@@ -1,0 +1,8 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Amove app icon</title>
+  <defs><linearGradient id="accent" x1="512" y1="336" x2="512" y2="608" gradientUnits="userSpaceOnUse"><stop stop-color="#A9E1F8"/><stop offset="1" stop-color="#91D3F1"/></linearGradient></defs>
+  <path d="M298 64H726C852 64 960 172 960 298V726C960 852 852 960 726 960H298C172 960 64 852 64 726V298C64 172 172 64 298 64Z" fill="white"/>
+  <rect x="120" y="414" width="404" height="248" rx="64" fill="white" stroke="black" stroke-width="36"/>
+  <rect x="502" y="210" width="306" height="508" rx="82" fill="white" stroke="black" stroke-width="36"/>
+  <rect x="360" y="336" width="272" height="272" rx="68" fill="url(#accent)"/>
+</svg>

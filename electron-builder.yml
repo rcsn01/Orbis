@@ -1,0 +1,38 @@
+appId: com.opense.Orbis
+productName: Orbis
+copyright: Copyright © 2026 Orbis
+asar: true
+asarUnpack:
+  - out/main/scan-worker.js
+  - out/main/chunks/**/*
+directories:
+  output: release
+  buildResources: assets
+files:
+  - out/**/*
+  - package.json
+  - assets/**/*
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+mac:
+  identity: null
+  hardenedRuntime: false
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  category: public.app-category.utilities
+  icon: assets/app/icon.png
+  minimumSystemVersion: '14.0.0'
+  extendInfo:
+    LSMinimumSystemVersion: '14.0.0'
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+publish: null
