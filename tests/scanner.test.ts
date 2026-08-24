@@ -90,7 +90,7 @@ describe("Orbis scanner", () => {
       expect("diagnostics" in second).toBe(false)
       expect(withoutElapsed(first.totals)).toEqual(withoutElapsed(second.totals))
       expect(readNodeRows(first.publishedPath)).toEqual(readNodeRows(second.publishedPath))
-      const required = ["preflight", "database-create", "traversal", "aggregation", "index-create", "metadata-write", "database-optimize", "database-close", "publish-rename", "scan-total"]
+      const required = ["preflight", "database-create", "traversal", "aggregation", "index-create", "metadata-write", "database-commit", "database-optimize", "database-close", "publish-rename", "scan-total"]
       for (const phase of required) {
         const matches = events.filter((event) => event.phase === phase && event.generation === 11)
         expect(matches).toHaveLength(1)

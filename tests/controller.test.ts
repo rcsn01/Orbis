@@ -69,6 +69,30 @@ describe("OrbisController", () => {
     }
   })
 
+  it("keeps the previous index when a rescan publishes an invalid database", async () => {
+    const target = await makeTarget("failed-rescan")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-failed-rescan-index-"))
+    const workers: FakeWorker[] = []
+    const controller = new OrbisController({ create: () => { const worker = new FakeWorker(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await controller.startScan()
+      await publish(workers[0]!)
+      expect(controller.snapshot().scan.status).toBe("completed")
+      await controller.rescan()
+      const start = workers[1]!.startMessage()
+      await writeFile(start.publishedPath, "not a sqlite database")
+      const failed = new Promise<void>((resolveFailed) => {
+        controller.subscribe((snapshot) => { if (snapshot.scan.status === "fatal-error") resolveFailed() })
+      })
+      workers[1]!.emit({ type: "complete", generation: start.generation, result: { generation: start.generation, target: start.target, rootId: "n-1", publishedPath: start.publishedPath, capacityBytes: 0, freeBytes: 0, scannedBytes: 0, totals: { scannedItems: 0, discoveredBytes: 0, elapsedMs: 0, skippedItems: 0, unreadableItems: 0, nestedMounts: 0, symlinks: 0, duplicateHardLinks: 0, disappearingItems: 0 } } })
+      await failed
+      const snapshot = controller.snapshot()
+      expect(snapshot.scan.status).toBe("fatal-error")
+      expect(snapshot.focus?.name).toBe("target")
+      await expectDatabaseFilesAbsent(start.publishedPath)
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
   it("keeps a published index when the worker exits after posting completion", async () => {
     const target = await makeTarget("normal-exit")
     const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-normal-exit-index-"))
