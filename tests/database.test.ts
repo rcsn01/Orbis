@@ -18,8 +18,9 @@ describe("ScanDatabase", () => {
       database.insertNode({ id: "n-2", parentId: "n-1", name: "folder", path: "/root/folder", kind: "directory", ownBytes: 50, device: "1", inode: "2" })
       database.insertNode({ id: "n-3", parentId: "n-1", name: "file", path: "/root/file", kind: "file", ownBytes: 200, device: "1", inode: "3" })
       database.markUnreadable("n-2")
-      const nodes = database.finalize("n-1")
-      expect(nodes.get("n-1")).toMatchObject({ sizeBytes: 350, directChildren: 2, descendantCount: 2, unreadableCount: 1 })
+      database.updateDirectory("n-2", { sizeBytes: 50, directChildren: 0, descendantCount: 0, unreadableCount: 1 })
+      database.updateDirectory("n-1", { sizeBytes: 350, directChildren: 2, descendantCount: 2, unreadableCount: 1 })
+      database.finalize()
       database.writeMetadata({ target: "/root", rootId: "n-1", capacityBytes: 1_000, freeBytes: 500, scannedBytes: 350, totals })
       database.complete()
 
@@ -37,7 +38,8 @@ describe("ScanDatabase", () => {
     try {
       const database = createScanDatabase(path)
       database.insertNode({ id: "n-1", parentId: null, name: "root", path: "/root", kind: "directory", ownBytes: 100, device: "1", inode: "1" })
-      database.finalize("n-1")
+      database.updateDirectory("n-1", { sizeBytes: 100, directChildren: 0, descendantCount: 0, unreadableCount: 0 })
+      database.finalize()
       database.writeMetadata({ target: "/root", rootId: "n-1", capacityBytes: 1_000, freeBytes: 500, scannedBytes: 100, totals: { ...totals, scannedItems: 1, discoveredBytes: 100 } })
       database.abort()
       database.abort()
@@ -57,8 +59,9 @@ describe("ScanDatabase", () => {
     try {
       const database = createScanDatabase(path)
       database.insertNode({ id: "n-1", parentId: null, name: "root", path: "/root", kind: "directory", ownBytes: 100, device: "1", inode: "1" })
-      database.finalize("n-1")
-      expect(() => database.finalize("n-1")).toThrow()
+      database.updateDirectory("n-1", { sizeBytes: 100, directChildren: 0, descendantCount: 0, unreadableCount: 0 })
+      database.finalize()
+      expect(() => database.finalize()).toThrow()
       database.abort()
 
       const raw = new DatabaseSync(path, { readOnly: true })
@@ -75,7 +78,8 @@ describe("ScanDatabase", () => {
     try {
       const database = createScanDatabase(path)
       database.insertNode({ id: "n-1", parentId: null, name: "root", path: "/root", kind: "directory", ownBytes: 100, device: "1", inode: "1" })
-      database.finalize("n-1")
+      database.updateDirectory("n-1", { sizeBytes: 100, directChildren: 0, descendantCount: 0, unreadableCount: 0 })
+      database.finalize()
       database.writeMetadata({ target: "/root", rootId: "n-1", capacityBytes: 1_000, freeBytes: 500, scannedBytes: 100, totals: { ...totals, scannedItems: 1, discoveredBytes: 100 } })
       database.complete()
       expect(() => database.insertNode({ id: "n-2", parentId: "n-1", name: "late", path: "/root/late", kind: "file", ownBytes: 1, device: "1", inode: "2" })).toThrow("Scan database is closed")

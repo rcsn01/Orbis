@@ -1,4 +1,5 @@
-import { access, lstat, rm, writeFile } from "node:fs/promises"
+import { access, lstat, mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import { describe, expect, it } from "vitest"
@@ -42,6 +43,7 @@ describe("Orbis scanner", () => {
       expect(index.getBreadcrumbs(children[0]!.id).map((item) => item.name)).toEqual(["volume", "Documents"])
       const allocatedTotal = await sumAllocated(index, rootNode.id)
       expect(rootNode.sizeBytes).toBe(allocatedTotal)
+      assertEveryDirectoryAggregate(result.publishedPath)
       index.close()
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
@@ -73,7 +75,47 @@ describe("Orbis scanner", () => {
       const index = new DiskIndex(publishedPath)
       expect(index.getNode(index.rootId)!.unreadableCount).toBeGreaterThan(0)
       index.close()
+      assertEveryDirectoryAggregate(publishedPath)
     } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("aggregates a deep tree without a synchronous recursion limit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-deep-aggregate-"))
+    const indexDirectory = join(directory, "indexes")
+    const root = "/orbis-virtual-deep-root"
+    const depth = 1_500
+    const real = defaultScanFileSystem()
+    const virtualDepth = (path: string): number => path === root ? 0 : path.startsWith(`${root}/`) ? path.slice(root.length + 1).split("/").length : -1
+    const fileSystem: ScanFileSystem = {
+      realpath: async (path) => path.startsWith(directory) ? real.realpath(path) : path,
+      statfs: async () => ({ blocks: 10_000, bfree: 5_000, bsize: 4_096 }),
+      readdir: async (path) => virtualDepth(path) < depth ? ["d"] : [],
+      lstat: async (path) => {
+        const level = virtualDepth(path)
+        if (level < 0) return real.lstat(path)
+        return { blocks: 1, dev: 1, ino: level + 1, isDirectory: () => true, isFile: () => false, isSymbolicLink: () => false }
+      }
+    }
+    try {
+      const result = await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, fileSystem })
+      expect(result.totals.scannedItems).toBe(depth + 1)
+      expect(result.scannedBytes).toBe((depth + 1) * 512)
+      const index = new DiskIndex(result.publishedPath)
+      expect(index.root).toMatchObject({ directChildren: 1, descendantCount: depth, sizeBytes: (depth + 1) * 512 })
+      index.close()
+      assertEveryDirectoryAggregate(result.publishedPath)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("matches the independent directory oracle across fixture shapes", async () => {
+    for (const name of ["wide", "deep", "tiny", "mixed"] as const) {
+      const created = await createScanFixture(name, "quick")
+      const indexDirectory = join(created.directory, "indexes")
+      try {
+        const result = await scanFilesystem({ generation: 1, target: created.root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory })
+        assertEveryDirectoryAggregate(result.publishedPath)
+      } finally { await rm(created.directory, { recursive: true, force: true }) }
+    }
   })
 
   it("reports complete opt-in timings without changing scan output", async () => {
@@ -97,7 +139,7 @@ describe("Orbis scanner", () => {
         expect(matches[0]!.durationMs).toBeGreaterThanOrEqual(0)
       }
       const timings = Object.fromEntries(events.map((event) => [event.phase, event.durationMs]))
-      const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total").reduce((sum, [, duration]) => sum + duration, 0)
+      const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total" && phase !== "aggregation").reduce((sum, [, duration]) => sum + duration, 0)
       expect(leaves).toBeLessThanOrEqual(timings["scan-total"]! + 0.1)
     } finally {
       unsubscribe()
@@ -105,14 +147,24 @@ describe("Orbis scanner", () => {
     }
   })
 
-  it("removes a partial database when cancellation arrives", async () => {
+  it("rolls back completed subtree aggregates when cancellation arrives", async () => {
     const { directory, root } = await fixture()
-    for (let index = 0; index < 40; index += 1) await writeFile(join(root, `file-${index}.dat`), Buffer.alloc(1024))
     const partialPath = join(directory, "indexes", "partial.sqlite")
     const publishedPath = join(directory, "indexes", "published.sqlite")
     const signal = new AbortController()
+    const real = defaultScanFileSystem()
+    const visitedDirectories: string[] = []
+    const fileSystem: ScanFileSystem = {
+      ...real,
+      readdir: async (path) => {
+        visitedDirectories.push(path)
+        if (path.endsWith("Empty")) signal.abort()
+        return real.readdir(path)
+      }
+    }
     try {
-      await expect(scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory: join(directory, "indexes"), signal: signal.signal, onProgress: () => signal.abort() })).rejects.toBeInstanceOf(ScanCanceledError)
+      await expect(scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory: join(directory, "indexes"), signal: signal.signal, fileSystem })).rejects.toBeInstanceOf(ScanCanceledError)
+      expect(visitedDirectories.findIndex((path) => path.endsWith("Documents"))).toBeLessThan(visitedDirectories.findIndex((path) => path.endsWith("Empty")))
       await expectDatabaseFilesAbsent(partialPath)
       await expectDatabaseFilesAbsent(publishedPath)
     } finally { await removeDatabaseFiles(partialPath); await removeDatabaseFiles(publishedPath); await rm(directory, { recursive: true, force: true }) }
@@ -145,6 +197,40 @@ function readNodeRows(path: string): readonly Record<string, unknown>[] {
   const database = new DatabaseSync(path, { readOnly: true })
   try { return database.prepare("SELECT * FROM nodes ORDER BY id").all() as unknown as readonly Record<string, unknown>[] }
   finally { database.close() }
+}
+
+function assertEveryDirectoryAggregate(path: string): void {
+  const rows = readNodeRows(path)
+  const byId = new Map(rows.map((row) => [String(row.id), row]))
+  const children = new Map<string, Record<string, unknown>[]>()
+  for (const row of rows) {
+    if (row.parent_id === null) continue
+    const siblings = children.get(String(row.parent_id)) ?? []
+    siblings.push(row)
+    children.set(String(row.parent_id), siblings)
+  }
+  const visit = (row: Record<string, unknown>): { sizeBytes: number; descendantCount: number; unreadableCount: number } => {
+    const direct = children.get(String(row.id)) ?? []
+    let sizeBytes = Number(row.own_bytes)
+    let descendantCount = 0
+    let unreadableCount = Number(row.own_unreadable)
+    for (const child of direct) {
+      const aggregate = child.kind === "directory"
+        ? visit(byId.get(String(child.id))!)
+        : { sizeBytes: Number(child.own_bytes), descendantCount: 0, unreadableCount: Number(child.own_unreadable) }
+      sizeBytes += aggregate.sizeBytes
+      descendantCount += 1 + aggregate.descendantCount
+      unreadableCount += aggregate.unreadableCount
+    }
+    if (row.kind === "directory") {
+      expect(row.size_bytes, `${String(row.path)} size`).toBe(sizeBytes)
+      expect(row.direct_children, `${String(row.path)} direct children`).toBe(direct.length)
+      expect(row.descendant_count, `${String(row.path)} descendants`).toBe(descendantCount)
+      expect(row.unreadable_count, `${String(row.path)} unreadable`).toBe(unreadableCount)
+    }
+    return { sizeBytes, descendantCount, unreadableCount }
+  }
+  for (const row of rows) if (row.parent_id === null) visit(row)
 }
 
 function withoutElapsed<T extends { readonly elapsedMs: number }>(totals: T): Omit<T, "elapsedMs"> {
