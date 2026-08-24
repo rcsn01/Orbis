@@ -5,4 +5,6 @@ release/
 test-results/
 playwright-report/
 coverage/
+benchmark-results/
+benchmark-dist/
 .DS_Store

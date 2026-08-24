@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { OrbisController, type OrbisWorker } from "../src/main/controller"
 import { scanFilesystem } from "../src/main/scanner"
+import { subscribeControllerDiagnostics, type OrbisTimingEvent } from "../../../packages/feature-orbis/src/main/diagnostics"
 
 class FakeWorker implements OrbisWorker {
   readonly messages: unknown[] = []
@@ -20,6 +21,7 @@ class FakeWorker implements OrbisWorker {
   }
   terminate(): Promise<number> { this.terminated = true; return Promise.resolve(0) }
   emit(message: unknown): void { for (const listener of this.#messageListeners) listener(message) }
+  emitError(error: unknown): void { for (const listener of this.#errorListeners) listener(error) }
   emitExit(code: number): void { for (const listener of this.#exitListeners) listener(code) }
   startMessage(): { generation: number; target: string; partialPath: string; publishedPath: string; indexDirectory: string; startupRoot: boolean } { return this.messages[0] as never }
 }
@@ -83,6 +85,60 @@ describe("OrbisController", () => {
     } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
   })
 
+  it("reports first-publication and snapshot timings through the internal diagnostics seam", async () => {
+    const target = await makeTarget("diagnostics")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-diagnostics-index-"))
+    const workers: FakeWorker[] = []
+    const events: OrbisTimingEvent[] = []
+    const unsubscribe = subscribeControllerDiagnostics((event) => events.push(event))
+    const controller = new OrbisController({ create: () => { const worker = new FakeWorker(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      const completed = new Promise<void>((resolveCompleted) => {
+        controller.subscribe((snapshot) => { if (snapshot.scan.status === "completed") resolveCompleted() })
+      })
+      await controller.startScan()
+      await publish(workers[0]!)
+      await completed
+      await new Promise((resolve) => setImmediate(resolve))
+      const required = ["index-open", "partial-index-cleanup", "snapshot-focus-query", "snapshot-root-query", "snapshot-breadcrumbs-query", "snapshot-chart-query", "snapshot-largest-items-query", "snapshot-total", "listener-notify", "publication-total"]
+      for (const phase of required) {
+        const matches = events.filter((event) => event.phase === phase && event.generation === 1)
+        expect(matches, phase).toHaveLength(1)
+        expect(matches[0]!.durationMs).toBeGreaterThanOrEqual(0)
+      }
+    } finally {
+      unsubscribe()
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it("removes every owned database artifact after a worker error", async () => {
+    const target = await makeTarget("worker-error")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-worker-error-index-"))
+    const workers: FakeWorker[] = []
+    const controller = new OrbisController({ create: () => { const worker = new FakeWorker(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      const failed = new Promise<void>((resolveFailed) => {
+        controller.subscribe((snapshot) => { if (snapshot.scan.status === "fatal-error") resolveFailed() })
+      })
+      await controller.startScan()
+      const start = workers[0]!.startMessage()
+      for (const path of [start.partialPath, start.publishedPath]) {
+        for (const suffix of ["", "-journal", "-wal", "-shm"]) await writeFile(`${path}${suffix}`, "artifact")
+      }
+      workers[0]!.emitError(new Error("worker failed"))
+      await failed
+      for (const path of [start.partialPath, start.publishedPath]) await expectDatabaseFilesAbsent(path)
+      expect(workers[0]!.terminated).toBe(true)
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
   it("does not let a stale generation replace a newer scan", async () => {
     const target = await makeTarget("stale")
     const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-stale-index-"))
@@ -118,3 +174,7 @@ describe("OrbisController", () => {
     } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
   })
 })
+
+async function expectDatabaseFilesAbsent(path: string): Promise<void> {
+  for (const suffix of ["", "-journal", "-wal", "-shm"]) await expect(access(`${path}${suffix}`)).rejects.toThrow()
+}

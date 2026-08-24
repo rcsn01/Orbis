@@ -1,36 +1,26 @@
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { access, lstat, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import { DatabaseSync } from "node:sqlite"
 import { describe, expect, it } from "vitest"
 import { buildChart } from "../src/main/chart"
 import { removeDatabaseFiles } from "../src/main/database"
 import { DiskIndex } from "../src/main/index-store"
 import { defaultScanFileSystem, scanFilesystem, ScanCanceledError, type ScanFileSystem } from "../src/main/scanner"
+import { createScanFixture, type ScanFixtureManifest } from "../../../packages/feature-orbis/scripts/lib/scan-fixtures"
+import { subscribeScanDiagnostics, type OrbisTimingEvent } from "../../../packages/feature-orbis/src/main/diagnostics"
 
-async function fixture(): Promise<{ readonly directory: string; readonly root: string }> {
-  const directory = await mkdtemp(join(tmpdir(), "orbis-scanner-"))
-  const root = join(directory, "volume")
-  await mkdir(join(root, "Documents", "Nested"), { recursive: true })
-  await mkdir(join(root, "Empty"), { recursive: true })
-  await writeFile(join(root, "Documents", "small.txt"), "small")
-  await writeFile(join(root, "Documents", "Nested", "large.bin"), Buffer.alloc(48 * 1024))
-  await writeFile(join(root, "root.txt"), Buffer.alloc(8 * 1024))
-  return { directory, root }
+async function fixture(): Promise<{ readonly directory: string; readonly root: string; readonly manifest: ScanFixtureManifest }> {
+  const created = await createScanFixture("semantics", "quick")
+  return { directory: created.directory, root: created.root, manifest: created.manifest }
 }
 
 describe("Orbis scanner", () => {
   it("indexes allocated files, nested totals, stable ordering, symlinks, and hard links", async () => {
-    const { directory, root } = await fixture()
+    const { directory, root, manifest } = await fixture()
     const indexDirectory = join(directory, "indexes")
     const partialPath = join(indexDirectory, "scan.partial.sqlite")
     const publishedPath = join(indexDirectory, "scan.sqlite")
     try {
-      await symlink(join(root, "Documents"), join(root, "Documents-link"))
-      await symlink(join(root, "root.txt"), join(root, "root-link.txt"))
-      try { await symlink(join(root, "root.txt"), join(root, "root-hard-link.txt")) } catch { /* Symlink support is platform dependent. */ }
-      const source = join(root, "root.txt")
-      const hard = join(root, "hard-link.txt")
-      try { await (await import("node:fs/promises")).link(source, hard) } catch { /* Some filesystems disallow hard links in fixtures. */ }
       const result = await scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory })
       const index = new DiskIndex(result.publishedPath)
       const rootNode = index.root!
@@ -39,10 +29,11 @@ describe("Orbis scanner", () => {
       expect(names[0]).toBe("Documents")
       expect(names).toContain("Empty")
       expect(names.filter((name) => name === "root.txt" || name === "hard-link.txt")).toHaveLength(1)
-      expect(rootNode.descendantCount).toBeGreaterThanOrEqual(5)
+      expect(rootNode.descendantCount).toBe(manifest.files + manifest.directories - 1)
+      expect(result.totals.scannedItems).toBe(manifest.files + manifest.directories)
       expect(rootNode.sizeBytes).toBe(result.scannedBytes)
-      expect(result.totals.symlinks).toBeGreaterThanOrEqual(1)
-      expect(result.totals.duplicateHardLinks).toBeGreaterThanOrEqual(1)
+      expect(result.totals.symlinks).toBe(manifest.symlinks)
+      expect(result.totals.duplicateHardLinks).toBe(manifest.hardLinkAliases)
       const indexedRootFile = children.find((child) => child.name === "root.txt" || child.name === "hard-link.txt")!
       const expectedRootBytes = (await lstat(join(root, "root.txt"))).blocks * 512
       expect(index.getNode(indexedRootFile.id)!.sizeBytes).toBe(expectedRootBytes)
@@ -66,7 +57,9 @@ describe("Orbis scanner", () => {
       },
       lstat: async (path) => {
         if (path.endsWith("small.txt")) { const error = new Error("gone") as NodeJS.ErrnoException; error.code = "ENOENT"; throw error }
-        return real.lstat(path)
+        const stats = await real.lstat(path)
+        if (!path.endsWith("Nested")) return stats
+        return { ...(stats.blocks === undefined ? {} : { blocks: stats.blocks }), dev: Number(stats.dev) + 1, ino: stats.ino, isDirectory: () => stats.isDirectory(), isFile: () => stats.isFile(), isSymbolicLink: () => stats.isSymbolicLink() }
       }
     }
     const partialPath = join(directory, "indexes", "partial.sqlite")
@@ -75,11 +68,41 @@ describe("Orbis scanner", () => {
       const result = await scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory: join(directory, "indexes"), fileSystem })
       expect(result.totals.unreadableItems).toBeGreaterThan(0)
       expect(result.totals.disappearingItems).toBe(1)
-      expect(result.totals.skippedItems).toBeGreaterThanOrEqual(2)
+      expect(result.totals.skippedItems).toBeGreaterThanOrEqual(3)
+      expect(result.totals.nestedMounts).toBe(1)
       const index = new DiskIndex(publishedPath)
       expect(index.getNode(index.rootId)!.unreadableCount).toBeGreaterThan(0)
       index.close()
     } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("reports complete opt-in timings without changing scan output", async () => {
+    const { directory, root } = await fixture()
+    const firstDirectory = join(directory, "first-index")
+    const secondDirectory = join(directory, "second-index")
+    const events: OrbisTimingEvent[] = []
+    const unsubscribe = subscribeScanDiagnostics((event) => events.push(event))
+    try {
+      const first = await scanFilesystem({ generation: 11, target: root, partialPath: join(firstDirectory, "partial.sqlite"), publishedPath: join(firstDirectory, "published.sqlite"), indexDirectory: firstDirectory })
+      unsubscribe()
+      const second = await scanFilesystem({ generation: 12, target: root, partialPath: join(secondDirectory, "partial.sqlite"), publishedPath: join(secondDirectory, "published.sqlite"), indexDirectory: secondDirectory })
+      expect("diagnostics" in first).toBe(false)
+      expect("diagnostics" in second).toBe(false)
+      expect(withoutElapsed(first.totals)).toEqual(withoutElapsed(second.totals))
+      expect(readNodeRows(first.publishedPath)).toEqual(readNodeRows(second.publishedPath))
+      const required = ["preflight", "database-create", "traversal", "aggregation", "index-create", "metadata-write", "database-optimize", "database-close", "publish-rename", "scan-total"]
+      for (const phase of required) {
+        const matches = events.filter((event) => event.phase === phase && event.generation === 11)
+        expect(matches).toHaveLength(1)
+        expect(matches[0]!.durationMs).toBeGreaterThanOrEqual(0)
+      }
+      const timings = Object.fromEntries(events.map((event) => [event.phase, event.durationMs]))
+      const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total").reduce((sum, [, duration]) => sum + duration, 0)
+      expect(leaves).toBeLessThanOrEqual(timings["scan-total"]! + 0.1)
+    } finally {
+      unsubscribe()
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 
   it("removes a partial database when cancellation arrives", async () => {
@@ -90,8 +113,8 @@ describe("Orbis scanner", () => {
     const signal = new AbortController()
     try {
       await expect(scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory: join(directory, "indexes"), signal: signal.signal, onProgress: () => signal.abort() })).rejects.toBeInstanceOf(ScanCanceledError)
-      await expect(readFile(partialPath)).rejects.toThrow()
-      await expect(readFile(publishedPath)).rejects.toThrow()
+      await expectDatabaseFilesAbsent(partialPath)
+      await expectDatabaseFilesAbsent(publishedPath)
     } finally { await removeDatabaseFiles(partialPath); await removeDatabaseFiles(publishedPath); await rm(directory, { recursive: true, force: true }) }
   })
 })
@@ -113,6 +136,22 @@ describe("Orbis chart limits", () => {
     }
   })
 })
+
+async function expectDatabaseFilesAbsent(path: string): Promise<void> {
+  for (const suffix of ["", "-journal", "-wal", "-shm"]) await expect(access(`${path}${suffix}`)).rejects.toThrow()
+}
+
+function readNodeRows(path: string): readonly Record<string, unknown>[] {
+  const database = new DatabaseSync(path, { readOnly: true })
+  try { return database.prepare("SELECT * FROM nodes ORDER BY id").all() as unknown as readonly Record<string, unknown>[] }
+  finally { database.close() }
+}
+
+function withoutElapsed<T extends { readonly elapsedMs: number }>(totals: T): Omit<T, "elapsedMs"> {
+  const { elapsedMs, ...rest } = totals
+  void elapsedMs
+  return rest
+}
 
 async function sumAllocated(index: DiskIndex, id: string): Promise<number> {
   const path = index.resolvePath(id)!

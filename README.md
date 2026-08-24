@@ -15,6 +15,23 @@ pnpm dev
 
 Set `ORBIS_SCAN_ROOT` while developing or testing to scan a fixture instead of `/`. `ORBIS_USER_DATA` gives an automated run its own Electron data directory.
 
+## Scan benchmark
+
+The benchmark builds the real worker, creates deterministic fixtures outside the timed section, runs one warm-up and five measured scans, and writes raw JSON under the ignored `benchmark-results` directory:
+
+```sh
+pnpm benchmark:scan -- --profile baseline --warmup 1 --samples 5 --fixture all
+```
+
+Use `--profile quick --samples 1` to validate the harness. A live path requires both `--target <path>` and `--allow-live-target`, so the benchmark cannot scan the startup volume by accident.
+
+Prepare a cold-cache run before restarting. The prepared command performs no build afterward:
+
+```sh
+pnpm benchmark:scan:prepare
+pnpm benchmark:scan:prepared -- --target / --allow-live-target --cache-state cold-manual --warmup 0 --samples 1
+```
+
 ## Verification and packaging
 
 ```sh
