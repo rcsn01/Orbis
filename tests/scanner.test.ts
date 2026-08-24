@@ -1,4 +1,5 @@
-import { access, lstat, mkdtemp, rm } from "node:fs/promises"
+import { existsSync } from "node:fs"
+import { access, link, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
@@ -45,6 +46,136 @@ describe("Orbis scanner", () => {
       expect(rootNode.sizeBytes).toBe(allocatedTotal)
       assertEveryDirectoryAggregate(result.publishedPath)
       index.close()
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("bounds concurrent metadata reads while preserving deterministic writes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-bounded-metadata-"))
+    const root = join(directory, "root")
+    const indexDirectory = join(directory, "indexes")
+    await mkdir(root)
+    for (let index = 0; index < 16; index += 1) await writeFile(join(root, `file-${String(index).padStart(2, "0")}.dat`), "data")
+    const real = defaultScanFileSystem()
+    let active = 0
+    let maximumActive = 0
+    const fileSystem: ScanFileSystem = {
+      ...real,
+      lstat: async (path) => {
+        if (!path.startsWith(`${root}/`)) return real.lstat(path)
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        try { await new Promise((resolveDelay) => setTimeout(resolveDelay, 5)); return await real.lstat(path) }
+        finally { active -= 1 }
+      }
+    }
+    try {
+      const result = await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, fileSystem, metadataConcurrency: 4 })
+      expect(maximumActive).toBe(4)
+      const idsByName = new Map(readNodeRows(result.publishedPath).map((row) => [String(row.name), String(row.id)]))
+      for (let index = 0; index < 16; index += 1) expect(idsByName.get(`file-${String(index).padStart(2, "0")}.dat`)).toBe(`n-${index + 2}`)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("shares one metadata-operation limit across nested directories", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-global-metadata-limit-"))
+    const root = join(directory, "root")
+    const indexDirectory = join(directory, "indexes")
+    for (let branch = 0; branch < 4; branch += 1) {
+      const child = join(root, `d-${branch}`)
+      await mkdir(child, { recursive: true })
+      for (let file = 0; file < 4; file += 1) await writeFile(join(child, `f-${file}.dat`), "data")
+    }
+    const real = defaultScanFileSystem()
+    let active = 0
+    let maximumActive = 0
+    const fileSystem: ScanFileSystem = {
+      ...real,
+      lstat: async (path) => {
+        if (!path.startsWith(`${root}/`)) return real.lstat(path)
+        active += 1
+        maximumActive = Math.max(maximumActive, active)
+        const relativeDepth = path.slice(root.length + 1).split("/").length
+        const delay = relativeDepth === 1 && path.endsWith("d-0") ? 1 : relativeDepth === 1 ? 30 : 10
+        try { await new Promise((resolveDelay) => setTimeout(resolveDelay, delay)); return await real.lstat(path) }
+        finally { active -= 1 }
+      }
+    }
+    try {
+      await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, fileSystem, metadataConcurrency: 4 })
+      expect(maximumActive).toBe(4)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("stops metadata admission and drains in-flight reads on cancellation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-canceled-metadata-"))
+    const root = join(directory, "root")
+    const indexDirectory = join(directory, "indexes")
+    await mkdir(root)
+    for (let index = 0; index < 20; index += 1) await writeFile(join(root, `file-${index}.dat`), "data")
+    const signal = new AbortController()
+    const real = defaultScanFileSystem()
+    let started = 0
+    let releaseReads: (() => void) | undefined
+    const readsReleased = new Promise<void>((resolveReads) => { releaseReads = resolveReads })
+    const fileSystem: ScanFileSystem = {
+      ...real,
+      lstat: async (path) => {
+        if (!path.startsWith(`${root}/`)) return real.lstat(path)
+        started += 1
+        if (started === 4) { signal.abort(); releaseReads?.() }
+        await readsReleased
+        return real.lstat(path)
+      }
+    }
+    const partialPath = join(indexDirectory, "partial.sqlite")
+    const publishedPath = join(indexDirectory, "published.sqlite")
+    try {
+      await expect(scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory, fileSystem, signal: signal.signal, metadataConcurrency: 4 })).rejects.toBeInstanceOf(ScanCanceledError)
+      expect(started).toBe(4)
+      await expectDatabaseFilesAbsent(partialPath)
+      await expectDatabaseFilesAbsent(publishedPath)
+    } finally { releaseReads?.(); await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("deduplicates hard links across top-level subtrees deterministically", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-concurrent-hard-links-"))
+    const root = join(directory, "root")
+    const indexDirectory = join(directory, "indexes")
+    await mkdir(join(root, "a"), { recursive: true })
+    await mkdir(join(root, "b"), { recursive: true })
+    const source = join(root, "a", "source.dat")
+    await writeFile(source, "shared")
+    await link(source, join(root, "b", "alias.dat"))
+    try {
+      const result = await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, metadataConcurrency: 4 })
+      expect(result.totals.duplicateHardLinks).toBe(1)
+      const fileRows = readNodeRows(result.publishedPath).filter((row) => row.kind === "file")
+      expect(fileRows).toHaveLength(1)
+      expect(fileRows[0]!.path).toBe(source)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it("uses a total name order for deterministic hard-link representatives", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orbis-collation-order-"))
+    const root = "/orbis-virtual-collation-root"
+    const indexDirectory = join(directory, "indexes")
+    const real = defaultScanFileSystem()
+    const fileSystem: ScanFileSystem = {
+      realpath: async (path) => path.startsWith(directory) ? real.realpath(path) : path,
+      statfs: async () => ({ blocks: 100, bfree: 50, bsize: 4_096 }),
+      readdir: async () => ["a", "A"],
+      lstat: async (path) => {
+        if (path.startsWith(directory)) return real.lstat(path)
+        const rootNode = path === root
+        return { blocks: 1, dev: 1, ino: rootNode ? 1 : 2, isDirectory: () => rootNode, isFile: () => !rootNode, isSymbolicLink: () => false }
+      }
+    }
+    try {
+      const result = await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, fileSystem, metadataConcurrency: 4 })
+      expect(result.totals.duplicateHardLinks).toBe(1)
+      const fileRows = readNodeRows(result.publishedPath).filter((row) => row.kind === "file")
+      expect(fileRows).toHaveLength(1)
+      expect(fileRows[0]!.name).toBe("A")
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
@@ -125,9 +256,9 @@ describe("Orbis scanner", () => {
     const events: OrbisTimingEvent[] = []
     const unsubscribe = subscribeScanDiagnostics((event) => events.push(event))
     try {
-      const first = await scanFilesystem({ generation: 11, target: root, partialPath: join(firstDirectory, "partial.sqlite"), publishedPath: join(firstDirectory, "published.sqlite"), indexDirectory: firstDirectory })
+      const first = await scanFilesystem({ generation: 11, target: root, partialPath: join(firstDirectory, "partial.sqlite"), publishedPath: join(firstDirectory, "published.sqlite"), indexDirectory: firstDirectory, metadataConcurrency: 1 })
       unsubscribe()
-      const second = await scanFilesystem({ generation: 12, target: root, partialPath: join(secondDirectory, "partial.sqlite"), publishedPath: join(secondDirectory, "published.sqlite"), indexDirectory: secondDirectory })
+      const second = await scanFilesystem({ generation: 12, target: root, partialPath: join(secondDirectory, "partial.sqlite"), publishedPath: join(secondDirectory, "published.sqlite"), indexDirectory: secondDirectory, metadataConcurrency: 4 })
       expect("diagnostics" in first).toBe(false)
       expect("diagnostics" in second).toBe(false)
       expect(withoutElapsed(first.totals)).toEqual(withoutElapsed(second.totals))
@@ -145,6 +276,18 @@ describe("Orbis scanner", () => {
       unsubscribe()
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  it("removes a database when cancellation arrives during final publication progress", async () => {
+    const { directory, root } = await fixture()
+    const partialPath = join(directory, "indexes", "partial.sqlite")
+    const publishedPath = join(directory, "indexes", "published.sqlite")
+    const signal = new AbortController()
+    try {
+      await expect(scanFilesystem({ generation: 1, target: root, partialPath, publishedPath, indexDirectory: join(directory, "indexes"), signal: signal.signal, onProgress: () => { if (existsSync(publishedPath)) signal.abort() } })).rejects.toBeInstanceOf(ScanCanceledError)
+      await expectDatabaseFilesAbsent(partialPath)
+      await expectDatabaseFilesAbsent(publishedPath)
+    } finally { await removeDatabaseFiles(partialPath); await removeDatabaseFiles(publishedPath); await rm(directory, { recursive: true, force: true }) }
   })
 
   it("rolls back completed subtree aggregates when cancellation arrives", async () => {
