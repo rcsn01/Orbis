@@ -1,5 +1,6 @@
 node_modules/
 out/
+worker-dist/
 release/
 test-results/
 playwright-report/

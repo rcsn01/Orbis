@@ -10,8 +10,10 @@
   "packageManager": "pnpm@10.32.1",
   "engines": { "node": ">=22.5.0" },
   "scripts": {
-    "predev": "pnpm test:dev-ready",
+    "predev": "pnpm build:worker && pnpm test:dev-ready",
     "dev": "electron-vite dev",
+    "build:worker": "node ../../packages/feature-orbis/scripts/build-worker.mjs --outDir worker-dist",
+    "prebuild:app": "pnpm build:worker",
     "build:app": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
@@ -24,6 +26,7 @@
   },
   "dependencies": {
     "@moirasia/desktop-shell": "file:../../packages/desktop-shell",
+    "@moirasia/feature-orbis": "file:../../packages/feature-orbis",
     "@moirasia/ui-react": "file:../../packages/ui-react",
     "react": "19.2.8",
     "react-dom": "19.2.8"

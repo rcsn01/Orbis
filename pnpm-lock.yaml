@@ -11,6 +11,9 @@ importers:
       '@moirasia/desktop-shell':
         specifier: file:../../packages/desktop-shell
         version: file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
+      '@moirasia/feature-orbis':
+        specifier: file:../../packages/feature-orbis
+        version: file:../../packages/feature-orbis(@types/react@19.2.18)(electron@43.1.0)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
       '@moirasia/ui-react':
         specifier: file:../../packages/ui-react
         version: file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
@@ -743,6 +746,13 @@ packages:
     peerDependencies:
       electron: '>=41 <44'
       react: '>=19 <20'
+
+  '@moirasia/feature-orbis@file:../../packages/feature-orbis':
+    resolution: {directory: ../../packages/feature-orbis, type: directory}
+    peerDependencies:
+      electron: '>=41 <44'
+      react: '>=19 <20'
+      react-dom: '>=19 <20'
 
   '@moirasia/ui-react@file:../../packages/ui-react':
     resolution: {directory: ../../packages/ui-react, type: directory}
@@ -4181,6 +4191,24 @@ snapshots:
     dependencies:
       electron: 43.1.0
       react: 19.2.8
+
+  '@moirasia/feature-orbis@file:../../packages/feature-orbis(@types/react@19.2.18)(electron@43.1.0)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
+    dependencies:
+      '@moirasia/desktop-shell': file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
+      '@moirasia/ui-react': file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
+      electron: 43.1.0
+      react: 19.2.8
+      react-dom: 19.2.8(react@19.2.8)
+    transitivePeerDependencies:
+      - '@cfworker/json-schema'
+      - '@date-fns/tz'
+      - '@types/react'
+      - babel-plugin-macros
+      - date-fns
+      - react-is
+      - redux
+      - supports-color
+      - typescript
 
   '@moirasia/ui-react@file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
     dependencies:

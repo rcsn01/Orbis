@@ -2,9 +2,6 @@ appId: com.opense.Orbis
 productName: Orbis
 copyright: Copyright © 2026 Orbis
 asar: true
-asarUnpack:
-  - out/main/scan-worker.js
-  - out/main/chunks/**/*
 directories:
   output: release
   buildResources: assets
@@ -12,6 +9,9 @@ files:
   - out/**/*
   - package.json
   - assets/**/*
+extraResources:
+  - from: worker-dist
+    to: features/orbis/worker
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 mac:
   identity: null

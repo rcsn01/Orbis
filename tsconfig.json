@@ -15,7 +15,7 @@
     "resolveJsonModule": true,
     "types": ["node", "vite/client", "vitest/globals", "@testing-library/jest-dom"],
     "baseUrl": ".",
-    "paths": { "@shared/*": ["src/shared/*"], "@main/*": ["src/main/*"] }
+    "paths": { "@shared/*": ["../../packages/feature-orbis/src/shared/*"], "@main/*": ["../../packages/feature-orbis/src/main/*"], "@orbis/*": ["../../packages/feature-orbis/src/*"] }
   },
   "include": [
     "src/**/*.ts",
