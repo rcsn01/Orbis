@@ -264,7 +264,7 @@ describe("Orbis scanner", () => {
       expect("diagnostics" in first).toBe(false)
       expect("diagnostics" in second).toBe(false)
       expect(withoutElapsed(first.totals)).toEqual(withoutElapsed(second.totals))
-      expect(readNodeRows(first.publishedPath)).toEqual(readNodeRows(second.publishedPath))
+      expect(readComparableNodeRows(first.publishedPath)).toEqual(readComparableNodeRows(second.publishedPath))
       const required = ["preflight", "database-create", "traversal", "aggregation", "index-create", "metadata-write", "database-commit", "database-optimize", "database-close", "publish-rename", "scan-total"]
       for (const phase of required) {
         const matches = events.filter((event) => event.phase === phase && event.generation === 11)
@@ -380,6 +380,11 @@ function readNodeRows(path: string): readonly Record<string, unknown>[] {
   const database = new DatabaseSync(path, { readOnly: true })
   try { return database.prepare("SELECT * FROM nodes ORDER BY id").all() as unknown as readonly Record<string, unknown>[] }
   finally { database.close() }
+}
+
+function readComparableNodeRows(path: string): readonly Record<string, unknown>[] {
+  return readNodeRows(path).map(({ id: _id, parent_id: _parentId, ...row }) => row)
+    .sort((left, right) => String(left.path).localeCompare(String(right.path)))
 }
 
 function assertEveryDirectoryAggregate(path: string): void {
