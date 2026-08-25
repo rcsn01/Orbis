@@ -15,7 +15,7 @@
     "resolveJsonModule": true,
     "types": ["node", "vite/client", "vitest/globals", "@testing-library/jest-dom"],
     "baseUrl": ".",
-    "paths": { "@shared/*": ["../../packages/feature-orbis/src/shared/*"], "@main/*": ["../../packages/feature-orbis/src/main/*"], "@orbis/*": ["../../packages/feature-orbis/src/*"] }
+    "paths": { "@moirasia/feature-orbis/*": ["../../packages/feature-orbis/src/*"], "@shared/*": ["../../packages/feature-orbis/src/shared/*"], "@main/*": ["../../packages/feature-orbis/src/main/*"], "@orbis/*": ["../../packages/feature-orbis/src/*"] }
   },
   "include": [
     "src/**/*.ts",
