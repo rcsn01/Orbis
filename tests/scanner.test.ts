@@ -333,11 +333,11 @@ describe("Orbis chart limits", () => {
     expect(chart[0]?.startAngle).toBe(0)
     expect(chart.at(-1)?.endAngle).toBe(360)
 
-    const startupChart = buildChart(source, root, { maxRings: 1, extraRootBytes: 100 })
-    expect(startupChart.find((segment) => segment.name === "Other")).toMatchObject({ sizeBytes: 50, itemCount: 50 })
-    const unscanned = startupChart.find((segment) => segment.name === "Unscanned or system data")
-    expect(unscanned).toMatchObject({ sizeBytes: 100 })
-    expect(unscanned?.itemCount).toBeUndefined()
+    const capacityChart = buildChart(source, root, { maxRings: 1, rootTotalBytes: 150 })
+    expect(capacityChart.find((segment) => segment.name === "Other")).toMatchObject({ sizeBytes: 42, itemCount: 42 })
+    expect(capacityChart.at(-1)?.endAngle).toBeCloseTo(120)
+    expect(capacityChart.reduce((sum, segment) => sum + segment.percentage, 0)).toBeCloseTo(100 / 3)
+    expect(capacityChart.some((segment) => segment.name === "Unscanned or system data")).toBe(false)
   })
 
   it("uses the one-percent share threshold before the visible-file cap", () => {

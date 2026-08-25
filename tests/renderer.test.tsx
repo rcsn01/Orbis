@@ -25,6 +25,7 @@ beforeEach(() => {
     startScan: vi.fn(async () => scanning),
     chooseFolder: vi.fn(async () => scanning),
     cancelScan: vi.fn(async () => ({ ...scanning, scan: { ...scanning.scan, status: "canceled" as const, progress: null } } as OrbisSnapshot)),
+    discardSavedScan: vi.fn(async () => scanning),
     rescan: vi.fn(async () => scanning),
     focusNode: vi.fn(async () => completed),
     revealNode: vi.fn(async () => undefined),
@@ -50,7 +51,7 @@ describe("Orbis renderer", () => {
     expect(screen.queryByLabelText(/Estimated folder size/)).toBeNull()
   })
 
-  it("does not present a growing known-so-far value as a folder estimate", async () => {
+  it("shows the currently known folder size while scanning", async () => {
     const withoutEstimate: OrbisSnapshot = {
       ...scanning,
       focus: { ...root, sizeBytes: 4096, scanState: "scanning", sizeAccuracy: "partial" },
@@ -59,8 +60,25 @@ describe("Orbis renderer", () => {
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(withoutEstimate)
 
     render(<App />)
-    expect(await screen.findByLabelText("Estimating folder size")).toBeVisible()
-    expect(screen.getByRole("button", { name: "Documents, directory, Estimating" })).toBeVisible()
+    expect(await screen.findByLabelText("Known folder size, 4.0 KB")).toBeVisible()
+    expect(screen.getByRole("button", { name: "Documents, directory, 4.0 KB, Scanning" })).toBeVisible()
+  })
+
+  it("presents the startup root as a share of total disk capacity", async () => {
+    const diskSnapshot: OrbisSnapshot = {
+      ...completed,
+      target: { name: "Macintosh HD", isStartup: true },
+      chart: [
+        { ...completed.chart[0]!, endAngle: 144, percentage: 40 },
+        { ...completed.chart[1]!, startAngle: 144, endAngle: 180, percentage: 10 }
+      ]
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(diskSnapshot)
+
+    render(<App />)
+    expect(await screen.findByText("50.0%")).toBeVisible()
+    expect(screen.getByText("disk capacity")).toBeVisible()
+    expect(screen.queryByText("selected folder")).toBeNull()
   })
 
   it("shows scan progress, supports keyboard segment activation, drill-down, file selection, and Finder reveal", async () => {
