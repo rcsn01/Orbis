@@ -12,6 +12,10 @@ files:
 extraResources:
   - from: worker-dist
     to: features/orbis/worker
+  - from: native
+    to: features/orbis/native
+    filter:
+      - '*.node'
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 mac:
   identity: null

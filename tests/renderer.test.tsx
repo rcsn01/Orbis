@@ -5,14 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../src/renderer/App"
 import type { OrbisSnapshot } from "../src/shared/contracts"
 
-const file = { id: "n-3", parentId: "n-1", name: "notes.txt", kind: "file" as const, sizeBytes: 2048, directChildren: 0, descendantCount: 0, unreadableCount: 0 }
-const folder = { id: "n-2", parentId: "n-1", name: "Documents", kind: "directory" as const, sizeBytes: 8192, directChildren: 1, descendantCount: 1, unreadableCount: 0 }
-const root = { id: "n-1", parentId: null, name: "fixture", kind: "directory" as const, sizeBytes: 10240, directChildren: 2, descendantCount: 2, unreadableCount: 0 }
-const scanning: OrbisSnapshot = { version: 1, target: { name: "fixture", isStartup: false }, focus: root, breadcrumbs: [{ id: root.id, name: root.name }], chart: [
-  { id: folder.id, name: folder.name, kind: "directory", depth: 1, startAngle: 0, endAngle: 288, sizeBytes: folder.sizeBytes, percentage: 80, drillable: true, colorKey: "root:n-2" },
-  { id: file.id, name: file.name, kind: "file", depth: 1, startAngle: 288, endAngle: 360, sizeBytes: file.sizeBytes, percentage: 20, drillable: false, colorKey: "root:n-3" }
-], largestItems: [folder, file], volume: { capacityBytes: 20_480, freeBytes: 10_240, scannedBytes: 10_240, unscannedBytes: 0 }, scan: { status: "scanning", generation: 1, progress: { stage: "traversing", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "notes.txt" }, totals: null, error: null } }
-const completed: OrbisSnapshot = { ...scanning, scan: { status: "completed", generation: 1, progress: null, totals: { scannedItems: 3, discoveredBytes: 10_240, elapsedMs: 300, skippedItems: 0, unreadableItems: 0, nestedMounts: 0, symlinks: 0, duplicateHardLinks: 0, disappearingItems: 0 }, error: null } }
+const file = { id: "n-3", parentId: "n-1", name: "notes.txt", kind: "file" as const, sizeBytes: 2048, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
+const folder = { id: "n-2", parentId: "n-1", name: "Documents", kind: "directory" as const, sizeBytes: 8192, directChildren: 1, descendantCount: 1, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
+const root = { id: "n-1", parentId: null, name: "fixture", kind: "directory" as const, sizeBytes: 10240, directChildren: 2, descendantCount: 2, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
+const scanning: OrbisSnapshot = { version: 3, committed: false, target: { name: "fixture", isStartup: false }, focus: root, breadcrumbs: [{ id: root.id, name: root.name }], chart: [
+  { id: folder.id, name: folder.name, kind: "directory", depth: 1, startAngle: 0, endAngle: 288, sizeBytes: folder.sizeBytes, percentage: 80, drillable: true, colorKey: "root:n-2", scanState: "complete", sizeAccuracy: "exact" },
+  { id: file.id, name: file.name, kind: "file", depth: 1, startAngle: 288, endAngle: 360, sizeBytes: file.sizeBytes, percentage: 20, drillable: false, colorKey: "root:n-3", scanState: "complete", sizeAccuracy: "exact" }
+], largestItems: [folder, file], volume: { capacityBytes: 20_480, freeBytes: 10_240, scannedBytes: 10_240, unscannedBytes: 0, sizeAccuracy: "exact" }, scan: { status: "scanning", generation: 1, progress: { stage: "traversing", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "notes.txt" }, totals: null, error: null } }
+const completed: OrbisSnapshot = { ...scanning, committed: true, scan: { status: "completed", generation: 1, progress: null, totals: { scannedItems: 3, discoveredBytes: 10_240, elapsedMs: 300, skippedItems: 0, unreadableItems: 0, nestedMounts: 0, symlinks: 0, duplicateHardLinks: 0, disappearingItems: 0 }, error: null } }
 
 let publish: ((snapshot: OrbisSnapshot) => void) | undefined
 
@@ -35,6 +35,34 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); publish = undefined })
 
 describe("Orbis renderer", () => {
+  it("shows the estimated folder size until an exact snapshot replaces it", async () => {
+    const provisional: OrbisSnapshot = {
+      ...scanning,
+      focus: { ...root, sizeBytes: 12 * 1024 * 1024, estimatedSizeBytes: 8 * 1024 * 1024, scanState: "scanning", sizeAccuracy: "estimated" }
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(provisional)
+
+    render(<App />)
+    expect(await screen.findByLabelText("Estimated folder size, 8.0 MB")).toBeVisible()
+
+    publish?.(completed)
+    expect(await screen.findByLabelText("Folder size, 10 KB")).toBeVisible()
+    expect(screen.queryByLabelText(/Estimated folder size/)).toBeNull()
+  })
+
+  it("does not present a growing known-so-far value as a folder estimate", async () => {
+    const withoutEstimate: OrbisSnapshot = {
+      ...scanning,
+      focus: { ...root, sizeBytes: 4096, scanState: "scanning", sizeAccuracy: "partial" },
+      largestItems: [{ ...folder, sizeBytes: 4096, scanState: "queued", sizeAccuracy: "partial" }]
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(withoutEstimate)
+
+    render(<App />)
+    expect(await screen.findByLabelText("Estimating folder size")).toBeVisible()
+    expect(screen.getByRole("button", { name: "Documents, directory, Estimating" })).toBeVisible()
+  })
+
   it("shows scan progress, supports keyboard segment activation, drill-down, file selection, and Finder reveal", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -46,9 +74,11 @@ describe("Orbis renderer", () => {
     folderSegment.focus()
     await user.keyboard("{Enter}")
     expect(window.orbis.focusNode).toHaveBeenCalledWith("n-2")
-    const fileRow = screen.getByRole("button", { name: /notes\.txt, file, 2\.0 KB$/ })
-    await user.click(fileRow)
+    const chartFile = screen.getByRole("button", { name: /notes\.txt, file, 2\.0 KB, 20\.0 percent/ })
+    await user.click(chartFile)
     expect(await screen.findByText("SELECTED ITEM")).toBeVisible()
+    const fileRow = screen.getByRole("button", { name: /notes\.txt, file, 2\.0 KB, Exact$/ })
+    await user.click(fileRow)
     await user.click(screen.getByRole("button", { name: "Reveal in Finder" }))
     expect(window.orbis.revealNode).toHaveBeenCalledWith("n-3")
   })

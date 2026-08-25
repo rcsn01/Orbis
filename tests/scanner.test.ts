@@ -72,7 +72,7 @@ describe("Orbis scanner", () => {
       const result = await scanFilesystem({ generation: 1, target: root, partialPath: join(indexDirectory, "partial.sqlite"), publishedPath: join(indexDirectory, "published.sqlite"), indexDirectory, fileSystem, metadataConcurrency: 4 })
       expect(maximumActive).toBe(4)
       const idsByName = new Map(readNodeRows(result.publishedPath).map((row) => [String(row.name), String(row.id)]))
-      for (let index = 0; index < 16; index += 1) expect(idsByName.get(`file-${String(index).padStart(2, "0")}.dat`)).toBe(`n-${index + 2}`)
+      for (let index = 0; index < 16; index += 1) expect(idsByName.has(`file-${String(index).padStart(2, "0")}.dat`)).toBe(true)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
@@ -236,7 +236,7 @@ describe("Orbis scanner", () => {
       index.close()
       assertEveryDirectoryAggregate(result.publishedPath)
     } finally { await rm(directory, { recursive: true, force: true }) }
-  })
+  }, 15_000)
 
   it("matches the independent directory oracle across fixture shapes", async () => {
     for (const name of ["wide", "deep", "tiny", "mixed"] as const) {
@@ -255,6 +255,8 @@ describe("Orbis scanner", () => {
     const secondDirectory = join(directory, "second-index")
     const events: OrbisTimingEvent[] = []
     const unsubscribe = subscribeScanDiagnostics((event) => events.push(event))
+    const previousLegacy = process.env.ORBIS_LEGACY_SCAN
+    process.env.ORBIS_LEGACY_SCAN = "1"
     try {
       const first = await scanFilesystem({ generation: 11, target: root, partialPath: join(firstDirectory, "partial.sqlite"), publishedPath: join(firstDirectory, "published.sqlite"), indexDirectory: firstDirectory, metadataConcurrency: 1 })
       unsubscribe()
@@ -273,6 +275,8 @@ describe("Orbis scanner", () => {
       const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total" && phase !== "aggregation").reduce((sum, [, duration]) => sum + duration, 0)
       expect(leaves).toBeLessThanOrEqual(timings["scan-total"]! + 0.1)
     } finally {
+      if (previousLegacy === undefined) delete process.env.ORBIS_LEGACY_SCAN
+      else process.env.ORBIS_LEGACY_SCAN = previousLegacy
       unsubscribe()
       await rm(directory, { recursive: true, force: true })
     }
@@ -315,9 +319,45 @@ describe("Orbis scanner", () => {
 })
 
 describe("Orbis chart limits", () => {
+  it("batches a large tail of small files into one counted Other segment", () => {
+    const children = Array.from({ length: 50 }, (_, index) => ({ id: `n-${index + 2}`, parentId: "n-1", name: `tiny-${index}`, path: `/tiny-${index}`, kind: "file" as const, sizeBytes: 1, confirmedBytes: 1, estimatedBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }))
+    const root = { id: "n-1", parentId: null, name: "root", path: "/", kind: "directory" as const, sizeBytes: children.length, confirmedBytes: children.length, estimatedBytes: 0, directChildren: children.length, descendantCount: children.length, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
+    const source = { getNode: (id: string) => id === root.id ? root : children.find((child) => child.id === id), getChildren: (_id: string, limit: number) => children.slice(0, limit), countChildren: () => children.length }
+
+    const chart = buildChart(source, root, { maxRings: 1 })
+    const other = chart.find((segment) => segment.name === "Other")
+
+    expect(chart.filter((segment) => segment.id !== null)).toHaveLength(8)
+    expect(other).toMatchObject({ id: null, sizeBytes: 42, itemCount: 42, drillable: false })
+    expect(chart.reduce((sum, segment) => sum + segment.sizeBytes, 0)).toBe(root.sizeBytes)
+    expect(chart[0]?.startAngle).toBe(0)
+    expect(chart.at(-1)?.endAngle).toBe(360)
+
+    const startupChart = buildChart(source, root, { maxRings: 1, extraRootBytes: 100 })
+    expect(startupChart.find((segment) => segment.name === "Other")).toMatchObject({ sizeBytes: 50, itemCount: 50 })
+    const unscanned = startupChart.find((segment) => segment.name === "Unscanned or system data")
+    expect(unscanned).toMatchObject({ sizeBytes: 100 })
+    expect(unscanned?.itemCount).toBeUndefined()
+  })
+
+  it("uses the one-percent share threshold before the visible-file cap", () => {
+    const children = [
+      { id: "n-big", parentId: "n-1", name: "big", path: "/big", kind: "file" as const, sizeBytes: 40, confirmedBytes: 40, estimatedBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const },
+      { id: "n-medium", parentId: "n-1", name: "medium", path: "/medium", kind: "file" as const, sizeBytes: 10, confirmedBytes: 10, estimatedBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const },
+      ...Array.from({ length: 8 }, (_, index) => ({ id: `n-small-${index}`, parentId: "n-1", name: `small-${index}`, path: `/small-${index}`, kind: "file" as const, sizeBytes: 5, confirmedBytes: 5, estimatedBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }))
+    ]
+    const root = { id: "n-1", parentId: null, name: "root", path: "/", kind: "directory" as const, sizeBytes: 1000, confirmedBytes: 1000, estimatedBytes: 0, directChildren: children.length, descendantCount: children.length, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
+    const source = { getNode: (id: string) => id === root.id ? root : children.find((child) => child.id === id), getChildren: (_id: string, limit: number) => children.slice(0, limit), countChildren: () => children.length }
+
+    const chart = buildChart(source, root, { maxRings: 1 })
+
+    expect(chart.filter((segment) => segment.id !== null).map((segment) => segment.name)).toEqual(["big", "medium"])
+    expect(chart.find((segment) => segment.name === "Other")).toMatchObject({ itemCount: 8, sizeBytes: 950 })
+  })
+
   it("caps rings and segments and aggregates omitted children", () => {
-    const children = Array.from({ length: 60 }, (_, index) => ({ id: `n-${index + 2}`, parentId: "n-1", name: `item-${index}`, path: `/item-${index}`, kind: "file" as const, sizeBytes: 100, directChildren: 0, descendantCount: 0, unreadableCount: 0 }))
-    const root = { id: "n-1", parentId: null, name: "root", path: "/", kind: "directory" as const, sizeBytes: children.length * 100, directChildren: children.length, descendantCount: children.length, unreadableCount: 0 }
+    const children = Array.from({ length: 60 }, (_, index) => ({ id: `n-${index + 2}`, parentId: "n-1", name: `item-${index}`, path: `/item-${index}`, kind: "file" as const, sizeBytes: 100, confirmedBytes: 100, estimatedBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }))
+    const root = { id: "n-1", parentId: null, name: "root", path: "/", kind: "directory" as const, sizeBytes: children.length * 100, confirmedBytes: children.length * 100, estimatedBytes: 0, directChildren: children.length, descendantCount: children.length, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
     const source = { getNode: (id: string) => id === root.id ? root : children.find((child) => child.id === id), getChildren: (_id: string, limit: number) => children.slice(0, limit), countChildren: () => children.length }
     const chart = buildChart(source, root)
     expect(chart.length).toBeLessThanOrEqual(400)

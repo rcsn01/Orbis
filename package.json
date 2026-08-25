@@ -13,7 +13,10 @@
     "predev": "pnpm build:worker && pnpm test:dev-ready",
     "dev": "electron-vite dev",
     "build:worker": "node ../../packages/feature-orbis/scripts/build-worker.mjs --outDir worker-dist",
-    "prebuild:app": "pnpm build:worker",
+    "native:mac": "node ../../scripts/build-orbis-native.mjs --target aarch64-apple-darwin",
+    "native:build": "node ../../scripts/build-orbis-native.mjs",
+    "native:test": "cargo test --manifest-path ../../packages/feature-orbis/native/Cargo.toml",
+    "prebuild:app": "pnpm build:worker && pnpm native:mac",
     "build:app": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
@@ -23,7 +26,7 @@
     "benchmark:scan": "pnpm build:worker && node ../../packages/feature-orbis/scripts/run-scan-benchmark.mjs",
     "benchmark:scan:prepare": "pnpm build:worker && node ../../packages/feature-orbis/scripts/run-scan-benchmark.mjs --prepare-only benchmark-dist",
     "benchmark:scan:prepared": "node benchmark-dist/benchmark-scan.mjs --worker worker-dist/scan-worker.mjs",
-    "verify": "pnpm typecheck && pnpm test && pnpm build:app",
+    "verify": "pnpm typecheck && pnpm native:test && pnpm test && pnpm build:app",
     "package:dir": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir --arm64",
     "package:mac:unsigned": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --publish never -c.mac.notarize=false"
   },
@@ -35,6 +38,7 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@napi-rs/cli": "3.3.0",
     "@playwright/test": "1.58.2",
     "@tailwindcss/vite": "4.3.3",
     "@testing-library/jest-dom": "7.0.0",
@@ -53,5 +57,9 @@
     "vite": "7.3.6",
     "vitest": "4.1.10"
   },
-  "pnpm": { "onlyBuiltDependencies": ["electron", "electron-winstaller", "esbuild"] }
+  "pnpm": { "onlyBuiltDependencies": ["@napi-rs/cli", "electron", "electron-winstaller", "esbuild"] },
+  "napi": {
+    "binaryName": "orbis-metadata",
+    "targets": ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+  }
 }

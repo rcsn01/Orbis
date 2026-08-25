@@ -23,7 +23,7 @@ The benchmark builds the real worker, creates deterministic fixtures outside the
 pnpm benchmark:scan -- --profile baseline --warmup 1 --samples 5 --fixture all
 ```
 
-Use `--profile quick --samples 1` to validate the harness. A live path requires both `--target <path>` and `--allow-live-target`, so the benchmark cannot scan the startup volume by accident.
+Use `--profile quick --samples 1` to validate the harness. Pass `--scanner progressive` or `--scanner legacy` to compare the two implementations. Progressive is the default. A live path requires both `--target <path>` and `--allow-live-target`, so the benchmark cannot scan the startup volume by accident.
 
 Prepare a cold-cache run before restarting. The prepared command performs no build afterward:
 
@@ -48,4 +48,4 @@ The macOS package is an unsigned ARM64 DMG with bundle identifier `com.opense.Or
 
 The renderer receives snapshots, progress, and opaque node IDs through a context-isolated preload. It never receives a filesystem path. The main process owns the active read-only SQLite index and resolves Finder paths only after validating an ID against that index.
 
-Traversal, indexing, and the worker protocol live in `../../packages/feature-orbis`. `pnpm build:worker` produces the single ESM file `worker-dist/scan-worker.mjs` for development. Packaged builds place that file at `Resources/features/orbis/worker/scan-worker.mjs`. The worker stays on the selected filesystem, avoids nested mounts and macOS duplicate trees for startup scans, skips unreadable and disappearing entries, and publishes a generation-named database only after traversal and aggregate indexes finish. A canceled or stale worker cannot replace the last completed index.
+Traversal, indexing, and the worker protocol live in `../../packages/feature-orbis`. `pnpm build:worker` produces the single ESM file `worker-dist/scan-worker.mjs` for development. Packaged builds place that file at `Resources/features/orbis/worker/scan-worker.mjs`. Progressive scanning is the default. It emits path-free previews after root pages, keeps metadata concurrency at four by default, limits open directory handles to eight, and publishes a generation-named database only after traversal and aggregate indexes finish. Set `ORBIS_LEGACY_SCAN=1` for the temporary Stage 5 rollback. A canceled or stale worker cannot replace the last completed index.
