@@ -7,7 +7,7 @@ import { readConstructionPreview, resolveConstructionNodePath, type Construction
 import { removeDatabaseFiles } from './database'
 import { measureController, measureControllerAsync } from './diagnostics'
 import { FullScanResumeStore, type FullScanResumeLoad } from './full-scan-resume'
-import { DiskIndex } from './index-store'
+import { DiskIndex, toSummary } from './index-store'
 import {
   EXCLUSION_POLICY_VERSION, HARD_LINK_ORDERING_VERSION, IndexManifestStore, PERSISTENT_ACCOUNTING_VERSION,
   PERSISTENT_INDEX_SCHEMA_VERSION, type IndexManifest, type JournalCursor
@@ -161,7 +161,7 @@ export class OrbisController {
     return {
       version: 3, committed: compatible,
       target: { name: compatible ? root?.name ?? displayName(target) : displayName(target), isStartup: target === '/' },
-      focus: focus ? toSnapshotNode(focus) : null, breadcrumbs, chart, largestItems, volume,
+      focus: focus ? toSummary(focus) : null, breadcrumbs, chart, largestItems, volume,
       scan: { ...this.#scanStatus, totals: this.#scanStatus.status === 'scanning' ? null : this.#scanStatus.totals ?? activeTotals, ...(this.#resume ? { resume: this.#resume } : {}) }
     }
   }
@@ -857,10 +857,6 @@ function manifestPublicationWasDurable(store: IndexManifestStore): boolean {
 
 function errorCode(error: unknown): unknown {
   return error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
-}
-
-function toSnapshotNode(node: { id: string; parentId: string | null; name: string; kind: 'directory' | 'file'; sizeBytes: number; estimatedBytes?: number; directChildren: number; descendantCount: number; unreadableCount: number; scanState: 'queued' | 'scanning' | 'complete' | 'unreadable'; sizeAccuracy: SizeAccuracy }) {
-  return { id: node.id, parentId: node.parentId, name: node.name, kind: node.kind, sizeBytes: node.sizeBytes, ...(node.estimatedBytes && node.estimatedBytes > 0 ? { estimatedSizeBytes: node.estimatedBytes } : {}), directChildren: node.directChildren, descendantCount: node.descendantCount, unreadableCount: node.unreadableCount, scanState: node.scanState, sizeAccuracy: node.sizeAccuracy }
 }
 
 function previewNode(preview: ProgressivePreview, id: string): { readonly id: string; readonly kind: 'directory' | 'file' } | undefined {

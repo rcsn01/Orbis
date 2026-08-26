@@ -1,7 +1,7 @@
 import { lstatSync } from 'node:fs'
-import { DatabaseSync } from "node:sqlite"
+import { DatabaseSync, type StatementSync } from "node:sqlite"
 import { isAbsolute, normalize, relative, sep } from "node:path"
-import type { Breadcrumb, NodeSummary } from "../shared/contracts"
+import type { Breadcrumb, DirectoryScanState, NodeSummary, SizeAccuracy } from "../shared/contracts"
 import { readMetadata, type DatabaseNode } from "./database"
 import { PERSISTENT_INDEX_SCHEMA_VERSION } from "./index-manifest"
 
@@ -12,12 +12,114 @@ export interface ChartDataSource {
   getEstimatedRemainder?(id: string): number
 }
 
+/**
+ * The committed node SELECT.  Emits the same aliases as
+ * CONSTRUCTION_NODE_SELECT so one row mapping serves both schema families.
+ */
+export const COMMITTED_NODE_SELECT = `SELECT n.id, n.parent_id AS parentId, n.name, n.path, n.kind, n.size_bytes AS confirmedBytes, n.size_bytes AS display_size, 0 AS estimatedBytes, n.direct_children AS directChildren, n.descendant_count AS descendantCount, n.unreadable_count AS unreadableCount, n.own_unreadable AS ownUnreadable, n.scan_state AS scanState FROM nodes n`
+
+/** The construction node SELECT: display size and estimate overlay while pending. */
+export const CONSTRUCTION_NODE_SELECT = `SELECT n.id, n.parent_id AS parentId, n.name, n.path, n.kind,
+  n.size_bytes AS confirmedBytes,
+  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN MAX(n.size_bytes, COALESCE(e.estimated_bytes, 0)) ELSE n.size_bytes END AS display_size,
+  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN COALESCE(e.estimated_bytes, 0) ELSE 0 END AS estimatedBytes,
+  n.direct_children AS directChildren, n.descendant_count AS descendantCount,
+  n.unreadable_count AS unreadableCount, n.own_unreadable AS ownUnreadable, n.scan_state AS scanState
+  FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id`
+
+const ESTIMATE_REMAINDER_SQL = `
+  SELECT n.scan_state AS scanState, COALESCE(e.estimated_bytes, 0) AS estimatedBytes,
+    COALESCE((SELECT SUM(
+      CASE WHEN child.scan_state IN ('queued', 'scanning')
+        THEN MAX(child.size_bytes, COALESCE(childEstimate.estimated_bytes, 0))
+        ELSE child.size_bytes
+      END
+    ) FROM nodes child LEFT JOIN size_estimates childEstimate ON childEstimate.node_id = child.id WHERE child.parent_id = n.id), 0) AS childBytes
+  FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id WHERE n.id = ?
+`
+
+/**
+ * The shared node read-model: one row→DatabaseNode mapping and one set of
+ * navigation queries for both the committed index and the construction
+ * database.  Never closes the DatabaseSync it is given.
+ */
+export class NodeReadModel {
+  readonly #variant: "committed" | "construction"
+  readonly #getNodeStatement: StatementSync
+  readonly #getNodeByPathStatement: StatementSync
+  readonly #getChildrenStatement: StatementSync
+  readonly #countChildrenStatement: StatementSync
+  readonly #breadcrumbStatement: StatementSync
+  readonly #estimateRemainderStatement: StatementSync | undefined
+
+  constructor(database: DatabaseSync, variant: "committed" | "construction") {
+    this.#variant = variant
+    const select = variant === "committed" ? COMMITTED_NODE_SELECT : CONSTRUCTION_NODE_SELECT
+    this.#getNodeStatement = database.prepare(`${select} WHERE n.id = ?`)
+    this.#getNodeByPathStatement = database.prepare(`${select} WHERE n.path = ?`)
+    this.#getChildrenStatement = database.prepare(`${select} WHERE n.parent_id = ? ORDER BY display_size DESC, n.name COLLATE NOCASE ASC, n.id ASC LIMIT ?`)
+    this.#countChildrenStatement = database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?")
+    this.#breadcrumbStatement = database.prepare("SELECT id, parent_id AS parentId, name FROM nodes WHERE id = ?")
+    // The committed schema has no size_estimates table, so the remainder
+    // statement is only prepared for the construction variant.
+    this.#estimateRemainderStatement = variant === "construction" ? database.prepare(ESTIMATE_REMAINDER_SQL) : undefined
+  }
+
+  getNode(id: string): DatabaseNode | undefined {
+    const row = this.#getNodeStatement.get(id) as unknown as Record<string, unknown> | undefined
+    return row ? nodeFromRow(row) : undefined
+  }
+
+  getNodeByPath(path: string): DatabaseNode | undefined {
+    const row = this.#getNodeByPathStatement.get(path) as unknown as Record<string, unknown> | undefined
+    return row ? nodeFromRow(row) : undefined
+  }
+
+  getChildren(id: string, limit: number): readonly DatabaseNode[] {
+    const safeLimit = Math.max(0, Math.min(400, Math.floor(limit)))
+    if (safeLimit === 0) return []
+    const rows = this.#getChildrenStatement.all(id, safeLimit) as unknown as Array<Record<string, unknown>>
+    return rows.map(nodeFromRow)
+  }
+
+  countChildren(id: string): number {
+    const row = this.#countChildrenStatement.get(id) as unknown as { count?: number } | undefined
+    return Number(row?.count ?? 0)
+  }
+
+  getLargestItems(id: string): readonly NodeSummary[] {
+    return this.getChildren(id, 100).map(toSummary)
+  }
+
+  getEstimatedRemainder(id: string): number {
+    if (this.#variant === "committed") return 0
+    const row = this.#estimateRemainderStatement!.get(id) as unknown as { scanState?: string; estimatedBytes?: number; childBytes?: number } | undefined
+    if (!row || (row.scanState !== "queued" && row.scanState !== "scanning")) return 0
+    return Math.max(0, Number(row.estimatedBytes ?? 0) - Number(row.childBytes ?? 0))
+  }
+
+  /** All-or-nothing breadcrumbs: [] unless the parent chain terminates at null. */
+  getBreadcrumbs(id: string): readonly Breadcrumb[] {
+    const result: Breadcrumb[] = []
+    const seen = new Set<string>()
+    let current = this.#breadcrumbStatement.get(id) as unknown as { id: string; parentId: string | null; name: string } | undefined
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id)
+      result.unshift({ id: current.id, name: current.name })
+      if (current.parentId === null) return result
+      current = this.#breadcrumbStatement.get(current.parentId) as unknown as { id: string; parentId: string | null; name: string } | undefined
+    }
+    return []
+  }
+}
+
 export class DiskIndex implements ChartDataSource {
   readonly path: string
   readonly metadata: Record<string, string>
   readonly rootId: string
   readonly target: string
   private readonly database: DatabaseSync
+  private readonly readModel: NodeReadModel
   #closed = false
 
   constructor(path: string) {
@@ -28,6 +130,7 @@ export class DiskIndex implements ChartDataSource {
     this.database = database
     try {
       database.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")
+      this.readModel = new NodeReadModel(database, "committed")
       this.metadata = readMetadata(database)
       this.rootId = this.metadata.rootId ?? ""
       this.target = this.metadata.target ?? "/"
@@ -42,65 +145,19 @@ export class DiskIndex implements ChartDataSource {
 
   get root(): DatabaseNode | undefined { return this.getNode(this.rootId) }
 
-  getNodeByPath(path: string): DatabaseNode | undefined {
-    const row = this.database.prepare(`
-      SELECT id, parent_id AS parentId, name, path, kind, size_bytes AS sizeBytes,
-        size_bytes AS confirmedBytes, 0 AS estimatedBytes,
-        direct_children AS directChildren, descendant_count AS descendantCount,
-        unreadable_count AS unreadableCount, own_unreadable AS ownUnreadable, scan_state AS scanState
-      FROM nodes WHERE path = ?
-    `).get(path) as unknown as Record<string, unknown> | undefined
-    return row ? databaseNode(row) : undefined
-  }
+  getNodeByPath(path: string): DatabaseNode | undefined { return this.readModel.getNodeByPath(path) }
 
-  getNode(id: string): DatabaseNode | undefined {
-    const row = this.database.prepare(`
-      SELECT id, parent_id AS parentId, name, path, kind, size_bytes AS sizeBytes,
-        size_bytes AS confirmedBytes, 0 AS estimatedBytes,
-        direct_children AS directChildren, descendant_count AS descendantCount,
-        unreadable_count AS unreadableCount, own_unreadable AS ownUnreadable, scan_state AS scanState
-      FROM nodes WHERE id = ?
-    `).get(id) as unknown as Record<string, unknown> | undefined
-    return row ? databaseNode(row) : undefined
-  }
+  getNode(id: string): DatabaseNode | undefined { return this.readModel.getNode(id) }
 
-  getChildren(id: string, limit: number): readonly DatabaseNode[] {
-    const safeLimit = Math.max(0, Math.min(400, Math.floor(limit)))
-    if (safeLimit === 0) return []
-    const rows = this.database.prepare(`
-      SELECT id, parent_id AS parentId, name, path, kind, size_bytes AS sizeBytes,
-        size_bytes AS confirmedBytes, 0 AS estimatedBytes,
-        direct_children AS directChildren, descendant_count AS descendantCount,
-        unreadable_count AS unreadableCount, own_unreadable AS ownUnreadable, scan_state AS scanState
-      FROM nodes WHERE parent_id = ?
-      ORDER BY size_bytes DESC, name COLLATE NOCASE ASC, id ASC LIMIT ?
-    `).all(id, safeLimit) as unknown as Array<Record<string, unknown>>
-    return rows.map(databaseNode)
-  }
+  getChildren(id: string, limit: number): readonly DatabaseNode[] { return this.readModel.getChildren(id, limit) }
 
-  countChildren(id: string): number {
-    const row = this.database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(id) as unknown as { count?: number }
-    return Number(row?.count ?? 0)
-  }
+  countChildren(id: string): number { return this.readModel.countChildren(id) }
 
-  getEstimatedRemainder(_id: string): number { return 0 }
+  getEstimatedRemainder(id: string): number { return this.readModel.getEstimatedRemainder(id) }
 
-  getLargestItems(id: string): readonly NodeSummary[] {
-    return this.getChildren(id, 100).map(toSummary)
-  }
+  getLargestItems(id: string): readonly NodeSummary[] { return this.readModel.getLargestItems(id) }
 
-  getBreadcrumbs(id: string): readonly Breadcrumb[] {
-    const result: Breadcrumb[] = []
-    const seen = new Set<string>()
-    let current = this.getNode(id)
-    while (current && !seen.has(current.id)) {
-      seen.add(current.id)
-      result.unshift({ id: current.id, name: current.name })
-      if (current.parentId === null) break
-      current = this.getNode(current.parentId)
-    }
-    return result
-  }
+  getBreadcrumbs(id: string): readonly Breadcrumb[] { return this.readModel.getBreadcrumbs(id) }
 
   resolvePath(id: string): string | undefined {
     const path = this.getNode(id)?.path
@@ -130,21 +187,31 @@ export function toSummary(node: DatabaseNode): NodeSummary {
   }
 }
 
-function databaseNode(row: Record<string, unknown>): DatabaseNode {
+export function nodeFromRow(row: Record<string, unknown>): DatabaseNode {
+  const scanState: DirectoryScanState = row.scanState === "queued" || row.scanState === "scanning" || row.scanState === "unreadable" ? row.scanState : "complete"
+  const pending = scanState === "queued" || scanState === "scanning"
+  const confirmedBytes = safeBytes(row.confirmedBytes)
+  const estimatedBytes = pending ? safeBytes(row.estimatedBytes) : 0
+  const unreadableCount = nonnegativeInteger(row.unreadableCount)
+  const sizeAccuracy: SizeAccuracy = scanState === "complete" && unreadableCount === 0 && row.ownUnreadable !== 1
+    ? "exact"
+    : pending
+      ? estimatedBytes > 0 ? "estimated" : "partial"
+      : "partial"
   return {
     id: String(row.id),
     parentId: row.parentId === null ? null : String(row.parentId),
     name: String(row.name),
     path: String(row.path),
     kind: row.kind === "directory" ? "directory" : "file",
-    sizeBytes: numberValue(row.sizeBytes),
-    confirmedBytes: numberValue(row.confirmedBytes ?? row.sizeBytes),
-    estimatedBytes: numberValue(row.estimatedBytes),
-    directChildren: numberValue(row.directChildren),
-    descendantCount: numberValue(row.descendantCount),
-    unreadableCount: numberValue(row.unreadableCount),
-    scanState: row.scanState === "queued" || row.scanState === "scanning" || row.scanState === "unreadable" ? row.scanState : "complete",
-    sizeAccuracy: row.scanState === "unreadable" || numberValue(row.unreadableCount) > 0 ? "partial" : "exact"
+    sizeBytes: safeBytes(row.display_size),
+    confirmedBytes,
+    estimatedBytes,
+    directChildren: nonnegativeInteger(row.directChildren),
+    descendantCount: nonnegativeInteger(row.descendantCount),
+    unreadableCount,
+    scanState,
+    sizeAccuracy
   }
 }
 
@@ -159,7 +226,16 @@ function validatePersistentSchema(database: DatabaseSync, version: string): void
   if (!observationColumns.has("direct_duplicate_count") || !nodeColumns.has("depth")) throw new Error("Invalid persistent Orbis index")
 }
 
-function numberValue(value: unknown): number { return typeof value === "number" ? value : Number(value) }
+function safeBytes(value: unknown): number {
+  const number = typeof value === "bigint" ? Number(value) : Number(value)
+  return Number.isFinite(number) && number > 0 ? number : 0
+}
+
+function nonnegativeInteger(value: unknown): number {
+  const number = typeof value === "bigint" ? Number(value) : Number(value)
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0
+}
+
 function isWithin(path: string, parent: string): boolean {
   const child = normalize(path)
   const root = normalize(parent)

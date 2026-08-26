@@ -1,6 +1,5 @@
 import type { ChartSegment, DirectoryScanState, SizeAccuracy } from "../shared/contracts"
-import type { ChartDataSource } from "./index-store"
-import { toSummary, type DatabaseNode } from "./index-store"
+import type { ChartDataSource, DatabaseNode } from "./index-store"
 
 export interface ChartOptions {
   readonly maxRings?: number
@@ -234,6 +233,3 @@ function chartBytes(node: DatabaseNode): number {
 function sumItemCount(candidates: readonly Candidate[]): number {
   return candidates.reduce((sum, candidate) => sum + (candidate.itemCount ?? 0), 0)
 }
-
-export function chartNodePercentage(segment: ChartSegment): string { return `${segment.percentage.toFixed(1)}%` }
-export { toSummary }

@@ -1,8 +1,9 @@
 import { DatabaseSync, type StatementSync } from "node:sqlite"
 import { createHmac, randomBytes } from "node:crypto"
 import { join } from "node:path"
-import type { Breadcrumb, DirectoryScanState, NodeSummary, SizeAccuracy } from "../shared/contracts"
+import type { Breadcrumb, DirectoryScanState, NodeSummary } from "../shared/contracts"
 import type { FolderSizeEstimate } from "./scan-metadata"
+import { NodeReadModel, toSummary } from "./index-store"
 import type { ChartDataSource } from "./index-store"
 import type { DatabaseNode, InsertNode, ScanDatabaseMeta } from "./database"
 import { measureScan } from "./diagnostics"
@@ -120,8 +121,8 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   readonly #deleteEstimateRoot: StatementSync
   readonly #deleteEstimateStatement: StatementSync
   readonly #taskIsFocused: StatementSync
-  readonly #getNodeStatement: StatementSync
   readonly #parentIdStatement: StatementSync
+  readonly #readModel: NodeReadModel
   readonly #estimateRootNames = new Set<string>()
   #metadataBatch: MetadataBatch | undefined
   #state: State = "building"
@@ -255,6 +256,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
         const run = this.#database.prepare('SELECT 1 AS found FROM scan_run WHERE singleton = 1').get() as { found?: number } | undefined
         if (!run?.found) throw new Error('Construction database has no scan run')
       }
+      this.#readModel = new NodeReadModel(this.#database, "construction")
       this.#insertNode = this.#database.prepare(`
         INSERT INTO nodes (id, parent_id, name, path, kind, own_bytes, size_bytes, device, inode, scan_state, enumeration_complete, depth)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -317,7 +319,6 @@ export class ProgressiveScanDatabase implements ChartDataSource {
       this.#deleteEstimateRoot = this.#database.prepare("DELETE FROM estimate_roots WHERE name = ?")
       this.#deleteEstimateStatement = this.#database.prepare("DELETE FROM size_estimates WHERE node_id = ?")
       this.#taskIsFocused = this.#database.prepare("SELECT focused FROM directory_tasks WHERE node_id = ?")
-      this.#getNodeStatement = this.#database.prepare(`${NODE_SELECT} WHERE n.id = ?`)
       this.#parentIdStatement = this.#database.prepare("SELECT parent_id AS parentId FROM nodes WHERE id = ?")
       const estimateRoots = this.#database.prepare("SELECT name FROM estimate_roots").all() as unknown as Array<{ name: string }>
       for (const estimate of estimateRoots) this.#estimateRootNames.add(estimate.name)
@@ -600,18 +601,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
 
   getEstimatedRemainder(id: string): number {
     this.#flushPendingMetadataBatch()
-    const row = this.#database.prepare(`
-      SELECT n.scan_state AS scanState, COALESCE(e.estimated_bytes, 0) AS estimatedBytes,
-        COALESCE((SELECT SUM(
-          CASE WHEN child.scan_state IN ('queued', 'scanning')
-            THEN MAX(child.size_bytes, COALESCE(childEstimate.estimated_bytes, 0))
-            ELSE child.size_bytes
-          END
-        ) FROM nodes child LEFT JOIN size_estimates childEstimate ON childEstimate.node_id = child.id WHERE child.parent_id = n.id), 0) AS childBytes
-      FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id WHERE n.id = ?
-    `).get(id) as unknown as { scanState?: string; estimatedBytes?: number; childBytes?: number } | undefined
-    if (!row || (row.scanState !== "queued" && row.scanState !== "scanning")) return 0
-    return Math.max(0, Number(row.estimatedBytes ?? 0) - Number(row.childBytes ?? 0))
+    return this.#readModel.getEstimatedRemainder(id)
   }
 
   promoteSubtree(id: string): boolean {
@@ -785,36 +775,25 @@ export class ProgressiveScanDatabase implements ChartDataSource {
 
   getNode(id: string): DatabaseNode | undefined {
     this.#flushPendingMetadataBatch()
-    const row = this.#getNodeStatement.get(id) as unknown as Record<string, unknown> | undefined
-    return row ? databaseNode(row) : undefined
+    return this.#readModel.getNode(id)
   }
 
   getChildren(id: string, limit: number): readonly DatabaseNode[] {
     this.#flushPendingMetadataBatch()
-    const safeLimit = Math.max(0, Math.min(400, Math.floor(limit)))
-    if (safeLimit === 0) return []
-    const rows = this.#database.prepare(`${NODE_SELECT} WHERE n.parent_id = ? ORDER BY display_size DESC, n.name COLLATE NOCASE ASC, n.id ASC LIMIT ?`).all(id, safeLimit) as unknown as Array<Record<string, unknown>>
-    return rows.map(databaseNode)
+    return this.#readModel.getChildren(id, limit)
   }
 
   countChildren(id: string): number {
     this.#flushPendingMetadataBatch()
-    const row = this.#database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(id) as { count?: number }
-    return Number(row.count ?? 0)
+    return this.#readModel.countChildren(id)
   }
 
   getLargestItems(id: string): readonly NodeSummary[] {
-    return this.getChildren(id, 100).map((node) => ({ id: node.id, parentId: node.parentId, name: node.name, kind: node.kind, sizeBytes: node.sizeBytes, ...(node.estimatedBytes > 0 ? { estimatedSizeBytes: node.estimatedBytes } : {}), directChildren: node.directChildren, descendantCount: node.descendantCount, unreadableCount: node.unreadableCount, scanState: node.scanState, sizeAccuracy: node.sizeAccuracy }))
+    return this.getChildren(id, 100).map(toSummary)
   }
 
   getBreadcrumbs(id: string): readonly Breadcrumb[] {
-    const rows = this.#database.prepare(`
-      WITH RECURSIVE trail(id, parent_id, name, depth) AS (
-        SELECT id, parent_id, name, 0 FROM nodes WHERE id = ?
-        UNION ALL SELECT nodes.id, nodes.parent_id, nodes.name, trail.depth + 1 FROM nodes JOIN trail ON nodes.id = trail.parent_id
-      ) SELECT id, name FROM trail ORDER BY depth DESC
-    `).all(id) as unknown as Breadcrumb[]
-    return rows.map((row) => ({ id: String(row.id), name: String(row.name) }))
+    return this.#readModel.getBreadcrumbs(id)
   }
 
   resolvePath(id: string): string | undefined {
@@ -957,33 +936,6 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     if (this.#state === "closed") return
     try { measureScan("database-close", () => this.#database.close()) }
     finally { this.#state = "closed" }
-  }
-}
-
-const NODE_SELECT = `SELECT n.id, n.parent_id AS parentId, n.name, n.path, n.kind,
-  n.size_bytes AS confirmedBytes,
-  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN MAX(n.size_bytes, COALESCE(e.estimated_bytes, 0)) ELSE n.size_bytes END AS display_size,
-  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN COALESCE(e.estimated_bytes, 0) ELSE 0 END AS estimatedBytes,
-  n.direct_children AS directChildren, n.descendant_count AS descendantCount,
-  n.unreadable_count AS unreadableCount, n.own_unreadable AS ownUnreadable, n.scan_state AS scanState
-  FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id`
-
-function databaseNode(row: Record<string, unknown>): DatabaseNode {
-  const state = String(row.scanState)
-  const scanState: DirectoryScanState = state === "queued" || state === "scanning" || state === "unreadable" ? state : "complete"
-  const confirmedBytes = safeBytes(row.confirmedBytes)
-  const estimatedBytes = scanState === "queued" || scanState === "scanning" ? safeBytes(row.estimatedBytes) : 0
-  const unreadableCount = Math.max(0, Number(row.unreadableCount ?? 0))
-  const sizeAccuracy: SizeAccuracy = scanState === "complete" && unreadableCount === 0 && row.ownUnreadable !== 1
-    ? "exact"
-    : scanState === "queued" || scanState === "scanning"
-      ? estimatedBytes > 0 ? "estimated" : "partial"
-      : "partial"
-  return {
-    id: String(row.id), parentId: row.parentId === null ? null : String(row.parentId), name: String(row.name), path: String(row.path),
-    kind: row.kind === "directory" ? "directory" : "file", sizeBytes: safeBytes(row.display_size), confirmedBytes, estimatedBytes,
-    directChildren: Math.max(0, Number(row.directChildren ?? 0)), descendantCount: Math.max(0, Number(row.descendantCount ?? 0)),
-    unreadableCount, scanState, sizeAccuracy
   }
 }
 

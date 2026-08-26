@@ -2,12 +2,12 @@ import { createHmac } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { lstat, statfs } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
-import type { Breadcrumb, DirectoryScanState, NodeSummary, SizeAccuracy } from '../shared/contracts'
+import type { Breadcrumb, NodeSummary } from '../shared/contracts'
 import { buildChart } from './chart'
 import type { FullScanResumeLoad } from './full-scan-resume'
 import { isFullScanResumeDescriptor } from './full-scan-resume'
+import { CONSTRUCTION_NODE_SELECT, NodeReadModel, nodeFromRow, toSummary } from './index-store'
 import type { ChartDataSource, DatabaseNode } from './index-store'
-import { toSummary } from './index-store'
 import type { ProgressivePreview } from './scanner'
 
 type ConstructionResumeLoad = Extract<FullScanResumeLoad, { readonly kind: 'construction' }>
@@ -139,10 +139,10 @@ async function openConstructionDatabase(load: ConstructionResumeLoad): Promise<{
     const revision = Number(revisionRow?.value)
     if (!Number.isSafeInteger(revision) || revision < 0) return undefined
 
-    const roots = database.prepare(`${NODE_SELECT} WHERE n.parent_id IS NULL`).all() as unknown as Array<Record<string, unknown>>
+    const roots = database.prepare(`${CONSTRUCTION_NODE_SELECT} WHERE n.parent_id IS NULL`).all() as unknown as Array<Record<string, unknown>>
     if (roots.length !== 1) return undefined
     const rootRow = roots[0]!
-    const root = databaseNode(rootRow)
+    const root = nodeFromRow(rootRow)
     const target = descriptor.target
     const expectedRootId = `n-${createHmac('sha256', Buffer.from(run.seed as string, 'hex')).update('root').update('\0').update(target).digest('hex').slice(0, 32)}`
     if (root.id !== expectedRootId || root.kind !== 'directory' || root.parentId !== null || root.path !== target || root.name !== displayName(target)) return undefined
@@ -173,60 +173,27 @@ class ConstructionPreviewDatabase implements ConstructionDatabase {
   readonly rootId: string
   readonly target: string
   readonly revision: number
+  readonly #readModel: NodeReadModel
   #closed = false
 
   constructor(private readonly database: DatabaseSync, target: string, rootId: string, revision: number) {
     this.target = target
     this.rootId = rootId
     this.revision = revision
+    this.#readModel = new NodeReadModel(this.database, "construction")
   }
 
-  getNode(id: string): DatabaseNode | undefined {
-    const row = this.database.prepare(`${NODE_SELECT} WHERE n.id = ?`).get(id) as unknown as Record<string, unknown> | undefined
-    return row ? databaseNode(row) : undefined
-  }
+  getNode(id: string): DatabaseNode | undefined { return this.#readModel.getNode(id) }
 
-  getChildren(id: string, limit: number): readonly DatabaseNode[] {
-    const safeLimit = Math.max(0, Math.min(400, Math.floor(limit)))
-    if (safeLimit === 0) return []
-    const rows = this.database.prepare(`${NODE_SELECT} WHERE n.parent_id = ? ORDER BY display_size DESC, n.name COLLATE NOCASE ASC, n.id ASC LIMIT ?`).all(id, safeLimit) as unknown as Array<Record<string, unknown>>
-    return rows.map(databaseNode)
-  }
+  getChildren(id: string, limit: number): readonly DatabaseNode[] { return this.#readModel.getChildren(id, limit) }
 
-  countChildren(id: string): number {
-    const row = this.database.prepare('SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?').get(id) as { count?: unknown } | undefined
-    return nonnegativeInteger(row?.count)
-  }
+  countChildren(id: string): number { return this.#readModel.countChildren(id) }
 
-  getEstimatedRemainder(id: string): number {
-    const row = this.database.prepare(`
-      SELECT n.scan_state AS scanState, COALESCE(e.estimated_bytes, 0) AS estimatedBytes,
-        COALESCE((SELECT SUM(
-          CASE WHEN child.scan_state IN ('queued', 'scanning')
-            THEN MAX(child.size_bytes, COALESCE(childEstimate.estimated_bytes, 0))
-            ELSE child.size_bytes
-          END
-        ) FROM nodes child LEFT JOIN size_estimates childEstimate ON childEstimate.node_id = child.id WHERE child.parent_id = n.id), 0) AS childBytes
-      FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id WHERE n.id = ?
-    `).get(id) as unknown as { scanState?: unknown; estimatedBytes?: unknown; childBytes?: unknown } | undefined
-    if (!row || (row.scanState !== 'queued' && row.scanState !== 'scanning')) return 0
-    return Math.max(0, safeBytes(row.estimatedBytes) - safeBytes(row.childBytes))
-  }
+  getEstimatedRemainder(id: string): number { return this.#readModel.getEstimatedRemainder(id) }
 
-  getLargestItems(id: string): readonly NodeSummary[] { return this.getChildren(id, 100).map(toSummary) }
+  getLargestItems(id: string): readonly NodeSummary[] { return this.#readModel.getLargestItems(id) }
 
-  getBreadcrumbs(id: string): readonly Breadcrumb[] {
-    const result: Breadcrumb[] = []
-    const seen = new Set<string>()
-    let current = this.getNode(id)
-    while (current && !seen.has(current.id)) {
-      seen.add(current.id)
-      result.unshift({ id: current.id, name: current.name })
-      if (current.parentId === null) return result
-      current = this.getNode(current.parentId)
-    }
-    return []
-  }
+  getBreadcrumbs(id: string): readonly Breadcrumb[] { return this.#readModel.getBreadcrumbs(id) }
 
   resolvePath(id: string): string | undefined {
     const path = this.getNode(id)?.path
@@ -237,33 +204,6 @@ class ConstructionPreviewDatabase implements ConstructionDatabase {
     if (this.#closed) return
     this.#closed = true
     this.database.close()
-  }
-}
-
-const NODE_SELECT = `SELECT n.id, n.parent_id AS parentId, n.name, n.path, n.kind,
-  n.size_bytes AS confirmedBytes,
-  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN MAX(n.size_bytes, COALESCE(e.estimated_bytes, 0)) ELSE n.size_bytes END AS display_size,
-  CASE WHEN n.scan_state IN ('queued', 'scanning') THEN COALESCE(e.estimated_bytes, 0) ELSE 0 END AS estimatedBytes,
-  n.direct_children AS directChildren, n.descendant_count AS descendantCount,
-  n.unreadable_count AS unreadableCount, n.own_unreadable AS ownUnreadable, n.scan_state AS scanState
-  FROM nodes n LEFT JOIN size_estimates e ON e.node_id = n.id`
-
-function databaseNode(row: Record<string, unknown>): DatabaseNode {
-  const state = String(row.scanState)
-  const scanState: DirectoryScanState = state === 'queued' || state === 'scanning' || state === 'unreadable' ? state : 'complete'
-  const confirmedBytes = safeBytes(row.confirmedBytes)
-  const estimatedBytes = scanState === 'queued' || scanState === 'scanning' ? safeBytes(row.estimatedBytes) : 0
-  const unreadableCount = Math.max(0, safeNumber(row.unreadableCount))
-  const sizeAccuracy: SizeAccuracy = scanState === 'complete' && unreadableCount === 0 && row.ownUnreadable !== 1
-    ? 'exact'
-    : scanState === 'queued' || scanState === 'scanning'
-      ? estimatedBytes > 0 ? 'estimated' : 'partial'
-      : 'partial'
-  return {
-    id: String(row.id), parentId: row.parentId === null ? null : String(row.parentId), name: String(row.name), path: String(row.path),
-    kind: row.kind === 'directory' ? 'directory' : 'file', sizeBytes: safeBytes(row.display_size), confirmedBytes,
-    estimatedBytes, directChildren: nonnegativeInteger(row.directChildren), descendantCount: nonnegativeInteger(row.descendantCount),
-    unreadableCount, scanState, sizeAccuracy
   }
 }
 
@@ -283,21 +223,6 @@ function blockBytes(blocks: number | bigint, size: number | bigint): number | un
   const blockSize = Number(size)
   const value = blockCount * blockSize
   return Number.isFinite(value) && value >= 0 ? value : undefined
-}
-
-function safeBytes(value: unknown): number {
-  const number = typeof value === 'bigint' ? Number(value) : Number(value)
-  return Number.isFinite(number) && number > 0 ? number : 0
-}
-
-function safeNumber(value: unknown): number {
-  const number = typeof value === 'bigint' ? Number(value) : Number(value)
-  return Number.isFinite(number) ? number : 0
-}
-
-function nonnegativeInteger(value: unknown): number {
-  const number = safeNumber(value)
-  return Number.isSafeInteger(number) && number >= 0 ? number : 0
 }
 
 function isWithinPath(path: string, parent: string): boolean {
