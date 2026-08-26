@@ -415,7 +415,10 @@ export class OrbisController {
     await mkdir(this.indexDirectory, { recursive: true, mode: 0o700 })
     if (this.#closed) throw new Error('Orbis is shutting down')
     const generation = ++this.#generation
-    let saved = await this.#resumeStore.load()
+    // Peek at the saved scan (descriptor + file existence) instead of fully
+    // validating it: the worker performs the authoritative validation before
+    // resuming, and full validation is O(index size) on large saved scans.
+    let saved = await this.#resumeStore.peek()
     if (process.env.ORBIS_DISABLE_INCREMENTAL_SCAN === '1' && saved.kind !== 'none') {
       if (saved.kind === 'construction' || saved.kind === 'candidate' || saved.descriptor) await this.#resumeStore.discard(saved.descriptor?.scanId)
       else await this.#resumeStore.removeDescriptor()

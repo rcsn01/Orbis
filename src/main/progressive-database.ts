@@ -242,6 +242,10 @@ export class ProgressiveScanDatabase implements ChartDataSource {
         );
         CREATE TABLE dirty_scopes (path TEXT PRIMARY KEY);
       `)
+      // Recovery and the construction-state rebuild resolve file identities
+      // by (device, inode); without this index each lookup scans the whole
+      // nodes table (O(n^2) on large saved scans, stalling resume).
+      this.#database.exec('CREATE INDEX IF NOT EXISTS nodes_identity_idx ON nodes (device, inode)')
       if (!openExisting && options) {
         const seed = options.nodeIdSeed ?? randomBytes(32).toString('hex')
         if (!/^[0-9a-f]{64}$/u.test(seed)) throw new Error('Invalid progressive scan node ID seed')
@@ -836,6 +840,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
             AND aliases.device = nodes.device AND aliases.inode = nodes.inode
         WHERE nodes.kind = 'file' AND nodes.device <> '' AND nodes.inode <> '';
       DROP INDEX nodes_parent_preview;
+      DROP INDEX nodes_identity_idx;
       DROP TABLE directory_tasks;
       DROP TABLE hardlink_owners;
       DROP TABLE scan_state;
@@ -880,18 +885,35 @@ export class ProgressiveScanDatabase implements ChartDataSource {
       groups.set(key, group)
     }
     const seed = Buffer.from(this.nodeIdSeed, 'hex')
+    const existingNodes = this.#database.prepare("SELECT id, device, inode FROM nodes WHERE kind = 'file'")
+    const deleteNode = this.#database.prepare('DELETE FROM nodes WHERE id = ?')
+    const parentNode = this.#database.prepare('SELECT path, depth FROM nodes WHERE id = ?')
+    const bumpDuplicate = this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
+      direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`)
+    // The canonical node for a unique file already carries the deterministic
+    // id, so the per-group delete+insert is a no-op for the common case.
+    // Resolve identities in memory instead of issuing an indexed query per
+    // group: on large saved scans the per-group statements dominate resume
+    // (measured ~2 min for 276k groups) while the map pass is milliseconds.
+    const fileNodes = new Map<string, string[]>()
+    for (const row of existingNodes.all() as unknown as Array<{ id: string; device: string; inode: string }>) {
+      const key = `${row.device}\0${row.inode}`
+      const ids = fileNodes.get(key) ?? []
+      ids.push(row.id)
+      fileNodes.set(key, ids)
+    }
     for (const group of groups.values()) {
       group.sort((left, right) => Buffer.compare(Buffer.from(left.pathKey, 'utf8'), Buffer.from(right.pathKey, 'utf8')))
       const owner = group[0]!
-      const existing = this.#database.prepare("SELECT id FROM nodes WHERE kind = 'file' AND device = ? AND inode = ?").all(owner.device, owner.inode) as unknown as Array<{ id: string }>
-      for (const row of existing) this.#database.prepare('DELETE FROM nodes WHERE id = ?').run(row.id)
-      const parent = this.#database.prepare('SELECT path, depth FROM nodes WHERE id = ?').get(owner.parentId) as { path?: string; depth?: number } | undefined
-      if (!parent?.path) continue
       const id = `n-${createHmac('sha256', seed).update(owner.parentId).update('\0').update(owner.name).digest('hex').slice(0, 32)}`
+      const existing = fileNodes.get(`${owner.device}\0${owner.inode}`) ?? []
+      if (group.length === 1 && existing.length === 1 && existing[0] === id) continue
+      for (const rowId of existing) deleteNode.run(rowId)
+      const parent = parentNode.get(owner.parentId) as { path?: string; depth?: number } | undefined
+      if (!parent?.path) continue
       this.#insertNode.run(id, owner.parentId, owner.name, join(parent.path, owner.name), 'file', owner.allocatedBytes, owner.allocatedBytes, owner.device, owner.inode, 'complete', 1, Number(parent.depth ?? 0) + 1)
       this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
-      for (const duplicate of group.slice(1)) this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
-        direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`).run(duplicate.parentId)
+      for (const duplicate of group.slice(1)) bumpDuplicate.run(duplicate.parentId)
     }
     this.#database.exec(`
       UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);

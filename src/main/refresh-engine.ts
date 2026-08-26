@@ -6,7 +6,7 @@ import type { ChangeJournal } from './change-journal'
 import { createChangeJournal, FSEVENT_FLAGS, nativeChangeJournalAddon } from './change-journal'
 import { prepareDatabaseDirectory, readMetadata, removeDatabaseFiles } from './database'
 import { measureScanAsync, runWithScanDiagnostics } from './diagnostics'
-import { FullScanResumeStore, type FullScanResumeDescriptor } from './full-scan-resume'
+import { FullScanResumeStore, type FullScanResumeDescriptor, type FullScanResumeLoad } from './full-scan-resume'
 import type { IndexManifest, JournalCursor } from './index-manifest'
 import { planDirtyScopes, scanReplacementScopes } from './incremental-scanner'
 import { IncrementalFallbackError, replaceIndexSubtrees } from './persistent-index-database'
@@ -45,7 +45,7 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
   const activeCursor = request.active?.manifest.journal
   const saved = journal && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1'
     ? await new FullScanResumeStore(request.indexDirectory).load(request.target) : { kind: 'none' as const }
-  if (saved.kind === 'construction' || saved.kind === 'candidate') return fullRefresh(request, journal)
+  if (saved.kind === 'construction' || saved.kind === 'candidate') return fullRefresh(request, journal, undefined, 0, 0, saved)
   if (process.env.ORBIS_DISABLE_INCREMENTAL_SCAN === '1' || !request.active || !journal || !activeCursor) {
     return fullRefresh(request, journal)
   }
@@ -116,10 +116,10 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
   }
 }
 
-async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | undefined, fallbackReason?: string, raceRetry = 0, resumeRestarts = 0): Promise<RefreshOutcome> {
+async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | undefined, fallbackReason?: string, raceRetry = 0, resumeRestarts = 0, saved?: FullScanResumeLoad): Promise<RefreshOutcome> {
   const resumeStore = new FullScanResumeStore(request.indexDirectory)
   const resumable = journal && resumeRestarts < MAX_RESUME_RESTARTS && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1'
-    ? await prepareResumableFullScan(request, journal, resumeStore)
+    ? await prepareResumableFullScan(request, journal, resumeStore, saved)
     : undefined
   if (!resumable) await Promise.all([removeDatabaseFiles(request.partialPath), removeDatabaseFiles(request.publishedPath)])
   const checkpoint = resumable
@@ -198,9 +198,10 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
       if (!closed) return retryFullRefresh(request, journal, 'reconciliation-window-busy', raceRetry, resumeRestarts)
     }
   }
+  const effectiveFallback = fallbackReason ?? resumable?.expiredReason
   return {
     kind: 'candidate', strategy: 'full', result, journal: cursor,
-    ...(fallbackReason ? { fallbackReason } : {})
+    ...(effectiveFallback ? { fallbackReason: effectiveFallback } : {})
   }
 }
 
@@ -267,20 +268,28 @@ interface PreparedResume {
   readonly candidatePath: string
   readonly resume: boolean
   readonly candidate?: string
+  readonly expiredReason?: string
 }
 
-async function prepareResumableFullScan(request: RefreshRequest, journal: ChangeJournal, store: FullScanResumeStore): Promise<PreparedResume | undefined> {
-  const loaded = await store.load(request.target)
+async function prepareResumableFullScan(request: RefreshRequest, journal: ChangeJournal, store: FullScanResumeStore, saved?: FullScanResumeLoad): Promise<PreparedResume | undefined> {
+  const loaded = saved ?? await store.load(request.target)
   if (loaded.kind === 'construction' || loaded.kind === 'candidate') {
     const checkpoint = safeCheckpoint(journal, request.target)
     if (!checkpoint || checkpoint.device !== loaded.descriptor.journalDevice || checkpoint.journalUuid !== loaded.descriptor.journalUuid) {
       await store.discard(loaded.descriptor.scanId)
-      return createResumableFullScan(request, journal, store)
+      const fresh = await createResumableFullScan(request, journal, store)
+      return fresh ? { ...fresh, expiredReason: 'resume-expired:journal-changed' } : undefined
     }
-    const history = journal.readChanges(request.target, store.cursor(loaded.descriptor), MAX_EVENTS, HISTORY_TIMEOUT_MS)
+    // Validate only the window since the saved scan's last successful drain.
+    // The scan absorbed everything up to that watermark into its dirty scopes
+    // (persisted at each 30s drain and at pause), so replaying from the
+    // scan-start baseline would discard a perfectly resumable scan whenever
+    // the long window trips a journal limit or drop flag.
+    const history = journal.readChanges(request.target, store.cursor(loaded.descriptor, loaded.drainedThrough), MAX_EVENTS, HISTORY_TIMEOUT_MS)
     if (history.requiresFullScan) {
       await store.discard(loaded.descriptor.scanId)
-      return createResumableFullScan(request, journal, store)
+      const fresh = await createResumableFullScan(request, journal, store)
+      return fresh ? { ...fresh, expiredReason: `resume-expired:${history.reason ?? 'history-unavailable'}` } : undefined
     }
     return loaded.kind === 'candidate'
       ? { descriptor: loaded.descriptor, partialPath: joinOwned(store.directory, loaded.descriptor.partialFile), candidatePath: loaded.candidatePath, candidate: loaded.candidatePath, resume: true }
@@ -337,9 +346,19 @@ function readCandidateResult(path: string, generation: number): ScanResult {
 }
 
 async function retryFullRefresh(request: RefreshRequest, journal: ChangeJournal, reason: string, raceRetry: number, resumeRestarts: number): Promise<RefreshOutcome> {
-  await new FullScanResumeStore(request.indexDirectory).discard().catch(() => false)
-  if (raceRetry < 1) return fullRefresh(request, journal, reason, raceRetry + 1, resumeRestarts)
-  await Promise.all([removeDatabaseFiles(request.partialPath), removeDatabaseFiles(request.publishedPath)])
+  if (raceRetry < 1) {
+    await new FullScanResumeStore(request.indexDirectory).discard().catch(() => false)
+    return fullRefresh(request, journal, reason, raceRetry + 1, resumeRestarts)
+  }
+  // Preserve the checkpointed candidate and descriptor: a busy FSEvents
+  // window must not destroy resumable progress. The controller surfaces the
+  // saved scan as canceled-with-resume so the user can retry once the window
+  // settles. Unreferenced artifacts (no saved scan) are removed here and
+  // leftover run files are cleaned by the controller's failure path.
+  const saved = await new FullScanResumeStore(request.indexDirectory).load(request.target)
+  if (saved.kind !== 'construction' && saved.kind !== 'candidate') {
+    await Promise.all([removeDatabaseFiles(request.partialPath), removeDatabaseFiles(request.publishedPath)])
+  }
   throw new Error(`Unable to close the full-scan FSEvents window: ${reason}`)
 }
 

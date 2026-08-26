@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { writeFileSync } from 'node:fs'
-import { access, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -197,6 +197,37 @@ describe('Orbis refresh engine', () => {
     await expect(access(publishedPath)).rejects.toThrow()
   })
 
+  it('keeps the resumable candidate when the post-scan window cannot close', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-window-busy-'))
+    cleanup.push(directory)
+    const target = join(directory, 'target')
+    const indexes = join(directory, 'indexes')
+    for (const name of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']) await mkdir(join(target, name), { recursive: true })
+    await mkdir(indexes, { recursive: true })
+    const stats = await import('node:fs/promises').then(({ lstat }) => lstat(target))
+    // Every post-scan window reports more dirty scopes than the incremental
+    // bound, so the full-scan retry exhausts while a valid checkpoint exists.
+    const journal: ChangeJournal = {
+      captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'busy-journal', eventId: '10' }),
+      readChanges: () => ({
+        throughEventId: '20', requiresFullScan: false,
+        events: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'].map((name, index) => ({
+          relativePath: `${name}/file`, eventId: String(index + 11), flags: FSEVENT_FLAGS.itemModified | FSEVENT_FLAGS.itemIsFile
+        }))
+      })
+    }
+    const id = '81234567-89ab-4cde-8fab-0123456789ab'
+    await expect(refreshPersistentIndex({
+      generation: 1, target, indexDirectory: indexes, partialPath: join(indexes, `index-${id}.partial.sqlite`),
+      publishedPath: join(indexes, `index-${id}.sqlite`), changeJournal: journal
+    })).rejects.toThrow('Unable to close the full-scan FSEvents window: too-many-dirty-scopes')
+    // The exhausted window preserves the checkpointed candidate so the
+    // controller can offer a resume once the window settles.
+    const saved = await new FullScanResumeStore(indexes).load(target)
+    expect(saved.kind === 'construction' || saved.kind === 'candidate').toBe(true)
+    await expect(access(join(indexes, `index-${id}.sqlite`))).resolves.toBeUndefined()
+  })
+
   it('publishes a full scan despite an odd rename count in the final drain', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-churn-'))
     cleanup.push(directory)
@@ -280,6 +311,105 @@ describe('Orbis refresh engine', () => {
       publishedPath: join(indexes, 'unused.sqlite'), active: { manifest, path: baseline.publishedPath }, changeJournal: journal
     })
     expect(outcome).toEqual({ kind: 'unchanged', strategy: 'incremental', journal: { uuid: 'journal', eventId: '9' }, totals: baseline.totals, basePublicationId: manifest.publicationId })
+  })
+
+  it('resumes a canceled scan from its drain watermark when the scan-start baseline is no longer verifiable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-resume-watermark-'))
+    cleanup.push(directory)
+    const target = join(directory, 'target')
+    const indexes = join(directory, 'indexes')
+    await mkdir(join(target, 'folder'), { recursive: true })
+    await mkdir(indexes, { recursive: true })
+    for (let index = 0; index < 50; index += 1) await writeFile(join(target, 'folder', `f${index}`), Buffer.alloc(1024))
+    const stats = await lstat(target)
+    const id = '91234567-89ab-4cde-8fab-0123456789ab'
+    const partialPath = join(indexes, `index-${id}.partial.sqlite`)
+    const publishedPath = join(indexes, `index-${id}.sqlite`)
+
+    // Run 1: cancel as soon as the scan reports progress. The failure path
+    // performs a final drain that advances the persisted watermark to 11.
+    const abort = new AbortController()
+    const journal1: ChangeJournal = {
+      captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'w-journal', eventId: '10' }),
+      readChanges: () => ({ throughEventId: '11', requiresFullScan: false, events: [
+        { relativePath: 'folder/f0', eventId: '11', flags: FSEVENT_FLAGS.itemModified | FSEVENT_FLAGS.itemIsFile }
+      ] })
+    }
+    await refreshPersistentIndex({
+      generation: 1, target, indexDirectory: indexes, partialPath, publishedPath,
+      changeJournal: journal1, signal: abort.signal,
+      onProgress: () => abort.abort()
+    }).catch(() => undefined)
+    const saved = await new FullScanResumeStore(indexes).load(target)
+    expect(saved.kind).toBe('construction')
+    if (saved.kind !== 'construction') throw new Error('Expected a construction resume state')
+    expect(saved.drainedThrough).toBe('11')
+    const partialInode = (await lstat(partialPath)).ino
+
+    // Run 2: the scan-start baseline is no longer verifiable (event-limit),
+    // but the window since the last drain is. The saved scan must be reused.
+    const journal2: ChangeJournal = {
+      captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'w-journal', eventId: '10' }),
+      readChanges: (_target, cursor) => cursor.eventId === '10'
+        ? { throughEventId: '10', events: [], requiresFullScan: true, reason: 'event-limit' }
+        : { throughEventId: '11', events: [], requiresFullScan: false }
+    }
+    const outcome = await refreshPersistentIndex({
+      generation: 2, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal2
+    })
+    expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'w-journal', eventId: '11' } })
+    // The resumed scan continued the same partial (renamed on publication)
+    // instead of discarding it and re-scanning from an empty database.
+    expect((await lstat(publishedPath)).ino).toBe(partialInode)
+  })
+
+  it('reuses a finalized candidate from its drain watermark when the scan-start baseline is no longer verifiable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-candidate-watermark-'))
+    cleanup.push(directory)
+    const target = join(directory, 'target')
+    const indexes = join(directory, 'indexes')
+    await mkdir(join(target, 'folder'), { recursive: true })
+    await mkdir(indexes, { recursive: true })
+    await writeFile(join(target, 'folder', 'file'), Buffer.alloc(1024))
+    const stats = await lstat(target)
+    const id = 'a1234567-89ab-4cde-8fab-0123456789ab'
+    const partialPath = join(indexes, `index-${id}.partial.sqlite`)
+    const publishedPath = join(indexes, `index-${id}.sqlite`)
+
+    // Run 1: a full scan whose final drain advances the watermark to 41 with
+    // a dirty scope inside the target; the candidate stays resumable.
+    const journal1: ChangeJournal = {
+      captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'cand-journal', eventId: '40' }),
+      readChanges: (_target, cursor) => cursor.eventId === '40'
+        ? { throughEventId: '41', requiresFullScan: false, events: [
+          { relativePath: 'folder/file', eventId: '41', flags: FSEVENT_FLAGS.itemModified | FSEVENT_FLAGS.itemIsFile }
+        ] }
+        : { throughEventId: '41', events: [], requiresFullScan: false }
+    }
+    const first = await refreshPersistentIndex({
+      generation: 1, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal1
+    })
+    expect(first).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'cand-journal', eventId: '41' } })
+    const saved = await new FullScanResumeStore(indexes).load(target)
+    expect(saved.kind).toBe('candidate')
+    if (saved.kind !== 'candidate') throw new Error('Expected a candidate resume state')
+    expect(saved.drainedThrough).toBe('41')
+    const candidateInode = (await lstat(publishedPath)).ino
+
+    // Run 2: the scan-start baseline is no longer verifiable (kernel-dropped),
+    // but the window since the candidate's drain watermark is. The candidate
+    // must be reused without re-scanning.
+    const journal2: ChangeJournal = {
+      captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'cand-journal', eventId: '40' }),
+      readChanges: (_target, cursor) => cursor.eventId === '40'
+        ? { throughEventId: '40', events: [], requiresFullScan: true, reason: 'kernel-dropped' }
+        : { throughEventId: '41', events: [], requiresFullScan: false }
+    }
+    const outcome = await refreshPersistentIndex({
+      generation: 2, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal2
+    })
+    expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'cand-journal', eventId: '41' } })
+    expect((await lstat(publishedPath)).ino).toBe(candidateInode)
   })
 })
 

@@ -34,4 +34,21 @@ describe.skipIf(!available)('live Orbis FSEvents addon', () => {
       expect(batch.events.every((event) => /^\d+$/u.test(event.eventId))).toBe(true)
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
+
+  it('captures a flushed checkpoint that includes just-written activity', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-fsevents-fence-'))
+    const addon = createRequire(import.meta.url)(addonPath) as NativeChangeJournalAddon
+    try {
+      const before = addon.captureVolumeCheckpoint(directory)
+      await writeFile(join(directory, 'fresh.dat'), Buffer.alloc(4096, 1))
+      // The checkpoint must observe the write even though the daemon may not
+      // have flushed its per-device journal when the file was created.
+      const after = addon.captureVolumeCheckpoint(directory)
+      expect(BigInt(after.eventId)).toBeGreaterThan(BigInt(before.eventId))
+      // Replaying from the checkpoint must not re-report the write.
+      const batch = addon.readChanges(directory, after.journalUuid!, after.eventId, 10_000, 5_000)
+      expect(batch.requiresFullScan).toBe(false)
+      expect(batch.events).toEqual([])
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
 })

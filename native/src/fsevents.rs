@@ -28,7 +28,7 @@ pub fn capture_volume_checkpoint(target: String) -> Result<VolumeCheckpoint> {
     #[cfg(target_os = "macos")]
     {
         let volume = macos::volume(&target)?;
-        let event_id = macos::event_fence(volume.device);
+        let event_id = macos::flushed_fence(volume.device, &volume.relative_target);
         return Ok(VolumeCheckpoint {
             device: volume.device.to_string(),
             journal_uuid: macos::journal_uuid(volume.device),
@@ -190,7 +190,7 @@ mod macos {
 
     pub(super) struct Volume {
         pub device: libc::dev_t,
-        relative_target: String,
+        pub(super) relative_target: String,
     }
 
     pub(super) fn volume(target: &str) -> Result<Volume> {
@@ -237,6 +237,128 @@ mod macos {
             .unwrap_or_default()
             .as_secs_f64();
         unsafe { FSEventsGetLastEventIdForDeviceBeforeTime(device, seconds) }
+    }
+
+    pub(super) fn flushed_fence(device: libc::dev_t, watch_relative: &str) -> u64 {
+        // A bare FSEventsGetLastEventIdForDeviceBeforeTime reads the lazily
+        // flushed per-device journal; on a busy volume it can lag thousands of
+        // events behind the live stream, so a checkpoint taken from it treats
+        // recent-but-prior activity as if it happened during the scan. Fence
+        // through a flushed stream instead, mirroring read_changes: the flush
+        // pushes the daemon's buffered events and GetLatestEventId then reports
+        // the true watermark. When the watch path is quiet or the stream cannot
+        // start, fall back to the journal fence; a quiet path cannot produce a
+        // phantom change window either way.
+        let since = event_fence(device);
+        if begin_replay().is_err() {
+            return since;
+        }
+        let fence = flushed_fence_inner(device, watch_relative, since);
+        finish_replay();
+        fence
+    }
+
+    fn flushed_fence_inner(device: libc::dev_t, watch_relative: &str, since: u64) -> u64 {
+        let Ok(watched) = create_cf_string(watch_relative) else {
+            return since;
+        };
+        let values = [watched as *const c_void];
+        let paths = unsafe {
+            CFArrayCreate(kCFAllocatorDefault, values.as_ptr(), 1, &kCFTypeArrayCallBacks)
+        };
+        unsafe { CFRelease(watched as CFTypeRef) };
+        if paths.is_null() {
+            return since;
+        }
+
+        let run_loop = unsafe { CFRunLoopGetCurrent() };
+        let mut collector = FenceCollector { max_seen: since };
+        let mut context = FSEventStreamContext {
+            version: 0,
+            info: (&mut collector as *mut FenceCollector).cast(),
+            retain: ptr::null(),
+            release: ptr::null(),
+            copy_description: ptr::null(),
+        };
+        let flags =
+            CREATE_USE_CF_TYPES | CREATE_WATCH_ROOT | CREATE_FILE_EVENTS | CREATE_FULL_HISTORY;
+        let stream = unsafe {
+            FSEventStreamCreateRelativeToDevice(
+                kCFAllocatorDefault,
+                collect_fence_events,
+                &mut context,
+                device,
+                paths,
+                since,
+                0.05,
+                flags,
+            )
+        };
+        unsafe { CFRelease(paths as CFTypeRef) };
+        if stream.is_null() {
+            return since;
+        }
+
+        unsafe { FSEventStreamScheduleWithRunLoop(stream, run_loop, kCFRunLoopDefaultMode) };
+        let started = unsafe { FSEventStreamStart(stream) } != 0;
+        if !started {
+            unsafe {
+                FSEventStreamStop(stream);
+                FSEventStreamUnscheduleFromRunLoop(stream, run_loop, kCFRunLoopDefaultMode);
+                FSEventStreamInvalidate(stream);
+                FSEventStreamRelease(stream);
+            }
+            return since;
+        }
+
+        unsafe { FSEventStreamFlushSync(stream) };
+        let mut fence = since;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            fence = fence
+                .max(collector.max_seen)
+                .max(unsafe { FSEventStreamGetLatestEventId(stream) });
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let seconds = deadline
+                .saturating_duration_since(now)
+                .as_secs_f64()
+                .min(0.05);
+            unsafe {
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 1);
+                FSEventStreamFlushSync(stream);
+            }
+        }
+        unsafe {
+            FSEventStreamStop(stream);
+            FSEventStreamUnscheduleFromRunLoop(stream, run_loop, kCFRunLoopDefaultMode);
+            FSEventStreamInvalidate(stream);
+            FSEventStreamRelease(stream);
+        }
+        fence
+    }
+
+    struct FenceCollector {
+        max_seen: u64,
+    }
+
+    unsafe extern "C" fn collect_fence_events(
+        _stream: FSEventStreamRef,
+        info: *mut c_void,
+        count: usize,
+        _paths: *mut c_void,
+        _flags: *const u32,
+        ids: *const u64,
+    ) {
+        if info.is_null() || ids.is_null() {
+            return;
+        }
+        let collector = &mut *(info as *mut FenceCollector);
+        for index in 0..count {
+            collector.max_seen = collector.max_seen.max(*ids.add(index));
+        }
     }
 
     pub(super) fn journal_uuid(device: libc::dev_t) -> Option<String> {

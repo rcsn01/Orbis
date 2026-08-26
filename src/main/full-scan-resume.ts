@@ -38,8 +38,14 @@ export interface FullScanResumeDescriptor {
 export type FullScanResumeLoad =
   | { readonly kind: 'none' }
   | { readonly kind: 'restart'; readonly reason: string; readonly descriptor?: FullScanResumeDescriptor }
-  | { readonly kind: 'construction'; readonly descriptor: FullScanResumeDescriptor; readonly partialPath: string; readonly candidatePath: string; readonly checkpointSequence: number; readonly checkpointedAt: string }
-  | { readonly kind: 'candidate'; readonly descriptor: FullScanResumeDescriptor; readonly candidatePath: string }
+  | { readonly kind: 'construction'; readonly descriptor: FullScanResumeDescriptor; readonly partialPath: string; readonly candidatePath: string; readonly checkpointSequence: number; readonly checkpointedAt: string; readonly drainedThrough: string }
+  | { readonly kind: 'candidate'; readonly descriptor: FullScanResumeDescriptor; readonly candidatePath: string; readonly drainedThrough: string }
+
+export type FullScanResumePeek =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'restart'; readonly descriptor?: FullScanResumeDescriptor }
+  | { readonly kind: 'construction'; readonly descriptor: FullScanResumeDescriptor }
+  | { readonly kind: 'candidate'; readonly descriptor: FullScanResumeDescriptor }
 
 export class FullScanResumeStore {
   readonly descriptorPath: string
@@ -102,6 +108,20 @@ export class FullScanResumeStore {
     } catch { return undefined }
   }
 
+  async peek(): Promise<FullScanResumePeek> {
+    // Cheap controller-side lookahead: descriptor plus file existence only.
+    // The worker performs the authoritative validation before resuming.
+    const descriptor = await this.readDescriptor()
+    if (!descriptor) return { kind: 'none' }
+    const [partial, candidate] = await Promise.all([
+      regularFile(join(this.directory, descriptor.partialFile)),
+      regularFile(join(this.directory, descriptor.candidateFile))
+    ])
+    if (candidate) return { kind: 'candidate', descriptor }
+    if (partial) return { kind: 'construction', descriptor }
+    return { kind: 'restart', descriptor }
+  }
+
   async load(expectedTarget?: string): Promise<FullScanResumeLoad> {
     let raw: unknown
     try {
@@ -125,12 +145,16 @@ export class FullScanResumeStore {
     const [partial, candidate] = await Promise.all([regularFile(partialPath), regularFile(candidatePath)])
     if (candidate) {
       const valid = validateCandidate(candidatePath, descriptor)
-      return valid ? { kind: 'candidate', descriptor, candidatePath } : { kind: 'restart', reason: 'invalid-finalized-candidate', descriptor }
+      return valid ? { kind: 'candidate', descriptor, candidatePath, drainedThrough: readCandidateDrainedThrough(candidatePath) ?? descriptor.journalBaseline } : { kind: 'restart', reason: 'invalid-finalized-candidate', descriptor }
     }
     if (!partial) return { kind: 'restart', reason: 'missing-resume-database', descriptor }
-    if (validateCandidate(partialPath, descriptor)) {
+    // A partial without resume metadata is mid-scan: skip the full candidate
+    // validation (integrity and foreign-key checks alone are O(index size))
+    // and go straight to the construction checks. Resume metadata is written
+    // only when a resumable scan finalizes, so its absence is decisive.
+    if (hasResumeDrainedThrough(partialPath) && validateCandidate(partialPath, descriptor)) {
       await durablePromote(partialPath, candidatePath, this.directory)
-      return { kind: 'candidate', descriptor, candidatePath }
+      return { kind: 'candidate', descriptor, candidatePath, drainedThrough: readCandidateDrainedThrough(candidatePath) ?? descriptor.journalBaseline }
     }
     try {
       const database = new DatabaseSync(partialPath)
@@ -140,14 +164,16 @@ export class FullScanResumeStore {
         const foreignKeys = database.prepare('PRAGMA foreign_key_check').all()
         const row = database.prepare(`SELECT scan_id AS scanId, node_id_seed AS seed, checkpoint_sequence AS checkpointSequence,
           checkpointed_at AS checkpointedAt, journal_device AS journalDevice, journal_uuid AS journalUuid,
-          journal_baseline AS journalBaseline FROM scan_run WHERE singleton = 1`).get() as Record<string, unknown> | undefined
+          journal_baseline AS journalBaseline, drained_through AS drainedThrough FROM scan_run WHERE singleton = 1`).get() as Record<string, unknown> | undefined
         if (integrity.integrity_check !== 'ok' || foreignKeys.length > 0 || !row || row.scanId !== descriptor.scanId
           || typeof row.seed !== 'string' || !/^[0-9a-f]{64}$/u.test(row.seed)
           || row.journalDevice !== descriptor.journalDevice || row.journalUuid !== descriptor.journalUuid
-          || row.journalBaseline !== descriptor.journalBaseline) return { kind: 'restart', reason: 'invalid-resume-database', descriptor }
+          || row.journalBaseline !== descriptor.journalBaseline
+          || !decimal(row.drainedThrough) || BigInt(row.drainedThrough) < BigInt(descriptor.journalBaseline)) return { kind: 'restart', reason: 'invalid-resume-database', descriptor }
         return {
           kind: 'construction', descriptor, partialPath, candidatePath,
-          checkpointSequence: Number(row.checkpointSequence ?? 0), checkpointedAt: String(row.checkpointedAt ?? descriptor.createdAt)
+          checkpointSequence: Number(row.checkpointSequence ?? 0), checkpointedAt: String(row.checkpointedAt ?? descriptor.createdAt),
+          drainedThrough: String(row.drainedThrough)
         }
       } finally { database.close() }
     } catch { return { kind: 'restart', reason: 'invalid-resume-database', descriptor } }
@@ -275,6 +301,23 @@ function validateCandidate(path: string, descriptor: FullScanResumeDescriptor): 
         && Number(totals.disappearingItems) === Number(semantic.disappearing) && Number(totals.symlinks) === Number(semantic.symlinks)
         && Number(totals.nestedMounts) === Number(semantic.mounts) && Number(totals.duplicateHardLinks) === Number(semantic.duplicates)
         && Number.isFinite(elapsed) && elapsed >= 0
+    } finally { database.close() }
+  } catch { return false }
+}
+function readCandidateDrainedThrough(path: string): string | undefined {
+  try {
+    const database = new DatabaseSync(path, { readOnly: true })
+    try {
+      const row = database.prepare(`SELECT value FROM metadata WHERE key = 'resumeDrainedThrough'`).get() as { value?: string } | undefined
+      return typeof row?.value === 'string' && decimal(row.value) ? row.value : undefined
+    } finally { database.close() }
+  } catch { return undefined }
+}
+function hasResumeDrainedThrough(path: string): boolean {
+  try {
+    const database = new DatabaseSync(path, { readOnly: true })
+    try {
+      return database.prepare(`SELECT 1 AS found FROM metadata WHERE key = 'resumeDrainedThrough'`).get() !== undefined
     } finally { database.close() }
   } catch { return false }
 }
