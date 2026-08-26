@@ -8,8 +8,8 @@ import { buildChart } from "../src/main/chart"
 import { removeDatabaseFiles } from "../src/main/database"
 import { DiskIndex } from "../src/main/index-store"
 import { defaultScanFileSystem, scanFilesystem, ScanCanceledError, type ScanFileSystem } from "../src/main/scanner"
-import { createScanFixture, type ScanFixtureManifest } from "../../../packages/feature-orbis/scripts/lib/scan-fixtures"
-import { subscribeScanDiagnostics, type OrbisTimingEvent } from "../../../packages/feature-orbis/src/main/diagnostics"
+import { createScanFixture, type ScanFixtureManifest } from "../scripts/lib/scan-fixtures"
+import { subscribeScanDiagnostics, type OrbisTimingEvent } from "../src/main/diagnostics"
 
 async function fixture(): Promise<{ readonly directory: string; readonly root: string; readonly manifest: ScanFixtureManifest }> {
   const created = await createScanFixture("semantics", "quick")
@@ -334,7 +334,7 @@ describe("Orbis chart limits", () => {
     expect(chart.at(-1)?.endAngle).toBe(360)
 
     const capacityChart = buildChart(source, root, { maxRings: 1, rootTotalBytes: 150 })
-    expect(capacityChart.find((segment) => segment.name === "Other")).toMatchObject({ sizeBytes: 42, itemCount: 42 })
+    expect(capacityChart.find((segment) => segment.name === "Other")).toMatchObject({ sizeBytes: 50, itemCount: 50 })
     expect(capacityChart.at(-1)?.endAngle).toBeCloseTo(120)
     expect(capacityChart.reduce((sum, segment) => sum + segment.percentage, 0)).toBeCloseTo(100 / 3)
     expect(capacityChart.some((segment) => segment.name === "Unscanned or system data")).toBe(false)

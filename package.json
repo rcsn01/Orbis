@@ -12,10 +12,10 @@
   "scripts": {
     "predev": "pnpm build:worker && pnpm test:dev-ready",
     "dev": "electron-vite dev",
-    "build:worker": "node ../../packages/feature-orbis/scripts/build-worker.mjs --outDir worker-dist",
-    "native:mac": "node ../../scripts/build-orbis-native.mjs --target aarch64-apple-darwin",
-    "native:build": "node ../../scripts/build-orbis-native.mjs",
-    "native:test": "cargo test --manifest-path ../../packages/feature-orbis/native/Cargo.toml",
+    "build:worker": "node scripts/build-worker.mjs --outDir worker-dist",
+    "native:mac": "node scripts/build-native.mjs --target aarch64-apple-darwin",
+    "native:build": "node scripts/build-native.mjs",
+    "native:test": "cargo test --manifest-path native/Cargo.toml",
     "prebuild:app": "pnpm build:worker && pnpm native:mac",
     "build:app": "electron-vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -23,8 +23,8 @@
     "test:watch": "vitest",
     "test:dev-ready": "node ../../scripts/check-electron-install.mjs .",
     "test:smoke": "playwright test",
-    "benchmark:scan": "pnpm build:worker && node ../../packages/feature-orbis/scripts/run-scan-benchmark.mjs",
-    "benchmark:scan:prepare": "pnpm build:worker && node ../../packages/feature-orbis/scripts/run-scan-benchmark.mjs --prepare-only benchmark-dist",
+    "benchmark:scan": "pnpm build:worker && node scripts/run-scan-benchmark.mjs",
+    "benchmark:scan:prepare": "pnpm build:worker && node scripts/run-scan-benchmark.mjs --prepare-only benchmark-dist",
     "benchmark:scan:prepared": "node benchmark-dist/benchmark-scan.mjs --worker worker-dist/scan-worker.mjs",
     "verify": "pnpm typecheck && pnpm native:test && pnpm test && pnpm build:app",
     "package:dir": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir --arm64",
@@ -32,7 +32,6 @@
   },
   "dependencies": {
     "@moirasia/desktop-shell": "file:../../packages/desktop-shell",
-    "@moirasia/feature-orbis": "file:../../packages/feature-orbis",
     "@moirasia/ui-react": "file:../../packages/ui-react",
     "react": "19.2.8",
     "react-dom": "19.2.8"

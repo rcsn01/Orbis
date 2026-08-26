@@ -1,0 +1,20 @@
+[package]
+name = "orbis-metadata"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2.16.17", default-features = false, features = ["napi8"] }
+napi-derive = "2.16.13"
+
+[build-dependencies]
+napi-build = "2.1.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
+libc = "0.2.186"

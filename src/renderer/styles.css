@@ -1,3 +1,93 @@
-@import '@moirasia/feature-orbis/styles.css';
+@import "@moirasia/ui-react/styles.css";
+@import "@moirasia/desktop-shell/styles.css";
+@source "./**/*.{ts,tsx}";
 
-html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.orbis-feature-panel { width: 100%; height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--background); color: var(--foreground); }
+.orbis-feature-panel__header { display: flex; flex: 0 0 36px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--background); color: var(--foreground); }
+.orbis-feature-panel__header strong { font-size: 12px; font-weight: 650; }
+
+.orbis-feature-panel__page { max-width: none; padding: 24px 30px; overflow: auto; }
+.orbis-feature-panel__page, .orbis-feature-panel__page * { box-sizing: border-box; }
+.orbis-feature-panel__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.orbis-feature-panel__actions button svg, .orbis-feature-panel__panel-heading button svg { width: 14px; height: 14px; }
+.orbis-feature-panel__alert { margin: 0 0 14px; }
+.orbis-feature-panel__alert [data-slot="alert-description"] { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.orbis-feature-panel__state { display: grid; min-height: 300px; place-items: center; color: var(--muted-foreground); }
+.orbis-feature-panel__scan-status { display: grid; grid-template-columns: minmax(180px, 240px) minmax(120px, 1fr) auto; align-items: center; gap: 14px; margin-bottom: 16px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: color-mix(in oklab, var(--card), transparent 12%); }
+.orbis-feature-panel__scan-status-copy { display: grid; min-width: 0; gap: 3px; }
+.orbis-feature-panel__scan-status-copy strong { font-size: 12px; }
+.orbis-feature-panel__scan-status-copy span { overflow: hidden; color: var(--muted-foreground); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.orbis-feature-panel__scan-progress { min-width: 90px; }
+.orbis-feature-panel__volume-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 18px; }
+.orbis-feature-panel__volume-metric { display: grid; gap: 5px; min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: 11px 13px; background: var(--card); }
+.orbis-feature-panel__volume-metric span { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.orbis-feature-panel__volume-metric strong { font-size: 16px; letter-spacing: -.02em; }
+.orbis-feature-panel__volume-metric--muted strong { color: var(--muted-foreground); }
+.orbis-feature-panel__workspace { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .85fr); align-items: start; gap: 18px; min-height: 0; }
+.orbis-feature-panel__chart-panel, .orbis-feature-panel__inspector > [data-slot="card"] { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
+.orbis-feature-panel__chart-panel { min-height: 510px; padding: 18px; }
+.orbis-feature-panel__panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.orbis-feature-panel__panel-heading h2 { margin: 0; font-size: 18px; letter-spacing: -.025em; }
+.orbis-feature-panel__folder-size { display: flex; align-items: baseline; gap: 6px; margin: 4px 0 0; color: var(--muted-foreground); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.orbis-feature-panel__folder-size strong { color: var(--foreground); font-weight: 600; }
+.orbis-feature-panel__eyebrow { margin: 0 0 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 700; letter-spacing: .12em; }
+.orbis-feature-panel__breadcrumbs { display: flex; min-width: 0; align-items: center; gap: 5px; margin: 14px 0 2px; overflow: auto; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.orbis-feature-panel__breadcrumbs span { display: inline-flex; align-items: center; gap: 5px; }
+.orbis-feature-panel__breadcrumbs button { border: 0; border-radius: 4px; padding: 3px 4px; color: inherit; background: transparent; cursor: pointer; }
+.orbis-feature-panel__breadcrumbs button:hover, .orbis-feature-panel__breadcrumbs button:focus-visible { color: var(--foreground); background: var(--accent); outline: none; }
+.orbis-feature-panel__sunburst-wrap { position: relative; display: grid; min-height: 430px; place-items: center; overflow: visible; }
+.orbis-feature-panel__sunburst { display: block; width: min(100%, 520px); height: auto; overflow: visible; }
+.orbis-feature-panel__sunburst-segment { stroke: var(--card); stroke-width: 1.5; cursor: pointer; outline: none; transition: opacity 120ms ease, filter 120ms ease; }
+.orbis-feature-panel__sunburst-segment:hover, .orbis-feature-panel__sunburst-segment:focus-visible { filter: brightness(1.18); opacity: .92; stroke: var(--foreground); stroke-width: 2.5; }
+.orbis-feature-panel__sunburst-segment:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.orbis-feature-panel__sunburst-hatch, .orbis-feature-panel__sunburst-estimate { pointer-events: none; }
+.orbis-feature-panel__sunburst-hatch-line { fill: none; stroke: rgb(255 255 255 / 58%); stroke-width: 1.35; }
+.orbis-feature-panel__sunburst-estimate-dot { fill: rgb(255 255 255 / 72%); }
+.orbis-feature-panel__sunburst-center { fill: var(--card); stroke: var(--border); stroke-width: 1; }
+.orbis-feature-panel__sunburst-center-label { fill: var(--foreground); font-size: 19px; font-weight: 650; }
+.orbis-feature-panel__sunburst-center-caption { fill: var(--muted-foreground); font-size: 9px; }
+.orbis-feature-panel__sunburst-tooltip { position: fixed; z-index: 30; display: grid; gap: 3px; max-width: 240px; pointer-events: none; border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 5px 20px rgb(0 0 0 / 18%); font-size: 11px; }
+.orbis-feature-panel__sunburst-tooltip span { color: var(--muted-foreground); }
+.orbis-feature-panel__sunburst-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--muted-foreground); font-size: 12px; }
+.orbis-feature-panel__sunburst-geometry { display: none; }
+.orbis-feature-panel__inspector { display: grid; min-width: 0; gap: 14px; }
+.orbis-feature-panel__selection-card, .orbis-feature-panel__largest-card { min-width: 0; }
+.orbis-feature-panel__selection-card--empty { min-height: 132px; }
+.orbis-feature-panel__selection-card [data-slot="card-header"], .orbis-feature-panel__largest-card [data-slot="card-header"] { gap: 7px; }
+.orbis-feature-panel__selection-card [data-slot="card-title"], .orbis-feature-panel__largest-card [data-slot="card-title"] { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orbis-feature-panel__selection-card [data-slot="card-content"] { padding-top: 0; }
+.orbis-feature-panel__largest-list { max-height: 360px; margin: 0; padding: 0; overflow: auto; list-style: none; }
+.orbis-feature-panel__largest-list li + li { border-top: 1px solid var(--border); }
+.orbis-feature-panel__largest-list button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 10px; min-height: 39px; border: 0; padding: 5px 0; color: var(--foreground); background: transparent; text-align: left; cursor: pointer; }
+.orbis-feature-panel__largest-list button:hover, .orbis-feature-panel__largest-list button:focus-visible { color: var(--primary); outline: none; }
+.orbis-feature-panel__largest-list-name { display: flex; min-width: 0; align-items: center; gap: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.orbis-feature-panel__largest-list-size { flex: 0 0 auto; color: var(--muted-foreground); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.orbis-feature-panel__node-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--muted-foreground); }
+.orbis-feature-panel__node-dot--directory { background: #5a87c5; }
+.orbis-feature-panel__muted { margin: 0; color: var(--muted-foreground); font-size: 12px; }
+.orbis-feature-panel__empty { display: grid; min-height: 360px; place-items: center; align-content: center; gap: 8px; color: var(--muted-foreground); text-align: center; }
+.orbis-feature-panel__empty strong { color: var(--foreground); font-size: 14px; }
+.orbis-feature-panel__empty span, .orbis-feature-panel__empty p { max-width: 380px; margin: 0; font-size: 12px; }
+.orbis-feature-panel__empty--large { min-height: 420px; }
+.orbis-feature-panel__empty--large h2 { margin: 0; color: var(--foreground); font-size: 20px; }
+.orbis-feature-panel__empty--large p { margin: 0 0 8px; }
+.orbis-feature-panel__permission-warning [data-slot="alert-description"] { align-items: center; }
+
+@media (max-width: 980px) {
+  .orbis-feature-panel__page { padding: 20px; }
+  .orbis-feature-panel__workspace { grid-template-columns: minmax(0, 1fr); }
+  .orbis-feature-panel__chart-panel { min-height: 450px; }
+  .orbis-feature-panel__sunburst-wrap { min-height: 390px; }
+  .orbis-feature-panel__largest-list { max-height: 260px; }
+}
+@media (max-width: 650px) {
+  .orbis-feature-panel__page { padding: 16px; }
+  .orbis-feature-panel__scan-status { grid-template-columns: 1fr auto; }
+  .orbis-feature-panel__scan-progress { grid-column: 1 / -1; grid-row: 2; }
+  .orbis-feature-panel__volume-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .orbis-feature-panel__chart-panel { padding: 12px; }
+  .orbis-feature-panel__sunburst-wrap { min-height: 330px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .orbis-feature-panel__sunburst-segment { transition: none; }
+}

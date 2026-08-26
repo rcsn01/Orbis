@@ -8,8 +8,6 @@ export default defineConfig({
     dedupe: ["react", "react-dom"],
     alias: {
       electron: resolve("node_modules/electron"),
-      "@moirasia/feature-orbis/renderer/panel": resolve("../../packages/feature-orbis/src/renderer/App.tsx"),
-      "@moirasia/feature-orbis": resolve("../../packages/feature-orbis/src"),
       "@shared": resolve("src/shared"),
       "@main": resolve("src/main")
     }

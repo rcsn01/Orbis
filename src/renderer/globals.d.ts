@@ -1,5 +1,5 @@
 import type { AppearanceApi } from '@moirasia/desktop-shell'
-import type { OrbisApi } from '@moirasia/feature-orbis/shared/contracts'
+import type { OrbisApi } from '../shared/contracts'
 
 declare global {
   interface Window {

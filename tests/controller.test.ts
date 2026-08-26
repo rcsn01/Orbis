@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { OrbisController, type OrbisWorker } from "../src/main/controller"
 import { scanFilesystem, type ProgressivePreview } from "../src/main/scanner"
-import { subscribeControllerDiagnostics, type OrbisTimingEvent } from "../../../packages/feature-orbis/src/main/diagnostics"
+import { subscribeControllerDiagnostics, type OrbisTimingEvent } from "../src/main/diagnostics"
 
 class FakeWorker implements OrbisWorker {
   readonly messages: unknown[] = []

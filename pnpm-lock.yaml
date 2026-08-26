@@ -11,9 +11,6 @@ importers:
       '@moirasia/desktop-shell':
         specifier: file:../../packages/desktop-shell
         version: file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
-      '@moirasia/feature-orbis':
-        specifier: file:../../packages/feature-orbis
-        version: file:../../packages/feature-orbis(@types/react@19.2.18)(electron@43.1.0)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
       '@moirasia/ui-react':
         specifier: file:../../packages/ui-react
         version: file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
@@ -26,7 +23,7 @@ importers:
     devDependencies:
       '@napi-rs/cli':
         specifier: 3.3.0
-        version: 3.3.0(@emnapi/runtime@1.11.2)(@types/node@25.9.5)
+        version: 3.3.0(@emnapi/runtime@1.9.2)(@types/node@25.9.5)
       '@playwright/test':
         specifier: 1.58.2
         version: 1.58.2
@@ -901,13 +898,6 @@ packages:
     peerDependencies:
       electron: '>=41 <44'
       react: '>=19 <20'
-
-  '@moirasia/feature-orbis@file:../../packages/feature-orbis':
-    resolution: {directory: ../../packages/feature-orbis, type: directory}
-    peerDependencies:
-      electron: '>=41 <44'
-      react: '>=19 <20'
-      react-dom: '>=19 <20'
 
   '@moirasia/ui-react@file:../../packages/ui-react':
     resolution: {directory: ../../packages/ui-react, type: directory}
@@ -4963,24 +4953,6 @@ snapshots:
       electron: 43.1.0
       react: 19.2.8
 
-  '@moirasia/feature-orbis@file:../../packages/feature-orbis(@types/react@19.2.18)(electron@43.1.0)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
-    dependencies:
-      '@moirasia/desktop-shell': file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
-      '@moirasia/ui-react': file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
-      electron: 43.1.0
-      react: 19.2.8
-      react-dom: 19.2.8(react@19.2.8)
-    transitivePeerDependencies:
-      - '@cfworker/json-schema'
-      - '@date-fns/tz'
-      - '@types/react'
-      - babel-plugin-macros
-      - date-fns
-      - react-is
-      - redux
-      - supports-color
-      - typescript
-
   '@moirasia/ui-react@file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
     dependencies:
       '@base-ui/react': 1.7.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -5005,7 +4977,7 @@ snapshots:
       - supports-color
       - typescript
 
-  '@napi-rs/cli@3.3.0(@emnapi/runtime@1.11.2)(@types/node@25.9.5)':
+  '@napi-rs/cli@3.3.0(@emnapi/runtime@1.9.2)(@types/node@25.9.5)':
     dependencies:
       '@inquirer/prompts': 7.10.1(@types/node@25.9.5)
       '@napi-rs/cross-toolchain': 1.0.3
@@ -5020,7 +4992,7 @@ snapshots:
       semver: 7.8.5
       typanion: 3.14.0
     optionalDependencies:
-      '@emnapi/runtime': 1.11.2
+      '@emnapi/runtime': 1.9.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { createOrderedConcurrentMapper } from "../../../packages/feature-orbis/src/main/ordered-concurrent-map"
+import { createOrderedConcurrentMapper } from "../src/main/ordered-concurrent-map"
 
 describe("orderedConcurrentMap", () => {
   it("keeps a bounded sliding window and yields in input order", async () => {

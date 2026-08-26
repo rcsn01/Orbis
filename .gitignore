@@ -7,4 +7,6 @@ playwright-report/
 coverage/
 benchmark-results/
 benchmark-dist/
+native/target/
+native/*.node
 .DS_Store

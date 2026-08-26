@@ -1,7 +1,7 @@
 import { app, Menu, session } from 'electron'
 import { runLoginItemControl } from '@moirasia/desktop-shell/main'
-import { feature } from '@moirasia/feature-orbis/main'
-import { standaloneContext } from '@moirasia/feature-orbis/standalone'
+import { feature } from './feature'
+import { standaloneContext } from './standalone'
 
 app.setName('Orbis')
 app.setAppUserModelId('com.opense.Orbis')
