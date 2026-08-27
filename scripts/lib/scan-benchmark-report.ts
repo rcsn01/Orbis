@@ -68,7 +68,7 @@ function validateResume(resume: ResumeBenchmarkSample): void {
   const unknown = actualPhases.some((phase) => !requiredPhases.includes(phase) && !optionalPhases.includes(phase))
   if (missingRequired || unknown) throw new Error('Resume phases do not match the diagnostic schema')
   for (const phase of RESUME_SCAN_PHASES) assertDuration(resume.phases[phase], phase)
-  for (const phase of optionalPhases) if (resume.phases[phase] !== undefined) assertDuration(resume.phases[phase], phase)
+  for (const phase of optionalPhases) if (actualPhases.includes(phase)) assertDuration(resume.phases[phase], phase)
   validateCounters(resume.counters)
 }
 
