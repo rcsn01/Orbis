@@ -43,12 +43,12 @@ export interface ChangeBatch {
 
 export interface ChangeJournal {
   captureCheckpoint(target: string): VolumeCheckpoint
-  readChanges(target: string, cursor: JournalCursor, maxEvents: number, timeoutMs: number): ChangeBatch
+  readChanges(target: string, cursor: JournalCursor, maxEvents: number, timeoutMs: number, quietMs?: number): ChangeBatch
 }
 
 export interface NativeChangeJournalAddon {
   captureVolumeCheckpoint(target: string): VolumeCheckpoint
-  readChanges(target: string, expectedUuid: string, sinceId: string, maxEvents: number, timeoutMs: number): ChangeBatch
+  readChanges(target: string, expectedUuid: string, sinceId: string, maxEvents: number, timeoutMs: number, quietMs: number): ChangeBatch
 }
 
 export class NativeChangeJournal implements ChangeJournal {
@@ -62,11 +62,11 @@ export class NativeChangeJournal implements ChangeJournal {
     return { device: value.device, journalUuid: value.journalUuid, eventId: value.eventId }
   }
 
-  readChanges(target: string, cursor: JournalCursor, maxEvents: number, timeoutMs: number): ChangeBatch {
+  readChanges(target: string, cursor: JournalCursor, maxEvents: number, timeoutMs: number, quietMs = 100): ChangeBatch {
     if (!nonempty(cursor.uuid) || !decimal(cursor.eventId)) return malformed(cursor.eventId)
     let raw: ChangeBatch
     try {
-      raw = this.addon.readChanges(target, cursor.uuid, cursor.eventId, boundedInteger(maxEvents, 1, 100_000), boundedInteger(timeoutMs, 1, 30_000))
+      raw = this.addon.readChanges(target, cursor.uuid, cursor.eventId, boundedInteger(maxEvents, 1, 100_000), boundedInteger(timeoutMs, 1, 30_000), boundedInteger(quietMs, 0, 30_000))
     } catch {
       return { throughEventId: cursor.eventId, events: [], requiresFullScan: true, reason: 'history-unavailable' }
     }

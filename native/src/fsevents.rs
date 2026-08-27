@@ -28,7 +28,16 @@ pub fn capture_volume_checkpoint(target: String) -> Result<VolumeCheckpoint> {
     #[cfg(target_os = "macos")]
     {
         let volume = macos::volume(&target)?;
-        let event_id = macos::flushed_fence(volume.device, &volume.relative_target);
+        // The default fence is a single synchronous stream flush: tight
+        // watermark at ~50ms instead of the 250ms deadline loop. The bare
+        // wall-clock fence ("store") can lag the lazily flushed per-device
+        // journal by seconds, which widens the drain window and can trip the
+        // target-root-dirty restart, so it is opt-in for experimentation.
+        let event_id = match std::env::var("ORBIS_CHECKPOINT_FENCE").as_deref() {
+            Ok("flush") => macos::flushed_fence(volume.device, &volume.relative_target),
+            Ok("store") => macos::event_fence(volume.device),
+            _ => macos::flushed_fence_once(volume.device, &volume.relative_target),
+        };
         return Ok(VolumeCheckpoint {
             device: volume.device.to_string(),
             journal_uuid: macos::journal_uuid(volume.device),
@@ -49,19 +58,21 @@ pub fn read_changes(
     since_id: String,
     max_events: u32,
     timeout_ms: u32,
+    quiet_ms: u32,
 ) -> Result<ChangeBatch> {
     #[cfg(target_os = "macos")]
     {
         let since = parse_event_id(&since_id)?;
         let max_events = max_events.clamp(1, 100_000);
         let timeout_ms = timeout_ms.clamp(1, 30_000);
+        let quiet_ms = quiet_ms.clamp(0, 30_000);
         if macos::begin_replay().is_err() {
             return Ok(macos::busy_fallback(since));
         }
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result =
-                macos::read_changes(&target, &expected_uuid, since, max_events, timeout_ms);
+                macos::read_changes(&target, &expected_uuid, since, max_events, timeout_ms, quiet_ms);
             macos::finish_replay();
             let _ = sender.send(result);
         });
@@ -71,7 +82,7 @@ pub fn read_changes(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (target, expected_uuid, since_id, max_events, timeout_ms);
+        let _ = (target, expected_uuid, since_id, max_events, timeout_ms, quiet_ms);
         Err(Error::from_reason("FSEvents is only available on macOS"))
     }
 }
@@ -253,12 +264,27 @@ mod macos {
         if begin_replay().is_err() {
             return since;
         }
-        let fence = flushed_fence_inner(device, watch_relative, since);
+        let fence = flushed_fence_inner(device, watch_relative, since, Duration::from_millis(250));
         finish_replay();
         fence
     }
 
-    fn flushed_fence_inner(device: libc::dev_t, watch_relative: &str, since: u64) -> u64 {
+    // A single synchronous flush instead of the 250ms deadline loop: the flush
+    // pushes the daemon's buffered events and GetLatestEventId reports the
+    // true watermark, so the fence is tight at a fraction of the cost. Events
+    // generated during the flush land after the watermark and are caught by
+    // the drains and the post-scan replay.
+    pub(super) fn flushed_fence_once(device: libc::dev_t, watch_relative: &str) -> u64 {
+        let since = event_fence(device);
+        if begin_replay().is_err() {
+            return since;
+        }
+        let fence = flushed_fence_inner(device, watch_relative, since, Duration::ZERO);
+        finish_replay();
+        fence
+    }
+
+    fn flushed_fence_inner(device: libc::dev_t, watch_relative: &str, since: u64, max_wait: Duration) -> u64 {
         let Ok(watched) = create_cf_string(watch_relative) else {
             return since;
         };
@@ -313,7 +339,7 @@ mod macos {
 
         unsafe { FSEventStreamFlushSync(stream) };
         let mut fence = since;
-        let deadline = Instant::now() + Duration::from_millis(250);
+        let deadline = Instant::now() + max_wait;
         loop {
             fence = fence
                 .max(collector.max_seen)
@@ -383,6 +409,7 @@ mod macos {
         since: u64,
         max_events: u32,
         timeout_ms: u32,
+        quiet_ms: u32,
     ) -> Result<ChangeBatch> {
         let volume = volume(target)?;
         let Some(actual_uuid) = journal_uuid(volume.device) else {
@@ -457,7 +484,12 @@ mod macos {
             flush_fence = Some(unsafe { FSEventStreamGetLatestEventId(stream) });
             let now = Instant::now();
             let deadline = now + Duration::from_millis(timeout_ms as u64);
-            let quiet_deadline = now + Duration::from_millis((timeout_ms as u64).min(100));
+            // The quiet deadline bounds how long a caught-up stream waits for
+            // stragglers before returning. It is separate from the history
+            // deadline: drains and replays pass a small value so a quiet
+            // volume costs ~10ms instead of ~100ms per call, while busy
+            // volumes still get the full timeout to read history.
+            let quiet_deadline = now + Duration::from_millis((quiet_ms as u64).min(timeout_ms as u64));
             loop {
                 if collector.history_done
                     && (flush_fence.unwrap_or(since) > since || Instant::now() >= quiet_deadline)

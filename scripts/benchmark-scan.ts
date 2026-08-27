@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { link, mkdir, readdir, rename, rm, stat, statfs, writeFile } from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { cpus, release, totalmem } from 'node:os'
 import { dirname, resolve } from 'node:path'
@@ -617,7 +617,11 @@ function gitState(directory: string): { readonly sha: string; readonly dirty: bo
   const hash = createHash('sha256')
   hash.update(spawnSync('git', ['-C', directory, 'diff', '--binary', 'HEAD'], { encoding: 'buffer' }).stdout)
   const untracked = spawnSync('git', ['-C', directory, 'ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort()
-  for (const path of untracked) { hash.update(path); hash.update(readFileSync(resolve(directory, path))) }
+  for (const path of untracked) {
+    hash.update(path)
+    const fullPath = resolve(directory, path)
+    if (statSync(fullPath).isFile()) hash.update(readFileSync(fullPath))
+  }
   return { sha, dirty: status.length > 0, status, workingTreeHash: hash.digest('hex') }
 }
 

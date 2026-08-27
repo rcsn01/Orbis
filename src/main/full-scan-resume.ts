@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { chmod, lstat, open, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import {
   EXCLUSION_POLICY_VERSION, HARD_LINK_ORDERING_VERSION, PERSISTENT_ACCOUNTING_VERSION,
@@ -7,7 +7,9 @@ import {
 } from './index-manifest'
 
 export const FULL_SCAN_CONSTRUCTION_VERSION = 1
-export const FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION = 1
+// Version 1 used `traversing`; version 2 owns explicit lifecycle phases.
+export const FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION = 2
+const SUPPORTED_CONSTRUCTION_SCHEMA_VERSIONS = new Set([1, FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION])
 export const SCAN_RESUME_FILE = 'scan-resume.json'
 
 const SCAN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
@@ -139,13 +141,18 @@ export class FullScanResumeStore {
     const targetIdentity = await regularDirectoryIdentity(descriptor.target)
     if (!targetIdentity) return { kind: 'restart', reason: 'target-unavailable', descriptor }
     if (targetIdentity !== `${descriptor.targetDevice}:${descriptor.targetInode}`) return { kind: 'restart', reason: 'target-replaced', descriptor }
+    await removeConstructionStagingArtifacts(this.directory, descriptor)
 
     const partialPath = join(this.directory, descriptor.partialFile)
     const candidatePath = join(this.directory, descriptor.candidateFile)
     const [partial, candidate] = await Promise.all([regularFile(partialPath), regularFile(candidatePath)])
     if (candidate) {
       const valid = validateCandidate(candidatePath, descriptor)
-      return valid ? { kind: 'candidate', descriptor, candidatePath, drainedThrough: readCandidateDrainedThrough(candidatePath) ?? descriptor.journalBaseline } : { kind: 'restart', reason: 'invalid-finalized-candidate', descriptor }
+      if (valid) return { kind: 'candidate', descriptor, candidatePath, drainedThrough: readCandidateDrainedThrough(candidatePath) ?? descriptor.journalBaseline }
+      // A publication can leave a corrupt/incomplete candidate beside the
+      // last durable construction. Discard only the candidate so the valid
+      // construction remains resumable and finalization can be retried.
+      if (!partial) return { kind: 'restart', reason: 'invalid-finalized-candidate', descriptor }
     }
     if (!partial) return { kind: 'restart', reason: 'missing-resume-database', descriptor }
     // A partial without resume metadata is mid-scan: skip the full candidate
@@ -153,6 +160,7 @@ export class FullScanResumeStore {
     // and go straight to the construction checks. Resume metadata is written
     // only when a resumable scan finalizes, so its absence is decisive.
     if (hasResumeDrainedThrough(partialPath) && validateCandidate(partialPath, descriptor)) {
+      if (candidate) await removeOwnedArtifact(candidatePath, this.directory)
       await durablePromote(partialPath, candidatePath, this.directory)
       return { kind: 'candidate', descriptor, candidatePath, drainedThrough: readCandidateDrainedThrough(candidatePath) ?? descriptor.journalBaseline }
     }
@@ -162,14 +170,18 @@ export class FullScanResumeStore {
         const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: string }
         database.exec('PRAGMA foreign_keys=ON')
         const foreignKeys = database.prepare('PRAGMA foreign_key_check').all()
-        const row = database.prepare(`SELECT scan_id AS scanId, node_id_seed AS seed, checkpoint_sequence AS checkpointSequence,
+        const row = database.prepare(`SELECT scan_id AS scanId, node_id_seed AS seed, phase, checkpoint_sequence AS checkpointSequence,
           checkpointed_at AS checkpointedAt, journal_device AS journalDevice, journal_uuid AS journalUuid,
           journal_baseline AS journalBaseline, drained_through AS drainedThrough FROM scan_run WHERE singleton = 1`).get() as Record<string, unknown> | undefined
         if (integrity.integrity_check !== 'ok' || foreignKeys.length > 0 || !row || row.scanId !== descriptor.scanId
           || typeof row.seed !== 'string' || !/^[0-9a-f]{64}$/u.test(row.seed)
           || row.journalDevice !== descriptor.journalDevice || row.journalUuid !== descriptor.journalUuid
           || row.journalBaseline !== descriptor.journalBaseline
+          || !Number.isSafeInteger(Number(row.checkpointSequence)) || Number(row.checkpointSequence) < 0
+          || typeof row.checkpointedAt !== 'string' || !Number.isFinite(Date.parse(row.checkpointedAt))
+          || row.phase !== 'traversing' && row.phase !== 'scanning' && row.phase !== 'paused' && row.phase !== 'awaiting-reconciliation' && row.phase !== 'finalizing'
           || !decimal(row.drainedThrough) || BigInt(row.drainedThrough) < BigInt(descriptor.journalBaseline)) return { kind: 'restart', reason: 'invalid-resume-database', descriptor }
+        if (candidate) await removeOwnedArtifact(candidatePath, this.directory)
         return {
           kind: 'construction', descriptor, partialPath, candidatePath,
           checkpointSequence: Number(row.checkpointSequence ?? 0), checkpointedAt: String(row.checkpointedAt ?? descriptor.createdAt),
@@ -221,7 +233,7 @@ export function isFullScanResumeDescriptor(value: unknown): value is FullScanRes
     && typeof descriptor.target === 'string' && isAbsolute(descriptor.target) && normalize(descriptor.target) === descriptor.target && !descriptor.target.includes('\u0000')
     && decimal(descriptor.targetDevice) && decimal(descriptor.targetInode) && identity(descriptor.indexDirectoryIdentity)
     && typeof descriptor.startupRoot === 'boolean' && descriptor.schemaVersion === PERSISTENT_INDEX_SCHEMA_VERSION
-    && descriptor.constructionSchemaVersion === FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION
+    && typeof descriptor.constructionSchemaVersion === 'number' && SUPPORTED_CONSTRUCTION_SCHEMA_VERSIONS.has(descriptor.constructionSchemaVersion)
     && descriptor.accountingVersion === PERSISTENT_ACCOUNTING_VERSION && descriptor.exclusionPolicyVersion === EXCLUSION_POLICY_VERSION
     && descriptor.hardLinkOrderingVersion === HARD_LINK_ORDERING_VERSION && decimal(descriptor.journalDevice)
     && typeof descriptor.journalUuid === 'string' && descriptor.journalUuid.length > 0 && decimal(descriptor.journalBaseline)
@@ -231,6 +243,17 @@ export function isFullScanResumeDescriptor(value: unknown): value is FullScanRes
 
 export function descriptorOwnedFiles(descriptor: FullScanResumeDescriptor | undefined): readonly string[] {
   return descriptor ? [descriptor.partialFile, descriptor.candidateFile] : []
+}
+
+async function removeConstructionStagingArtifacts(directory: string, descriptor: FullScanResumeDescriptor): Promise<void> {
+  try {
+    const names = await readdir(directory)
+    const prefixes = [`${descriptor.partialFile}.staging-`, `${descriptor.candidateFile}.staging-`]
+    await Promise.all(names.filter((name) => prefixes.some((prefix) => name.startsWith(prefix)) && /^[0-9a-f]{16}$/u.test(name.slice(name.lastIndexOf('-') + 1))).map((name) => {
+      const path = join(directory, name)
+      return Promise.all([rm(path, { force: true }), rm(`${path}-journal`, { force: true }), rm(`${path}-wal`, { force: true }), rm(`${path}-shm`, { force: true })])
+    }))
+  } catch { /* Staging cleanup is best effort; the owned files remain authoritative. */ }
 }
 
 async function regularDirectoryIdentity(path: string): Promise<string | undefined> {
@@ -247,6 +270,9 @@ function validateCandidate(path: string, descriptor: FullScanResumeDescriptor): 
   try {
     const database = new DatabaseSync(path, { readOnly: true })
     try {
+      const constructionTables = database.prepare(`SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE type = 'table' AND name IN ('directory_tasks', 'hardlink_owners', 'scan_state', 'scan_run', 'scan_counters', 'dirty_scopes', 'size_estimates', 'estimate_roots')`).get() as { count?: number }
+      if (Number(constructionTables.count ?? 0) !== 0) return false
       const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: string }
       database.exec('PRAGMA foreign_keys=ON')
       if (integrity.integrity_check !== 'ok' || database.prepare('PRAGMA foreign_key_check').all().length > 0) return false

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { COMMITTED_NODE_SELECT, CONSTRUCTION_NODE_SELECT, DiskIndex, NodeReadModel, nodeFromRow, toSummary } from '../src/main/index-store'
-import { ProgressiveScanDatabase } from '../src/main/progressive-database'
+import { ConstructionDatabase } from '../src/main/construction-database'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -12,7 +12,7 @@ afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(pat
 /** Drive a construction database to a committed index and return its path. */
 function buildCommittedIndex(directory: string, withMetadata: boolean): string {
   const path = join(directory, 'index.sqlite')
-  const database = new ProgressiveScanDatabase(path)
+  const database = new ConstructionDatabase(path)
   const rootPath = join(directory, 'root')
   database.insertRoot({ id: 'n-root', parentId: null, name: 'root', path: rootPath, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
   database.insertChild({ id: 'n-big', parentId: 'n-root', name: 'big', path: join(rootPath, 'big'), kind: 'file', ownBytes: 2048, device: '1', inode: '2' }, 1, false)
@@ -55,7 +55,7 @@ describe('node read-model', () => {
   it('maps pending, estimated, complete, and unreadable rows through the construction adapter', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-read-model-construction-'))
     cleanup.push(directory)
-    const database = new ProgressiveScanDatabase(join(directory, 'construction.sqlite'))
+    const database = new ConstructionDatabase(join(directory, 'construction.sqlite'))
     try {
       database.insertRoot({ id: 'n-root', parentId: null, name: 'root', path: join(directory, 'root'), kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
       database.applyEstimates({ items: [{ name: 'folder', estimatedBytes: 4096 }] })
@@ -84,7 +84,7 @@ describe('node read-model', () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-read-model-remainder-'))
     cleanup.push(directory)
     // A discovered child consumes its estimate: the remainder is zero.
-    const consumed = new ProgressiveScanDatabase(join(directory, 'consumed.sqlite'))
+    const consumed = new ConstructionDatabase(join(directory, 'consumed.sqlite'))
     try {
       consumed.insertRoot({ id: 'n-root', parentId: null, name: 'root', path: join(directory, 'root'), kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
       consumed.applyEstimates({ items: [{ name: 'folder', estimatedBytes: 4096 }] })
@@ -93,7 +93,7 @@ describe('node read-model', () => {
       expect(consumed.getEstimatedRemainder('n-root')).toBe(0)
     } finally { consumed.abort() }
     // An estimate root that has not been discovered yet stays in the remainder.
-    const pending = new ProgressiveScanDatabase(join(directory, 'pending.sqlite'))
+    const pending = new ConstructionDatabase(join(directory, 'pending.sqlite'))
     try {
       pending.insertRoot({ id: 'n-root', parentId: null, name: 'root', path: join(directory, 'root'), kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
       pending.applyEstimates({ items: [{ name: 'later', estimatedBytes: 4096 }] })

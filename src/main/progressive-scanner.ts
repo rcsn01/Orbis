@@ -5,11 +5,18 @@ import type { Breadcrumb, ChartSegment, NodeSummary, VolumeSnapshot } from "../s
 import { buildChart } from "./chart"
 import { prepareDatabaseDirectory, removeDatabaseFiles } from "./database"
 import { createScanTimingAccumulator, measureScan, measureScanAsync, runWithScanDiagnostics } from "./diagnostics"
-import { ProgressiveScanDatabase, type DirectoryTask } from "./progressive-database"
+import {
+  ConstructionDatabase,
+  type ConstructionCheckpointRequest,
+  type ConstructionInput,
+  type ConstructionPage,
+  type ConstructionPageResult,
+  type DirectoryTask
+} from "./construction-database"
 import type { FullScanResumeDescriptor, FullScanResumeStore } from './full-scan-resume'
 import {
   createDirectoryMetadataSource, loadNativeMetadataAddon, NodeDirectoryMetadataSource,
-  type DirectoryMetadataCursor, type DirectoryMetadataEntry, type DirectoryMetadataSource, type FolderSizeEstimate
+  type DirectoryMetadataCursor, type DirectoryMetadataSource, type FolderSizeEstimate
 } from "./scan-metadata"
 import {
   DEFAULT_METADATA_CONCURRENCY, STARTUP_EXCLUSIONS, ScanCanceledError,
@@ -51,12 +58,12 @@ export interface ProgressiveScanOptions extends ScanOptions {
 }
 
 export class ProgressiveScanControl {
-  #database: ProgressiveScanDatabase | undefined
+  #database: ConstructionDatabase | undefined
   #focusId: string | undefined
   #focusRequested = false
   #onFocus: (() => void) | undefined
 
-  attach(database: ProgressiveScanDatabase, rootId: string, onFocus?: () => void): void {
+  attach(database: ConstructionDatabase, rootId: string, onFocus?: () => void): void {
     this.#database = database
     this.#focusId = rootId
     this.#focusRequested = false
@@ -116,7 +123,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   const nodeId = (parentId: string, name: string): string => `n-${createHmac("sha256", key).update(parentId).update("\0").update(name).digest("hex").slice(0, 32)}`
   const cursors = new Map<string, ActiveCursor>()
   const bulkFallbackDirectories = new Set<string>()
-  let database: ProgressiveScanDatabase | undefined
+  let database: ConstructionDatabase | undefined
   let constructionActive = true
 
   let preflight: Awaited<ReturnType<typeof preflightShape>>
@@ -152,7 +159,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   let resumeJournal: { readonly drainedThrough: string; readonly dirtyScopes: readonly string[] } | undefined
   try {
     if (options.resumable?.resume) {
-      database = measureScan('database-resume', () => ProgressiveScanDatabase.openResumable(options.partialPath))
+      database = measureScan('database-resume', () => ConstructionDatabase.openResumable(options.partialPath, { candidatePath: options.publishedPath }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
       const recovered = database.recoverIncompleteDirectories()
@@ -160,19 +167,19 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       Object.assign(totals, persisted)
       activeElapsedBefore = persisted.activeElapsedMs
       void recovered
-      notifyCheckpoint(options, database.checkpoint())
+      notifyCheckpoint(options, database.checkpoint({ reason: 'resume' }))
     } else if (options.resumable) {
       const descriptor = options.resumable.descriptor
-      database = measureScan('database-create', () => ProgressiveScanDatabase.create(options.partialPath, {
+      database = measureScan('database-create', () => ConstructionDatabase.create(options.partialPath, {
         scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid,
-        journalBaseline: descriptor.journalBaseline
+        journalBaseline: descriptor.journalBaseline, candidatePath: options.publishedPath
       }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
-      notifyCheckpoint(options, database.checkpoint())
+      notifyCheckpoint(options, database.checkpoint({ reason: 'startup' }))
       await options.resumable.store.publish(descriptor)
     } else {
-      database = measureScan("database-create", () => new ProgressiveScanDatabase(options.partialPath))
+      database = measureScan("database-create", () => new ConstructionDatabase(options.partialPath))
       rootId = nodeId('root', preflight.target)
     }
     const rootBytes = allocatedBytes(preflight.rootStats)
@@ -199,13 +206,17 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       if (!options.resumable || !database) return
       const now = Date.now()
       const drainDue = Boolean(options.drainResumeJournal) && (finalDrain || now - lastJournalDrainAt >= 30_000)
+      let journalDrain: ConstructionCheckpointRequest['journalDrain']
       if (drainDue && options.drainResumeJournal) {
         const drain = options.drainResumeJournal(database.drainedThrough)
         if (drain.restartReason) throw new Error(`resume-invalidated:${drain.restartReason}`)
-        database.setJournalDrain(drain.scopes, drain.throughEventId)
+        journalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
         lastJournalDrainAt = now
       }
-      notifyCheckpoint(options, database.checkpoint(now - lastCheckpointAt))
+      notifyCheckpoint(options, database.checkpoint({
+        reason: finalDrain ? 'finalize' : 'scheduled', activeElapsedDeltaMs: now - lastCheckpointAt,
+        ...(journalDrain ? { journalDrain } : {})
+      }))
       lastCheckpointAt = now
       entriesSinceCheckpoint = 0
     }
@@ -225,23 +236,12 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       const pageConcurrency = bulkMetadataSource
         ? Math.max(1, Math.min(metadataConcurrency, bulkMetadataSource.pageConcurrency ?? 1))
         : metadataConcurrency
-      while (database!.hasPendingTasks()) {
+      while (true) {
         throwIfCanceled(options.signal)
-        const reserved = new Set<string>()
-        const tasks: DirectoryTask[] = []
-        while (tasks.length < pageConcurrency) {
-          const focusedAvailable = database!.hasPendingTasks(true)
-          const normalAvailable = database!.hasPendingTasks(false)
-          const takeFocused = focusedAvailable && (focusTurns < 3 || !normalAvailable)
-          let task = database!.nextTask(takeFocused, reserved)
-          if (!task) task = database!.nextTask(!takeFocused, reserved)
-          if (!task) break
-          reserved.add(task.id)
-          tasks.push(task)
-          if (task.focused) focusTurns += 1
-          else focusTurns = 0
-          if (task.focused && focusTurns >= 3 && database!.hasPendingTasks(false)) focusTurns = 3
-        }
+        const batch = database!.takeWork({ limit: pageConcurrency, focusTurns })
+        const tasks = batch.work
+        focusTurns = batch.focusTurns
+        if (batch.done) break
         if (tasks.length === 0) throw new Error("Directory queue is inconsistent")
 
         const missingCursors = tasks.reduce((count, task) => count + (cursors.has(task.id) ? 0 : 1), 0)
@@ -269,32 +269,21 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
           throwIfCanceled(options.signal)
           const task = read.task
           if (!read.ok) {
-            applyUnreadableBatch(database!, task, isDisappearing(read.error), totals)
+            const delta = aggregationTiming.measure(() => database!.accept({ kind: 'unreadable', taskId: task.id, disappearing: isDisappearing(read.error) }))
+            addConstructionTotals(totals, delta)
             checkpointDue()
             reporter.batch(database!, task.id, preflight, task.id === rootId)
             continue
           }
           const page = read.page
-          const totalsBeforeBatch = { ...totals }
           const firstRootPage = task.id === rootId && task.entriesRead === 0
-          try {
-            database!.applyMetadataBatch(() => {
-              if (!page.done) database!.startTask(task.id)
-              processPage(page.entries, task, database!, options, preflight, totals, nodeId, aggregationTiming.measure)
-              database!.addMetadataCounters(page.bulkEntries, page.fallbackEntries)
-              database!.bumpRevision()
-              if (page.done) database!.finishEnumeration(task.id)
-              else {
-                database!.advanceTask(task.id, page.entries.length)
-                database!.yieldTask(task.id)
-              }
-            })
-          } catch (error) {
-            Object.assign(totals, totalsBeforeBatch)
-            throw error
+          const focused = task.focused || database!.taskIsFocused(task.id)
+          const input: ConstructionInput = {
+            kind: 'page',
+            page: normalizeConstructionPage(page, task, focused, options, preflight, nodeId)
           }
-          totals.bulkMetadataEntries += page.bulkEntries
-          totals.fallbackMetadataEntries += page.fallbackEntries
+          const delta = aggregationTiming.measure(() => database!.accept(input))
+          addConstructionTotals(totals, delta)
           entriesSinceCheckpoint += page.entries.length
           if (page.done) await closeCursor(cursors, task.id)
           reporter.batch(database!, task.id, preflight, task.id === rootId && firstRootPage)
@@ -307,15 +296,11 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     await bulkMetadataSource?.close?.()
     constructionActive = false
     throwIfCanceled(options.signal)
-    if (options.resumable) {
-      database.setPhase('awaiting-reconciliation')
-      checkpointForced(true)
-    }
+    if (options.resumable) checkpointForced(true)
     const root = database.getNode(rootId)
     if (!root || root.scanState !== "complete" && root.scanState !== "unreadable") throw new Error("Progressive scan root did not reach a terminal state")
     reporter.progress(displayName(preflight.target), true, "indexing")
     if (options.resumable) resumeJournal = { drainedThrough: database.drainedThrough, dirtyScopes: database.dirtyScopes }
-    measureScan("index-create", () => database!.finalize())
     const elapsedMs = activeElapsedBefore + Date.now() - startedAt
     const finalTotals: ScanTotals = {
       scannedItems: totals.scannedItems, discoveredBytes: root.confirmedBytes, elapsedMs, skippedItems: totals.skippedItems,
@@ -323,12 +308,33 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       duplicateHardLinks: totals.duplicateHardLinks, disappearingItems: totals.disappearingItems
     }
     const capturedAt = new Date().toISOString()
-    measureScan("metadata-write", () => database!.writeMetadata({
+    const metadata = {
       target: preflight.target, rootId, capacityBytes: preflight.capacityBytes, freeBytes: preflight.freeBytes,
       scannedBytes: root.confirmedBytes, totals: finalTotals, targetDevice: preflight.rootDevice,
       targetInode: part(preflight.rootStats.ino), ...(preflight.indexIdentity ? { indexDirectoryIdentity: preflight.indexIdentity } : {}),
       indexRevision: 1, capturedAt, refreshedAt: capturedAt, ...(resumeJournal ? { resume: resumeJournal } : {})
-    }))
+    }
+    if (options.resumable) {
+      const finalization = measureScan("index-create", () => database!.finish({
+        kind: 'finalize', metadata, checkpoint: { activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt) }
+      }))
+      if (finalization.kind !== 'candidate') throw new Error(`Unexpected construction finish result: ${finalization.kind}`)
+      database = undefined
+      options.control.detach()
+      throwIfCanceled(options.signal)
+      reporter.progress(displayName(preflight.target), true, "indexing")
+      throwIfCanceled(options.signal)
+      return {
+        generation: options.generation, target: preflight.target, rootId, publishedPath: finalization.candidatePath,
+        capacityBytes: preflight.capacityBytes, freeBytes: preflight.freeBytes, scannedBytes: root.confirmedBytes, totals: finalTotals,
+        metadata: {
+          bulkMetadataEntries: totals.bulkMetadataEntries, fallbackMetadataEntries: totals.fallbackMetadataEntries,
+          ...(resumeJournal ? { resume: resumeJournal } : {})
+        }
+      }
+    }
+    measureScan("index-create", () => database!.finalize())
+    measureScan("metadata-write", () => database!.writeMetadata(metadata))
     database.complete()
     database = undefined
     options.control.detach()
@@ -339,10 +345,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     return {
       generation: options.generation, target: preflight.target, rootId, publishedPath: options.publishedPath,
       capacityBytes: preflight.capacityBytes, freeBytes: preflight.freeBytes, scannedBytes: root.confirmedBytes, totals: finalTotals,
-      metadata: {
-        bulkMetadataEntries: totals.bulkMetadataEntries, fallbackMetadataEntries: totals.fallbackMetadataEntries,
-        ...(resumeJournal ? { resume: resumeJournal } : {})
-      }
+      metadata: { bulkMetadataEntries: totals.bulkMetadataEntries, fallbackMetadataEntries: totals.fallbackMetadataEntries }
     }
   } catch (error) {
     constructionActive = false
@@ -353,13 +356,21 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     database = undefined
     if (failedDatabase && options.resumable) {
       try {
-        if (options.drainResumeJournal) {
-          const drain = options.drainResumeJournal(failedDatabase.drainedThrough)
-          if (!drain.restartReason) failedDatabase.setJournalDrain(drain.scopes, drain.throughEventId)
-        }
-        notifyCheckpoint(options, failedDatabase.checkpoint(Date.now() - lastCheckpointAt))
-      } catch { /* The previous committed checkpoint remains resumable. */ }
-      failedDatabase.abort()
+        if (error instanceof ScanCanceledError || options.signal?.aborted) {
+          let journalDrain: ConstructionCheckpointRequest['journalDrain']
+          if (options.drainResumeJournal) {
+            try {
+              const drain = options.drainResumeJournal(failedDatabase.drainedThrough)
+              if (!drain.restartReason) journalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
+            } catch { /* A failed drain must not discard the pause checkpoint. */ }
+          }
+          const result = failedDatabase.finish({
+            kind: 'pause', activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt),
+            ...(journalDrain ? { journalDrain } : {})
+          })
+          if (result.kind === 'paused') notifyCheckpoint(options, result.checkpointSequence)
+        } else failedDatabase.finish({ kind: 'unexpected-failure', cause: error })
+      } catch { failedDatabase.abort() }
     } else failedDatabase?.abort()
     if (!options.resumable) {
       await removeDatabaseFiles(options.partialPath)
@@ -445,79 +456,62 @@ async function readTaskPage(
   }
 }
 
-function applyUnreadableBatch(
-  database: ProgressiveScanDatabase, task: DirectoryTask, disappearing: boolean, totals: ReturnType<typeof mutableTotals>
-): void {
-  const totalsBeforeBatch = { ...totals }
-  try {
-    database.applyMetadataBatch(() => {
-      database.startTask(task.id)
-      database.markUnreadable(task.id, disappearing)
-      database.bumpRevision()
-      totals.skippedItems += 1
-      totals.unreadableItems += 1
-      if (disappearing) totals.disappearingItems += 1
-    })
-  } catch (error) {
-    Object.assign(totals, totalsBeforeBatch)
-    throw error
-  }
-}
-
-function processPage(
-  entries: readonly DirectoryMetadataEntry[], task: DirectoryTask, database: ProgressiveScanDatabase, options: ProgressiveScanOptions,
-  preflight: Awaited<ReturnType<typeof preflightShape>>, totals: ReturnType<typeof mutableTotals>,
-  nodeId: (parentId: string, name: string) => string, recordAggregation: (operation: () => void) => void
-): number {
-  let accepted = 0
-  const focused = task.focused || database.taskIsFocused(task.id)
-  for (const entry of entries) {
+function normalizeConstructionPage(
+  page: DirectoryMetadataPage, task: DirectoryTask, focused: boolean, options: ProgressiveScanOptions,
+  preflight: Awaited<ReturnType<typeof preflightShape>>, nodeId: (parentId: string, name: string) => string
+): ConstructionPage {
+  const entries: ConstructionPage['entries'][number][] = []
+  for (const entry of page.entries) {
     throwIfCanceled(options.signal)
     const path = normalize(resolve(task.path, entry.name))
     if (entry.error) {
-      const disappearing = isDisappearing(entry.error)
-      totals.skippedItems += 1
-      database.observeSkipped(task.id, disappearing ? { disappearing: true } : { unreadable: true })
-      if (disappearing) totals.disappearingItems += 1
-      else totals.unreadableItems += 1
+      entries.push({ kind: 'skipped', observation: isDisappearing(entry.error) ? { disappearing: true } : { unreadable: true } })
       continue
     }
-    if (!isWithin(path, preflight.target) || shouldExclude(path, options, preflight.indexRoot)) { totals.skippedItems += 1; database.observeSkipped(task.id); continue }
-    if (entry.kind === "symlink") { totals.skippedItems += 1; totals.symlinks += 1; database.observeSkipped(task.id, { symlink: true }); continue }
-    if (entry.mountPoint || entry.device !== "" && entry.device !== preflight.rootDevice) { totals.skippedItems += 1; totals.nestedMounts += 1; database.observeSkipped(task.id, { nestedMount: true }); continue }
-    if (preflight.indexIdentity && entry.kind === "directory" && identity({ dev: entry.device, ino: entry.inode }) === preflight.indexIdentity) { totals.skippedItems += 1; database.observeSkipped(task.id); continue }
-    const kind = entry.kind === "directory" || entry.kind === "file" ? entry.kind : undefined
-    if (!kind) { totals.skippedItems += 1; database.observeSkipped(task.id); continue }
-    const id = nodeId(task.id, entry.name)
-    const bytes = Math.max(0, entry.allocatedBytes)
-    const pathKey = relative(preflight.target, path)
-    let replacingOwner = false
-    if (kind === "file") database.insertFileAlias(task.id, entry.name, pathKey, entry.device, entry.inode, bytes)
-    const needsHardLinkOwnership = kind === "file" && entry.device !== "" && entry.inode !== "" && entry.linkCount !== 1
-    if (needsHardLinkOwnership) {
-      const owner = database.getHardLinkOwner(entry.device, entry.inode)
-      if (owner) {
-        totals.skippedItems += 1
-        totals.duplicateHardLinks += 1
-        if (comparePaths(pathKey, owner.pathKey) >= 0) {
-          database.observeSkipped(task.id, { duplicate: true })
-          continue
-        }
-        const previousParentId = database.getNode(owner.nodeId)?.parentId
-        if (previousParentId) database.observeSkipped(previousParentId, { duplicate: true })
-        replacingOwner = true
-        recordAggregation(() => database.removeOwnedFile(owner.nodeId))
-      }
+    if (!isWithin(path, preflight.target) || shouldExclude(path, options, preflight.indexRoot)) {
+      entries.push({ kind: 'skipped', observation: {} })
+      continue
     }
-    recordAggregation(() => database.insertChild({ id, parentId: task.id, name: entry.name, path, kind, ownBytes: bytes, device: entry.device, inode: entry.inode }, task.depth + 1, focused))
-    if (needsHardLinkOwnership) database.setHardLinkOwner(entry.device, entry.inode, id, pathKey)
-    if (!replacingOwner) {
-      totals.scannedItems += 1
-      totals.discoveredBytes += bytes
+    if (entry.kind === 'symlink') {
+      entries.push({ kind: 'skipped', observation: { symlink: true } })
+      continue
     }
-    accepted += 1
+    if (entry.mountPoint || entry.device !== '' && entry.device !== preflight.rootDevice) {
+      entries.push({ kind: 'skipped', observation: { nestedMount: true } })
+      continue
+    }
+    if (preflight.indexIdentity && entry.kind === 'directory' && identity({ dev: entry.device, ino: entry.inode }) === preflight.indexIdentity) {
+      entries.push({ kind: 'skipped', observation: {} })
+      continue
+    }
+    const kind = entry.kind === 'directory' || entry.kind === 'file' ? entry.kind : undefined
+    if (!kind) {
+      entries.push({ kind: 'skipped', observation: {} })
+      continue
+    }
+    const node = {
+      id: nodeId(task.id, entry.name), parentId: task.id, name: entry.name, path, kind,
+      ownBytes: Math.max(0, entry.allocatedBytes), device: entry.device, inode: entry.inode
+    }
+    entries.push({ kind: 'node', node: { node, pathKey: relative(preflight.target, path), ...(entry.linkCount === undefined ? {} : { linkCount: entry.linkCount }) } })
   }
-  return accepted
+  return {
+    taskId: task.id, depth: task.depth, focused, entriesRead: task.entriesRead, done: page.done, entries,
+    bulkMetadataEntries: page.bulkEntries, fallbackMetadataEntries: page.fallbackEntries
+  }
+}
+
+function addConstructionTotals(totals: ReturnType<typeof mutableTotals>, delta: ConstructionPageResult): void {
+  totals.scannedItems += delta.scannedItems
+  totals.discoveredBytes += delta.discoveredBytes
+  totals.skippedItems += delta.skippedItems
+  totals.unreadableItems += delta.unreadableItems
+  totals.disappearingItems += delta.disappearingItems
+  totals.symlinks += delta.symlinks
+  totals.nestedMounts += delta.nestedMounts
+  totals.duplicateHardLinks += delta.duplicateHardLinks
+  totals.bulkMetadataEntries += delta.bulkMetadataEntries
+  totals.fallbackMetadataEntries += delta.fallbackMetadataEntries
 }
 
 // Gives TypeScript a named structural type for preflight data without exporting private paths.
@@ -536,19 +530,19 @@ class PreviewReporter {
     this.#lastProgress = now
     this.options.onProgress?.({ stage, scannedItems: this.totals.scannedItems, discoveredBytes: this.totals.discoveredBytes, elapsedMs: now - this.startedAt, currentItem: item })
   }
-  focus(database: ProgressiveScanDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  focus(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
     if (!this.#firstPreview) return
     this.emit(database, volume, false)
   }
-  estimate(database: ProgressiveScanDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  estimate(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
     if (!this.#firstPreview) return
     this.emit(database, volume, false)
   }
-  resume(database: ProgressiveScanDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  resume(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
     if (!this.options.onPreview) return
     this.emit(database, volume, true)
   }
-  batch(database: ProgressiveScanDatabase, taskId: string, volume: { target: string; capacityBytes: number; freeBytes: number }, rootPageCompleted: boolean): void {
+  batch(database: ConstructionDatabase, taskId: string, volume: { target: string; capacityBytes: number; freeBytes: number }, rootPageCompleted: boolean): void {
     this.progress(database.getNode(taskId)?.name ?? "")
     this.options.control.consumeFocusRequest()
     if (!this.options.onPreview) return
@@ -561,7 +555,7 @@ class PreviewReporter {
     if (now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
     this.emit(database, volume, false)
   }
-  private emit(database: ProgressiveScanDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean): void {
+  private emit(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean): void {
     const now = Date.now()
     if (!first && now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
     const onPreview = this.options.onPreview
@@ -587,7 +581,7 @@ class PreviewReporter {
   }
 }
 
-function summary(node: NonNullable<ReturnType<ProgressiveScanDatabase["getNode"]>>): NodeSummary {
+function summary(node: NonNullable<ReturnType<ConstructionDatabase["getNode"]>>): NodeSummary {
   return { id: node.id, parentId: node.parentId, name: node.name, kind: node.kind, sizeBytes: node.sizeBytes, ...(node.estimatedBytes > 0 ? { estimatedSizeBytes: node.estimatedBytes } : {}), directChildren: node.directChildren, descendantCount: node.descendantCount, unreadableCount: node.unreadableCount, scanState: node.scanState, sizeAccuracy: node.sizeAccuracy }
 }
 
@@ -612,7 +606,6 @@ function resolveMetadataBatchSize(value: number | undefined): number {
 }
 function shouldExclude(path: string, options: ScanOptions, indexRoot: string): boolean { return isWithin(path, indexRoot) || options.startupRoot !== false && normalize(options.target) === "/" && STARTUP_EXCLUSIONS.some((excluded) => isWithin(path, excluded)) }
 function isWithin(path: string, parent: string): boolean { const child = normalize(path); const root = normalize(parent); const remainder = relative(root, child); return child === root || remainder !== "" && remainder !== ".." && !remainder.startsWith(`..${sep}`) }
-function comparePaths(left: string, right: string): number { return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')) }
 function displayName(path: string): string { return path === "/" ? "/" : basename(path) || path }
 function part(value: number | bigint | string): string { return String(value) }
 function identity(stats: { readonly dev: number | bigint | string; readonly ino: number | bigint | string }): string { return `${part(stats.dev)}:${part(stats.ino)}` }

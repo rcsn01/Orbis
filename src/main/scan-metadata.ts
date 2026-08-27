@@ -64,7 +64,7 @@ export interface NativeMetadataPage {
 }
 
 export interface NativeDirectoryCursor {
-  readPage(limit: number): NativeMetadataPage
+  readPage(limit: number): Promise<NativeMetadataPage>
   close(): void
 }
 
@@ -162,10 +162,12 @@ class NodeDirectoryMetadataCursor implements DirectoryMetadataCursor {
 export class BulkExactMetadataSource implements DirectoryMetadataSource {
   readonly #addon: NativeMetadataAddon
   readonly #fileSystem: ScanFileSystem
+  readonly pageConcurrency: number
 
-  constructor(addon: NativeMetadataAddon, fileSystem: ScanFileSystem) {
+  constructor(addon: NativeMetadataAddon, fileSystem: ScanFileSystem, metadataConcurrency = 4) {
     this.#addon = addon
     this.#fileSystem = fileSystem
+    this.pageConcurrency = Math.max(1, Math.min(64, Math.floor(metadataConcurrency)))
   }
 
   async open(path: string, targetRealpath: string): Promise<DirectoryMetadataCursor> {
@@ -184,7 +186,7 @@ class NativeDirectoryMetadataCursor implements DirectoryMetadataCursor {
     throwIfAborted(signal)
     if (this.#closed) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
     metadataCursorDiagnostics.nativeReadPageCalls += 1
-    const page = this.cursor.readPage(clampPageLimit(limit))
+    const page = await this.cursor.readPage(clampPageLimit(limit))
     throwIfAborted(signal)
     return nativePage(page)
   }
@@ -214,9 +216,9 @@ function nativePage(page: NativeMetadataPage): DirectoryMetadataPage {
   }
 }
 
-export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, fileSystem: ScanFileSystem, _metadataConcurrency: number): DirectoryMetadataSource | undefined {
+export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, fileSystem: ScanFileSystem, metadataConcurrency: number): DirectoryMetadataSource | undefined {
   if (!addon || process.env.ORBIS_DISABLE_BULK_METADATA === "1") return undefined
-  return new BulkExactMetadataSource(addon, fileSystem)
+  return new BulkExactMetadataSource(addon, fileSystem, metadataConcurrency)
 }
 
 export async function loadNativeMetadataAddon(path: string | undefined): Promise<NativeMetadataAddon | undefined> {
@@ -264,7 +266,22 @@ function fromStats(name: string, stats: ScanStats): DirectoryMetadataEntry {
 
 function clampPageLimit(value: number): number { return Math.max(1, Math.min(1_024, Math.floor(value))) }
 function normalizeKind(value: string): DirectoryMetadataKind { return value === "directory" || value === "file" || value === "symlink" ? value : "other" }
-function nativeError(code: number): Error & { code: string } { const error = new Error(`Bulk metadata failed (${code})`) as Error & { code: string }; error.code = String(code); return error }
+const errnoCodeNames: Readonly<Record<number, string>> = {
+  1: "EPERM",
+  2: "ENOENT",
+  5: "EIO",
+  13: "EACCES",
+  20: "ENOTDIR",
+  23: "ENFILE",
+  24: "EMFILE",
+  62: "ELOOP",
+  63: "ENAMETOOLONG"
+}
+function nativeError(code: number): Error & { code: string } {
+  const error = new Error(`Bulk metadata failed (${code})`) as Error & { code: string }
+  error.code = errnoCodeNames[code] ?? String(code)
+  return error
+}
 function finiteBytes(value: unknown): number { const result = number(value); return Number.isFinite(result) && result > 0 ? result : 0 }
 function finiteCount(value: unknown): number { const result = Math.floor(number(value)); return Number.isFinite(result) && result > 0 ? result : 0 }
 function number(value: number | bigint | unknown): number { const result = typeof value === "bigint" ? Number(value) : Number(value); return Number.isFinite(result) ? result : 0 }

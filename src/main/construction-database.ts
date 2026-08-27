@@ -1,6 +1,7 @@
+import { closeSync, copyFileSync, fsyncSync, linkSync, openSync, renameSync, rmSync } from "node:fs"
 import { DatabaseSync, type StatementSync } from "node:sqlite"
 import { createHmac, randomBytes } from "node:crypto"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import type { Breadcrumb, DirectoryScanState, NodeSummary } from "../shared/contracts"
 import type { FolderSizeEstimate } from "./scan-metadata"
 import { NodeReadModel, toSummary } from "./index-store"
@@ -20,10 +21,128 @@ export interface DirectoryTask {
   readonly entriesRead: number
 }
 
+export interface ConstructionWorkRequest {
+  readonly limit: number
+  readonly focusTurns: number
+}
+
+export interface ConstructionWorkBatch {
+  readonly work: readonly DirectoryTask[]
+  readonly focusTurns: number
+  readonly done: boolean
+}
+
+export type ConstructionErrorCode =
+  | "stale-work"
+  | "invalid-resume"
+  | "illegal-transition"
+  | "pending-work"
+  | "candidate-failure"
+
+export class ConstructionError extends Error {
+  constructor(readonly code: ConstructionErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "ConstructionError"
+  }
+}
+
+export interface ConstructionStatus {
+  readonly phase: ConstructionPhase
+  readonly revision: number
+  readonly checkpointSequence: number
+  readonly totals: ProgressiveSemanticTotals
+  readonly drainedThrough: string
+  readonly dirtyScopes: readonly string[]
+}
+
 export interface HardLinkOwner {
   readonly nodeId: string
   readonly pathKey: string
 }
+
+export type ConstructionPhase = "scanning" | "paused" | "awaiting-reconciliation" | "finalizing"
+
+export type ConstructionCheckpointReason = "startup" | "resume" | "scheduled" | "journal-drain" | "pause" | "finalize"
+
+export interface ConstructionJournalDrain {
+  readonly scopes: readonly string[]
+  readonly throughEventId: string
+}
+
+export interface ConstructionCheckpointRequest {
+  readonly reason?: ConstructionCheckpointReason
+  readonly activeElapsedDeltaMs?: number
+  readonly journalDrain?: ConstructionJournalDrain
+}
+
+export interface ConstructionNodeEntry {
+  readonly node: InsertNode
+  readonly pathKey: string
+  readonly linkCount?: number
+}
+
+export interface ConstructionSkippedEntry {
+  readonly kind: "skipped"
+  readonly observation?: {
+    readonly unreadable?: boolean
+    readonly disappearing?: boolean
+    readonly symlink?: boolean
+    readonly nestedMount?: boolean
+  }
+}
+
+export interface ConstructionNodePageEntry {
+  readonly kind: "node"
+  readonly node: ConstructionNodeEntry
+}
+
+export type ConstructionPageEntry = ConstructionSkippedEntry | ConstructionNodePageEntry
+
+export interface ConstructionPage {
+  readonly taskId: string
+  readonly depth: number
+  readonly focused: boolean
+  readonly entriesRead: number
+  readonly done: boolean
+  readonly entries: readonly ConstructionPageEntry[]
+  readonly bulkMetadataEntries: number
+  readonly fallbackMetadataEntries: number
+  readonly checkpointAfter?: ConstructionCheckpointRequest
+}
+
+export interface ConstructionUnreadableInput {
+  readonly kind: "unreadable"
+  readonly taskId: string
+  readonly disappearing: boolean
+  readonly checkpointAfter?: ConstructionCheckpointRequest
+}
+
+export type ConstructionInput = { readonly kind: "page"; readonly page: ConstructionPage } | ConstructionUnreadableInput
+
+export interface ConstructionPageResult {
+  readonly scannedItems: number
+  readonly discoveredBytes: number
+  readonly skippedItems: number
+  readonly unreadableItems: number
+  readonly disappearingItems: number
+  readonly symlinks: number
+  readonly nestedMounts: number
+  readonly duplicateHardLinks: number
+  readonly bulkMetadataEntries: number
+  readonly fallbackMetadataEntries: number
+}
+
+type MutableConstructionPageResult = { -readonly [Key in keyof ConstructionPageResult]: ConstructionPageResult[Key] }
+
+export type ConstructionFinishCommand =
+  | { readonly kind: "pause"; readonly activeElapsedDeltaMs?: number; readonly journalDrain?: ConstructionJournalDrain }
+  | { readonly kind: "unexpected-failure"; readonly cause?: unknown }
+  | { readonly kind: "finalize"; readonly metadata?: ScanDatabaseMeta; readonly checkpoint?: ConstructionCheckpointRequest }
+
+export type ConstructionFinishResult =
+  | { readonly kind: "paused"; readonly checkpointSequence: number }
+  | { readonly kind: "failed"; readonly checkpointSequence: number }
+  | { readonly kind: "candidate"; readonly candidatePath: string; readonly metadata: ScanDatabaseMeta }
 
 type State = "building" | "paused" | "committed" | "rolled-back" | "closed"
 
@@ -74,7 +193,6 @@ interface MetadataBatch {
   readonly fileNodes: Map<string, PendingFileNode>
   readonly fileAliases: PendingFileAlias[]
   readonly hardLinkOwners: Map<string, PendingHardLinkOwner>
-  readonly consumedEstimateRoots: Set<string>
 }
 
 export interface ProgressiveConstructionOptions {
@@ -83,6 +201,8 @@ export interface ProgressiveConstructionOptions {
   readonly journalDevice: string
   readonly journalUuid: string
   readonly journalBaseline: string
+  readonly candidatePath?: string
+  readonly clock?: () => number
 }
 
 export interface ProgressiveSemanticTotals {
@@ -99,7 +219,11 @@ export interface ProgressiveSemanticTotals {
   readonly activeElapsedMs: number
 }
 
-export class ProgressiveScanDatabase implements ChartDataSource {
+export class ConstructionDatabase implements ChartDataSource {
+  readonly #path: string
+  readonly #candidatePath: string | undefined
+  readonly #clock: () => number
+  readonly #resumable: boolean
   readonly #database: DatabaseSync
   readonly #insertNode: StatementSync
   readonly #insertFileNodeBatch: StatementSync
@@ -117,6 +241,9 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   readonly #selectOwnedFile: StatementSync
   readonly #deleteNode: StatementSync
   readonly #applyAncestorDeltaStatement: StatementSync
+  readonly #applyNodeDeltaStatement: StatementSync
+  readonly #nodeTotalsStatement: StatementSync
+  readonly #nodeScanStateStatement: StatementSync
   readonly #attachEstimate: StatementSync
   readonly #deleteEstimateRoot: StatementSync
   readonly #deleteEstimateStatement: StatementSync
@@ -124,22 +251,44 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   readonly #parentIdStatement: StatementSync
   readonly #readModel: NodeReadModel
   readonly #estimateRootNames = new Set<string>()
-  #metadataBatch: MetadataBatch | undefined
+  // The metadata batch is a long-lived accumulator: it survives across
+  // applyMetadataBatch calls and is flushed on a size/time threshold, on any
+  // read, and before every checkpoint/finalize/complete. Task-queue state is
+  // never batched, so scheduling stays immediate.
+  #metadataBatch: MetadataBatch = {
+    ancestorDeltas: new Map(), directChildDeltas: new Map(), observationDeltas: new Map(),
+    fileNodes: new Map(), fileAliases: [], hardLinkOwners: new Map()
+  }
+  #inMetadataOperation = false
+  #consumedEstimateRoots = new Set<string>()
+  #lastBatchFlushAt = 0
+  // Per-node record of the totals already propagated to the parent. Only
+  // unreadable nodes propagate more than once (at mark time and again when
+  // their subtree finishes), so the record lets the second propagation send
+  // exactly the delta since the first.
+  readonly #propagatedToParent = new Map<string, { readonly bytes: number; readonly descendants: number; readonly unreadable: number }>()
   #state: State = "building"
   #rootNodeId: string | undefined
+  readonly #leasedTaskIds: string[] = []
 
-  static create(path: string, options: ProgressiveConstructionOptions): ProgressiveScanDatabase {
-    return new ProgressiveScanDatabase(path, options, false)
+  static create(path: string, options: ProgressiveConstructionOptions): ConstructionDatabase {
+    return new ConstructionDatabase(path, options, false)
   }
 
-  static openResumable(path: string): ProgressiveScanDatabase {
-    return new ProgressiveScanDatabase(path, undefined, true)
+  static openResumable(path: string, options?: Pick<ProgressiveConstructionOptions, "candidatePath" | "clock">): ConstructionDatabase {
+    return new ConstructionDatabase(path, options, true)
   }
 
-  constructor(path: string, options?: ProgressiveConstructionOptions, openExisting = false) {
+  constructor(path: string, options?: ProgressiveConstructionOptions | Pick<ProgressiveConstructionOptions, "candidatePath" | "clock">, openExisting = false) {
+    this.#path = path
+    this.#candidatePath = options?.candidatePath
+    this.#clock = options?.clock ?? Date.now
+    this.#lastBatchFlushAt = this.#clock()
+    this.#resumable = openExisting || Boolean(options && 'scanId' in options)
     this.#database = new DatabaseSync(path)
     try {
-      this.#database.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+      this.#database.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")
+      if (openExisting) migrateConstructionSchema(this.#database)
       if (!openExisting) this.#database.exec(`
         CREATE TABLE nodes (
           id TEXT PRIMARY KEY,
@@ -226,7 +375,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
           scan_id TEXT NOT NULL UNIQUE,
           node_id_seed TEXT NOT NULL,
-          phase TEXT NOT NULL CHECK (phase IN ('traversing', 'awaiting-reconciliation', 'finalizing')),
+          phase TEXT NOT NULL CHECK (phase IN ('scanning', 'paused', 'awaiting-reconciliation', 'finalizing')),
           checkpoint_sequence INTEGER NOT NULL DEFAULT 0,
           active_elapsed_ms INTEGER NOT NULL DEFAULT 0,
           journal_device TEXT NOT NULL,
@@ -246,12 +395,12 @@ export class ProgressiveScanDatabase implements ChartDataSource {
       // by (device, inode); without this index each lookup scans the whole
       // nodes table (O(n^2) on large saved scans, stalling resume).
       this.#database.exec('CREATE INDEX IF NOT EXISTS nodes_identity_idx ON nodes (device, inode)')
-      if (!openExisting && options) {
+      if (!openExisting && options && 'scanId' in options) {
         const seed = options.nodeIdSeed ?? randomBytes(32).toString('hex')
         if (!/^[0-9a-f]{64}$/u.test(seed)) throw new Error('Invalid progressive scan node ID seed')
         this.#database.prepare(`INSERT INTO scan_run (singleton, scan_id, node_id_seed, phase, journal_device, journal_uuid,
-          journal_baseline, drained_through, checkpointed_at) VALUES (1, ?, ?, 'traversing', ?, ?, ?, ?, ?)`)
-          .run(options.scanId, seed, options.journalDevice, options.journalUuid, options.journalBaseline, options.journalBaseline, new Date().toISOString())
+          journal_baseline, drained_through, checkpointed_at) VALUES (1, ?, ?, 'scanning', ?, ?, ?, ?, ?)`)
+          .run(options.scanId, seed, options.journalDevice, options.journalUuid, options.journalBaseline, options.journalBaseline, new Date(this.#clock()).toISOString())
         this.#database.exec('INSERT INTO scan_counters (singleton) VALUES (1)')
       }
       if (openExisting) {
@@ -316,6 +465,17 @@ export class ProgressiveScanDatabase implements ChartDataSource {
         UPDATE nodes SET size_bytes = size_bytes + ?, descendant_count = descendant_count + ?, unreadable_count = unreadable_count + ?
         WHERE id IN (SELECT id FROM ancestors)
       `)
+      // Post-order accounting: deltas land on the node itself and are pushed
+      // to the parent when the node's subtree completes, so the recursive
+      // ancestor walk runs once per completed directory instead of once per
+      // page. The recursive statement above remains for the rare hardlink
+      // owner replacement, which can target an already-propagated subtree.
+      this.#applyNodeDeltaStatement = this.#database.prepare(`
+        UPDATE nodes SET size_bytes = size_bytes + ?, descendant_count = descendant_count + ?, unreadable_count = unreadable_count + ?
+        WHERE id = ?
+      `)
+      this.#nodeTotalsStatement = this.#database.prepare("SELECT size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE id = ?")
+      this.#nodeScanStateStatement = this.#database.prepare("SELECT scan_state AS scanState FROM nodes WHERE id = ?")
       this.#attachEstimate = this.#database.prepare(`
         INSERT INTO size_estimates (node_id, estimated_bytes, indexed_items, physical_size_coverage)
         SELECT ?, estimated_bytes, indexed_items, physical_size_coverage FROM estimate_roots WHERE name = ?
@@ -393,7 +553,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
 
   #consumeEstimateRoot(name: string): void {
     if (!this.#estimateRootNames.delete(name)) return
-    this.#metadataBatch?.consumedEstimateRoots.add(name)
+    this.#consumedEstimateRoots.add(name)
     this.#deleteEstimateRoot.run(name)
   }
 
@@ -425,6 +585,30 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   #queue(id: string, path: string, depth: number, focused: boolean): void {
     this.#incrementEnqueue.run()
     this.#insertTask.run(id, path, depth, focused ? 1 : 0)
+  }
+
+  takeWork(request: ConstructionWorkRequest): ConstructionWorkBatch {
+    this.#assertBuilding()
+    if (this.#leasedTaskIds.length > 0) throw new ConstructionError("illegal-transition", "Construction work is already leased")
+    const limit = Math.max(1, Math.floor(request.limit))
+    let focusTurns = Math.max(0, Math.floor(request.focusTurns))
+    const reserved = new Set<string>()
+    const work: DirectoryTask[] = []
+    while (work.length < limit) {
+      const focusedAvailable = this.hasPendingTasks(true)
+      const normalAvailable = this.hasPendingTasks(false)
+      const takeFocused = focusedAvailable && (focusTurns < 3 || !normalAvailable)
+      let task = this.nextTask(takeFocused, reserved)
+      if (!task) task = this.nextTask(!takeFocused, reserved)
+      if (!task) break
+      reserved.add(task.id)
+      work.push(task)
+      if (task.focused) focusTurns += 1
+      else focusTurns = 0
+      if (task.focused && focusTurns >= 3 && this.hasPendingTasks(false)) focusTurns = 3
+    }
+    this.#leasedTaskIds.push(...work.map((task) => task.id))
+    return { work, focusTurns, done: work.length === 0 && !this.hasPendingTasks() }
   }
 
   nextTask(focused: boolean, excludedIds: ReadonlySet<string> = new Set()): DirectoryTask | undefined {
@@ -462,41 +646,188 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     this.#database.prepare("UPDATE directory_observations SET enumeration_status = 'scanning' WHERE node_id = ? AND enumeration_status = 'queued'").run(id)
   }
 
+  accept(input: ConstructionInput): ConstructionPageResult {
+    this.#assertBuilding()
+    const taskId = input.kind === "unreadable" ? input.taskId : input.page.taskId
+    if (this.#leasedTaskIds.length > 0) {
+      const expected = this.#leasedTaskIds[0]
+      if (taskId !== expected) throw new ConstructionError("stale-work", `Expected construction work ${expected}, received ${taskId}`)
+      this.#leasedTaskIds.shift()
+    }
+    if (input.kind === "unreadable") {
+      const result = this.applyMetadataBatch(() => {
+        this.#assertOpenTask(input.taskId)
+        this.startTask(input.taskId)
+        this.markUnreadable(input.taskId, input.disappearing)
+        this.bumpRevision()
+        return {
+          scannedItems: 0, discoveredBytes: 0, skippedItems: 1, unreadableItems: 1,
+          disappearingItems: input.disappearing ? 1 : 0, symlinks: 0, nestedMounts: 0,
+          duplicateHardLinks: 0, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+        } satisfies ConstructionPageResult
+      })
+      if (input.checkpointAfter) this.checkpoint(input.checkpointAfter)
+      return result
+    }
+
+    const page = input.page
+    if (!Number.isSafeInteger(page.entriesRead) || page.entriesRead < 0) throw new Error('Invalid construction page cursor')
+    const result = this.applyMetadataBatch(() => {
+      this.#assertPageCursor(page)
+      const totals = emptyConstructionPageResult()
+      if (!page.done) this.startTask(page.taskId)
+      for (const entry of page.entries) this.#applyPageEntry(entry, page, totals)
+      if (this.#resumable) this.addMetadataCounters(page.bulkMetadataEntries, page.fallbackMetadataEntries)
+      this.bumpRevision()
+      this.#advanceTask(page.taskId, page.entriesRead, page.entries.length)
+      if (page.done) this.finishEnumeration(page.taskId)
+      else this.yieldTask(page.taskId)
+      totals.bulkMetadataEntries = Math.max(0, Math.floor(page.bulkMetadataEntries))
+      totals.fallbackMetadataEntries = Math.max(0, Math.floor(page.fallbackMetadataEntries))
+      return totals
+    })
+    if (page.checkpointAfter) this.checkpoint(page.checkpointAfter)
+    return result
+  }
+
+  #assertPageCursor(page: ConstructionPage): void {
+    const row = this.#database.prepare('SELECT entries_read AS entriesRead, depth, status FROM directory_tasks WHERE node_id = ?').get(page.taskId) as { entriesRead?: number; depth?: number; status?: string } | undefined
+    if (!row || Number(row.entriesRead) !== page.entriesRead || Number(row.depth) !== page.depth || row.status !== 'queued' && row.status !== 'scanning') {
+      throw new Error(`Stale construction page for ${page.taskId}`)
+    }
+  }
+
+  #assertOpenTask(id: string): void {
+    const row = this.#database.prepare('SELECT status FROM directory_tasks WHERE node_id = ?').get(id) as { status?: string } | undefined
+    if (!row || row.status !== 'queued' && row.status !== 'scanning') throw new Error(`Closed construction task for ${id}`)
+  }
+
+  #advanceTask(id: string, entriesRead: number, count: number): void {
+    const result = this.#database.prepare('UPDATE directory_tasks SET entries_read = entries_read + ? WHERE node_id = ? AND entries_read = ?')
+      .run(Math.max(0, Math.floor(count)), id, entriesRead)
+    if (Number(result.changes) !== 1) throw new Error(`Construction page cursor changed for ${id}`)
+  }
+
+  #applyPageEntry(entry: ConstructionPageEntry, page: ConstructionPage, totals: MutableConstructionPageResult): void {
+    if (entry.kind === "skipped") {
+      const observation = entry.observation
+      this.observeSkipped(page.taskId, observation)
+      totals.skippedItems += 1
+      if (observation?.unreadable) totals.unreadableItems += 1
+      if (observation?.disappearing) totals.disappearingItems += 1
+      if (observation?.symlink) totals.symlinks += 1
+      if (observation?.nestedMount) totals.nestedMounts += 1
+      return
+    }
+
+    const { node, pathKey, linkCount } = entry.node
+    const bytes = safeBytes(node.ownBytes)
+    if (node.kind === "file" && node.parentId) this.insertFileAlias(node.parentId, node.name, pathKey, node.device, node.inode, bytes)
+    const needsHardLinkOwnership = node.kind === "file" && node.device !== "" && node.inode !== "" && linkCount !== 1
+    let replacingOwner = false
+    if (needsHardLinkOwnership) {
+      const owner = this.getHardLinkOwner(node.device, node.inode)
+      if (owner) {
+        totals.skippedItems += 1
+        totals.duplicateHardLinks += 1
+        if (comparePathKeys(pathKey, owner.pathKey) >= 0) {
+          this.observeSkipped(page.taskId, { duplicate: true })
+          return
+        }
+        const previousParentId = this.#parentId(owner.nodeId)
+        if (previousParentId) this.observeSkipped(previousParentId, { duplicate: true })
+        this.removeOwnedFile(owner.nodeId)
+        replacingOwner = true
+      }
+    }
+    this.insertChild(node, page.depth + 1, page.focused)
+    if (needsHardLinkOwnership) this.setHardLinkOwner(node.device, node.inode, node.id, pathKey)
+    if (!replacingOwner) {
+      totals.scannedItems += 1
+      totals.discoveredBytes += bytes
+    }
+  }
+
   applyMetadataBatch<T>(operation: () => T): T {
     this.#assertBuilding()
-    if (this.#metadataBatch) throw new Error('Nested metadata batches are not supported')
-    // Metadata pages contain siblings from one directory. Keep aggregate work
-    // in memory until the page is complete so one page does not run the same
-    // ancestor walk and direct-child update once per sibling.
-    const parentBatch = this.#metadataBatch
+    if (this.#inMetadataOperation) throw new Error('Nested metadata batches are not supported')
+    // The savepoint keeps one page's immediate statements atomic; the
+    // accumulator maps survive across pages and are flushed on a threshold.
     this.#database.exec('SAVEPOINT metadata_batch')
-    const batch: MetadataBatch = {
-      ancestorDeltas: new Map(), directChildDeltas: new Map(), observationDeltas: new Map(),
-      fileNodes: new Map(), fileAliases: [], hardLinkOwners: new Map(), consumedEstimateRoots: new Set()
+    this.#consumedEstimateRoots = new Set()
+    this.#inMetadataOperation = true
+    const batch = this.#metadataBatch
+    // Snapshot the accumulator so an error discards exactly this page's
+    // additions while preserving earlier pages' unflushed data: a canceled
+    // scan checkpoints before aborting, and the checkpoint must not commit
+    // entries the task queue never counted.
+    const snapshot = {
+      fileNodes: new Map(batch.fileNodes),
+      fileAliases: batch.fileAliases.slice(),
+      hardLinkOwners: new Map(batch.hardLinkOwners),
+      ancestorDeltas: new Map([...batch.ancestorDeltas].map(([key, delta]) => [key, { ...delta }])),
+      directChildDeltas: new Map(batch.directChildDeltas),
+      observationDeltas: new Map([...batch.observationDeltas].map(([key, delta]) => [key, { ...delta }])),
+      propagatedToParent: new Map([...this.#propagatedToParent].map(([key, delta]) => [key, { ...delta }])),
+      lastBatchFlushAt: this.#lastBatchFlushAt
     }
-    this.#metadataBatch = batch
     try {
       const result = operation()
-      this.#flushMetadataBatch(batch)
-      this.#metadataBatch = parentBatch
+      this.#maybeFlushMetadataBatch()
       this.#database.exec('RELEASE metadata_batch')
       return result
     } catch (error) {
-      this.#metadataBatch = parentBatch
-      for (const name of batch.consumedEstimateRoots) this.#estimateRootNames.add(name)
-      this.#database.exec('ROLLBACK TO metadata_batch')
-      this.#database.exec('RELEASE metadata_batch')
+      for (const name of this.#consumedEstimateRoots) this.#estimateRootNames.add(name)
+      this.#restoreBatchSnapshot(batch, snapshot)
+      try { this.#database.exec('ROLLBACK TO metadata_batch') } catch { /* The savepoint may already be released. */ }
+      try { this.#database.exec('RELEASE metadata_batch') } catch { /* The savepoint may already be released. */ }
       throw error
+    } finally {
+      this.#inMetadataOperation = false
     }
+  }
+
+  #restoreBatchSnapshot(batch: MetadataBatch, snapshot: {
+    readonly fileNodes: Map<string, PendingFileNode>
+    readonly fileAliases: PendingFileAlias[]
+    readonly hardLinkOwners: Map<string, PendingHardLinkOwner>
+    readonly ancestorDeltas: Map<string, AncestorDelta>
+    readonly directChildDeltas: Map<string, number>
+    readonly observationDeltas: Map<string, ObservationDelta>
+    readonly propagatedToParent: Map<string, { readonly bytes: number; readonly descendants: number; readonly unreadable: number }>
+    readonly lastBatchFlushAt: number
+  }): void {
+    batch.fileNodes.clear()
+    for (const [key, node] of snapshot.fileNodes) batch.fileNodes.set(key, node)
+    batch.fileAliases.length = 0
+    batch.fileAliases.push(...snapshot.fileAliases)
+    batch.hardLinkOwners.clear()
+    for (const [key, owner] of snapshot.hardLinkOwners) batch.hardLinkOwners.set(key, owner)
+    batch.ancestorDeltas.clear()
+    for (const [key, delta] of snapshot.ancestorDeltas) batch.ancestorDeltas.set(key, delta)
+    batch.directChildDeltas.clear()
+    for (const [key, delta] of snapshot.directChildDeltas) batch.directChildDeltas.set(key, delta)
+    batch.observationDeltas.clear()
+    for (const [key, delta] of snapshot.observationDeltas) batch.observationDeltas.set(key, delta)
+    this.#propagatedToParent.clear()
+    for (const [key, delta] of snapshot.propagatedToParent) this.#propagatedToParent.set(key, delta)
+    this.#lastBatchFlushAt = snapshot.lastBatchFlushAt
+  }
+
+  #maybeFlushMetadataBatch(): void {
+    const batch = this.#metadataBatch
+    const now = this.#clock()
+    if (batch.fileNodes.size < 4_096 && batch.ancestorDeltas.size < 1_024 && now - this.#lastBatchFlushAt < 250) return
+    this.#flushMetadataBatch(batch)
   }
 
   #flushMetadataBatch(batch: MetadataBatch): void {
     if (batch.fileNodes.size > 0) this.#insertFileNodeBatch.run(JSON.stringify([...batch.fileNodes.values()]))
     if (batch.fileAliases.length > 0) this.#insertFileAliasBatch.run(JSON.stringify(batch.fileAliases))
     if (batch.hardLinkOwners.size > 0) this.#setHardLinkOwnerBatch.run(JSON.stringify([...batch.hardLinkOwners.values()]))
-    for (const [parentId, delta] of batch.ancestorDeltas) {
+    for (const [nodeId, delta] of batch.ancestorDeltas) {
       if (delta.bytes === 0 && delta.descendants === 0 && delta.unreadable === 0) continue
-      this.#applyAncestorDeltaStatement.run(parentId, delta.bytes, delta.descendants, delta.unreadable)
+      this.#applyNodeDeltaStatement.run(delta.bytes, delta.descendants, delta.unreadable, nodeId)
     }
     for (const [parentId, delta] of batch.directChildDeltas) {
       if (delta !== 0) this.#incrementDirectChildren.run(delta, parentId)
@@ -511,11 +842,11 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     batch.ancestorDeltas.clear()
     batch.directChildDeltas.clear()
     batch.observationDeltas.clear()
+    this.#lastBatchFlushAt = this.#clock()
   }
 
   #flushPendingMetadataBatch(): void {
-    const batch = this.#metadataBatch
-    if (batch) this.#flushMetadataBatch(batch)
+    this.#flushMetadataBatch(this.#metadataBatch)
   }
 
   #applyDirectChildDelta(parentId: string, delta: number): void {
@@ -551,7 +882,14 @@ export class ProgressiveScanDatabase implements ChartDataSource {
         direct_unreadable_count = direct_unreadable_count + ?, direct_disappearing_count = direct_disappearing_count + ? WHERE node_id = ?
     `).run(disappearing ? 0 : 1, disappearing ? 1 : 0, id)
     this.#deleteEstimate(id)
-    this.#applyUnreadableDelta(id, 1)
+    // The unreadable node never completes, so push its accumulated state to
+    // the parent now: its own unreadable flag counts on itself and every
+    // ancestor, and children that completed before the failure must reach the
+    // ancestors even though the subtree will not propagate on completion.
+    // Children that complete after the mark are propagated when the
+    // completion walk reaches this node.
+    this.#applyNodeDeltaStatement.run(0, 0, 1, id)
+    this.#propagateToParent(id)
     const parent = this.#parentId(id)
     if (parent) this.#completeReady(parent)
   }
@@ -598,9 +936,40 @@ export class ProgressiveScanDatabase implements ChartDataSource {
       `).get(id, id) as unknown as { enumerationComplete: number; scanState: string; pending: number } | undefined
       if (!row || !row.enumerationComplete || row.pending) break
       this.#deleteEstimate(id)
-      if (row.scanState !== "unreadable") this.#database.prepare("UPDATE nodes SET scan_state = 'complete' WHERE id = ?").run(id)
+      if (row.scanState === "unreadable") {
+        // The unreadable node never transitions, but its subtree may finish
+        // after it was marked (children queued before the failure). Push the
+        // delta accumulated since the last propagation to the parent.
+        this.#propagateToParent(id)
+      } else if (row.scanState !== "complete") {
+        this.#database.prepare("UPDATE nodes SET scan_state = 'complete' WHERE id = ?").run(id)
+        this.#propagateToParent(id)
+      }
       id = this.#parentId(id)
     }
+  }
+
+  // Pushes a node's accumulated subtree totals (everything above its own
+  // bytes) to its parent. The node's own bytes and count reached the parent
+  // at insert time, so only the delta above own_bytes is propagated. The
+  // pending batch may hold unflushed contributions to the node, so the
+  // virtual state (row + pending) is what gets propagated and recorded.
+  #propagateToParent(id: string): void {
+    const parentId = this.#parentId(id)
+    if (!parentId) return
+    const row = this.#nodeTotalsStatement.get(id) as unknown as { sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number } | undefined
+    if (!row) return
+    const pending = this.#metadataBatch.ancestorDeltas.get(id)
+    const bytes = Number(row.sizeBytes) - Number(row.ownBytes) + (pending?.bytes ?? 0)
+    const descendants = Number(row.descendantCount) + (pending?.descendants ?? 0)
+    const unreadable = Number(row.unreadableCount) + (pending?.unreadable ?? 0)
+    const propagated = this.#propagatedToParent.get(id)
+    const deltaBytes = bytes - (propagated?.bytes ?? 0)
+    const deltaDescendants = descendants - (propagated?.descendants ?? 0)
+    const deltaUnreadable = unreadable - (propagated?.unreadable ?? 0)
+    if (deltaBytes === 0 && deltaDescendants === 0 && deltaUnreadable === 0) return
+    this.#applyAncestorDelta(parentId, deltaBytes, deltaDescendants, deltaUnreadable)
+    this.#propagatedToParent.set(id, { bytes, descendants, unreadable })
   }
 
   getEstimatedRemainder(id: string): number {
@@ -640,18 +1009,34 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   }
 
   removeOwnedFile(id: string): void {
-    const pending = this.#metadataBatch?.fileNodes.get(id)
+    const pending = this.#metadataBatch.fileNodes.get(id)
     if (pending) {
-      this.#metadataBatch?.fileNodes.delete(id)
-      this.#applyAncestorDelta(pending.parentId, -pending.ownBytes, -1, 0)
+      this.#metadataBatch.fileNodes.delete(id)
+      this.#removeFileFromAccounting(pending.parentId, -pending.ownBytes)
       this.#applyDirectChildDelta(pending.parentId, -1)
       return
     }
     const row = this.#selectOwnedFile.get(id) as unknown as { parentId: string | null; sizeBytes: number } | undefined
     if (!row) return
-    this.#applyAncestorDelta(row.parentId, -Number(row.sizeBytes), -1, 0)
+    this.#removeFileFromAccounting(row.parentId, -Number(row.sizeBytes))
     if (row.parentId) this.#applyDirectChildDelta(row.parentId, -1)
     this.#deleteNode.run(id)
+  }
+
+  // The file's bytes live on its parent and, once the parent's subtree
+  // completed, on every ancestor that propagated them upward. Subtract from
+  // exactly the nodes that received them: the parent, then each completed
+  // ancestor in turn. The walk is required because the parent may have
+  // completed (and propagated) before the replacement is discovered; it works
+  // against both the committed rows and the pending batch deltas.
+  #removeFileFromAccounting(parentId: string | null, bytes: number): void {
+    let id: string | null = parentId
+    while (id) {
+      this.#applyAncestorDelta(id, bytes, -1, 0)
+      const state = this.#nodeScanStateStatement.get(id) as { scanState?: string } | undefined
+      if (!state || state.scanState !== "complete" && state.scanState !== "unreadable") break
+      id = this.#parentId(id)
+    }
   }
 
   get scanId(): string | undefined {
@@ -670,27 +1055,66 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     return Number(row?.sequence ?? 0)
   }
 
-  checkpoint(activeElapsedDeltaMs = 0): number {
+  get phase(): ConstructionPhase {
+    const row = this.#database.prepare('SELECT phase FROM scan_run WHERE singleton = 1').get() as { phase?: ConstructionPhase } | undefined
+    if (!row?.phase) throw new Error('Construction database has no scan phase')
+    return row.phase
+  }
+
+  checkpoint(request: ConstructionCheckpointRequest | number = {}): number {
     this.#assertBuilding()
-    const started = Date.now()
+    const normalized = typeof request === 'number' ? { activeElapsedDeltaMs: request } : request
+    if (this.#resumable && normalized.reason === 'resume' && this.phase === 'paused') this.#setPhase('scanning')
+    if (normalized.journalDrain) this.#setJournalDrain(normalized.journalDrain.scopes, normalized.journalDrain.throughEventId)
+    // The task queue commits entries_read immediately, so a checkpoint must
+    // never outrun unflushed file rows: a resume would skip re-reading
+    // entries whose rows were never committed.
+    this.#flushPendingMetadataBatch()
     this.#database.prepare(`UPDATE scan_run SET checkpoint_sequence = checkpoint_sequence + 1,
       active_elapsed_ms = active_elapsed_ms + ?, checkpointed_at = ? WHERE singleton = 1`)
-      .run(Math.max(0, Math.floor(activeElapsedDeltaMs)), new Date().toISOString())
+      .run(Math.max(0, Math.floor(normalized.activeElapsedDeltaMs ?? 0)), new Date(this.#clock()).toISOString())
     measureScan('database-checkpoint', () => this.#database.exec('COMMIT'))
     this.#database.exec('BEGIN')
-    void started
     return this.checkpointSequence
   }
 
-  pause(activeElapsedDeltaMs = 0): number {
-    const sequence = this.checkpoint(activeElapsedDeltaMs)
-    this.#database.exec('ROLLBACK')
-    this.#state = 'paused'
-    this.#close()
-    return sequence
+  finish(command: ConstructionFinishCommand): ConstructionFinishResult {
+    if (command.kind === 'unexpected-failure') {
+      this.#assertBuilding()
+      const sequence = this.checkpointSequence
+      this.abort()
+      return { kind: 'failed', checkpointSequence: sequence }
+    }
+    if (command.kind === 'pause') {
+      this.#assertBuilding()
+      this.#setPhase('paused')
+      const request: ConstructionCheckpointRequest = {
+        reason: 'pause',
+        ...(command.activeElapsedDeltaMs === undefined ? {} : { activeElapsedDeltaMs: command.activeElapsedDeltaMs }),
+        ...(command.journalDrain === undefined ? {} : { journalDrain: command.journalDrain })
+      }
+      const sequence = this.checkpoint(request)
+      this.#database.exec('ROLLBACK')
+      this.#database.exec('PRAGMA synchronous=FULL; PRAGMA wal_checkpoint(TRUNCATE)')
+      this.#state = 'paused'
+      this.#close()
+      return { kind: 'paused', checkpointSequence: sequence }
+    }
+
+    return this.#finishCandidate(command)
   }
 
-  setPhase(phase: 'traversing' | 'awaiting-reconciliation' | 'finalizing'): void {
+  pause(activeElapsedDeltaMs = 0): number {
+    const result = this.finish({ kind: 'pause', activeElapsedDeltaMs })
+    if (result.kind !== 'paused') throw new Error(`Unexpected construction finish result: ${result.kind}`)
+    return result.checkpointSequence
+  }
+
+  setPhase(phase: ConstructionPhase | 'traversing'): void {
+    this.#setPhase(phase === 'traversing' ? 'scanning' : phase)
+  }
+
+  #setPhase(phase: ConstructionPhase): void {
     this.#database.prepare('UPDATE scan_run SET phase = ? WHERE singleton = 1').run(phase)
   }
 
@@ -711,12 +1135,29 @@ export class ProgressiveScanDatabase implements ChartDataSource {
 
   setJournalDrain(scopes: readonly string[], throughEventId: string): void {
     this.#assertBuilding()
-    if (scopes.length > 1024) throw new Error('resume-dirty-scopes-unbounded')
+    this.#setJournalDrain(scopes, throughEventId)
+  }
+
+  #setJournalDrain(scopes: readonly string[], throughEventId: string): void {
+    if (scopes.length > 1024 || !isDecimalEventId(throughEventId)) throw new Error('resume-dirty-scopes-unbounded')
+    const current = this.drainedThrough
+    if (isDecimalEventId(current) && BigInt(throughEventId) < BigInt(current)) throw new Error('resume-watermark-regressed')
     const insert = this.#database.prepare('INSERT OR IGNORE INTO dirty_scopes (path) VALUES (?)')
     for (const path of scopes) insert.run(path)
     const count = this.#database.prepare('SELECT COUNT(*) AS count FROM dirty_scopes').get() as { count: number }
     if (Number(count.count) > 1024) throw new Error('resume-dirty-scopes-unbounded')
     this.#database.prepare('UPDATE scan_run SET drained_through = ? WHERE singleton = 1').run(throughEventId)
+  }
+
+  status(): ConstructionStatus {
+    return {
+      phase: this.phase,
+      revision: this.revision,
+      checkpointSequence: this.checkpointSequence,
+      totals: this.semanticTotals(),
+      drainedThrough: this.drainedThrough,
+      dirtyScopes: this.dirtyScopes
+    }
   }
 
   semanticTotals(): ProgressiveSemanticTotals {
@@ -806,6 +1247,7 @@ export class ProgressiveScanDatabase implements ChartDataSource {
   }
 
   writeMetadata(meta: ScanDatabaseMeta): void {
+    this.#assertBuilding()
     this.#insertMetadata.run("target", meta.target)
     this.#insertMetadata.run("rootId", meta.rootId)
     this.#insertMetadata.run("volume", JSON.stringify({ capacityBytes: meta.capacityBytes, freeBytes: meta.freeBytes }))
@@ -819,44 +1261,118 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     this.#insertMetadata.run("exclusionPolicyVersion", EXCLUSION_POLICY_VERSION)
     this.#insertMetadata.run("hardLinkOrderingVersion", HARD_LINK_ORDERING_VERSION)
     this.#insertMetadata.run("indexRevision", String(meta.indexRevision ?? 1))
-    this.#insertMetadata.run("capturedAt", meta.capturedAt ?? new Date().toISOString())
-    this.#insertMetadata.run("refreshedAt", meta.refreshedAt ?? meta.capturedAt ?? new Date().toISOString())
+    const capturedAt = meta.capturedAt ?? new Date(this.#clock()).toISOString()
+    this.#insertMetadata.run("capturedAt", capturedAt)
+    this.#insertMetadata.run("refreshedAt", meta.refreshedAt ?? capturedAt)
     if (meta.resume) {
       this.#insertMetadata.run('resumeDrainedThrough', meta.resume.drainedThrough)
       this.#insertMetadata.run('resumeDirtyScopes', JSON.stringify(meta.resume.dirtyScopes))
     }
   }
 
-  finalize(): void {
+  #finishCandidate(command: Extract<ConstructionFinishCommand, { readonly kind: "finalize" }>): ConstructionFinishResult {
     this.#assertBuilding()
+    const candidatePath = this.#candidatePath
+    if (!candidatePath) throw new Error('Construction database has no candidate path')
+    if (resolve(candidatePath) === resolve(this.#path)) throw new Error('Construction and candidate paths must differ')
+    const metadata = command.metadata ?? this.#readMetadata()
+    if (!metadata) throw new Error('Construction database has no final metadata')
+
+    if (this.phase !== 'finalizing') {
+      this.#assertNoPendingTasks()
+      this.#setPhase('awaiting-reconciliation')
+      this.checkpoint({ ...command.checkpoint, reason: 'finalize' })
+      this.#setPhase('finalizing')
+      if (command.metadata) this.writeMetadata(metadata)
+      this.checkpoint({ reason: 'finalize' })
+    } else {
+      this.#flushPendingMetadataBatch()
+      this.#assertNoPendingTasks()
+    }
+
+    // End the fresh transaction opened by checkpoint(). The source remains a
+    // valid construction database until the candidate is fully built.
+    this.#database.exec('ROLLBACK')
+    this.#database.exec('PRAGMA synchronous=FULL; PRAGMA wal_checkpoint(TRUNCATE)')
+    this.#close()
+    const candidateStagingPath = `${candidatePath}.staging-${randomBytes(8).toString('hex')}`
+    const constructionStagingPath = `${this.#path}.staging-${randomBytes(8).toString('hex')}`
+    let published = false
+    try {
+      removeDatabaseArtifacts(candidatePath)
+      removeDatabaseArtifacts(candidateStagingPath)
+      removeDatabaseArtifacts(constructionStagingPath)
+      // Keep the original partial inode for the candidate (publication
+      // identity is stable), then break the link before either side is
+      // mutated so an interrupted finalization still has an independent,
+      // resumable construction database.
+      linkSync(this.#path, candidateStagingPath)
+      copyFileSync(this.#path, constructionStagingPath)
+      syncFile(constructionStagingPath)
+      renameSync(constructionStagingPath, this.#path)
+      syncDirectory(dirname(this.#path))
+      finalizeCandidateFile(candidateStagingPath)
+      validateFinalCandidateFile(candidateStagingPath, metadata)
+      syncFile(candidateStagingPath)
+      renameSync(candidateStagingPath, candidatePath)
+      syncDirectory(dirname(candidatePath))
+      published = true
+    } catch (error) {
+      if (!published) removeDatabaseArtifacts(candidatePath)
+      throw error
+    } finally {
+      removeDatabaseArtifacts(candidateStagingPath)
+      removeDatabaseArtifacts(constructionStagingPath)
+    }
+    return { kind: 'candidate', candidatePath, metadata }
+  }
+
+  #readMetadata(): ScanDatabaseMeta | undefined {
+    const values = Object.fromEntries((this.#database.prepare('SELECT key, value FROM metadata').all() as unknown as Array<{ key: string; value: string }>).map((row) => [row.key, row.value]))
+    if (!values.target || !values.rootId || !values.volume || !values.totals || values.scannedBytes === undefined) return undefined
+    try {
+      const volume = JSON.parse(values.volume) as { capacityBytes?: unknown; freeBytes?: unknown }
+      const totals = JSON.parse(values.totals) as ScanDatabaseMeta['totals']
+      const dirtyScopes = JSON.parse(values.resumeDirtyScopes ?? '[]') as unknown
+      const resume = typeof values.resumeDrainedThrough === 'string' && Array.isArray(dirtyScopes) && dirtyScopes.every((scope) => typeof scope === 'string')
+        ? { drainedThrough: values.resumeDrainedThrough, dirtyScopes: dirtyScopes as string[] }
+        : undefined
+      return {
+        target: values.target, rootId: values.rootId, capacityBytes: Number(volume.capacityBytes ?? 0), freeBytes: Number(volume.freeBytes ?? 0),
+        scannedBytes: Number(values.scannedBytes), totals,
+        ...(values.targetDevice ? { targetDevice: values.targetDevice } : {}),
+        ...(values.targetInode ? { targetInode: values.targetInode } : {}),
+        ...(values.indexDirectoryIdentity ? { indexDirectoryIdentity: values.indexDirectoryIdentity } : {}),
+        ...(values.indexRevision ? { indexRevision: Number(values.indexRevision) } : {}),
+        ...(values.capturedAt ? { capturedAt: values.capturedAt } : {}),
+        ...(values.refreshedAt ? { refreshedAt: values.refreshedAt } : {}),
+        ...(resume ? { resume } : {})
+      }
+    } catch { return undefined }
+  }
+
+  #assertNoPendingTasks(): void {
     const pending = this.#database.prepare("SELECT COUNT(*) AS count FROM directory_tasks WHERE status IN ('queued', 'scanning')").get() as { count: number }
     if (Number(pending.count) !== 0) throw new Error("Cannot publish an index with queued directory work")
-    this.#database.exec(`
-      CREATE INDEX nodes_parent_size ON nodes (parent_id, size_bytes DESC, name COLLATE NOCASE ASC, id ASC);
-      INSERT INTO hardlink_groups (device, inode, owner_path_key, node_id, allocated_bytes)
-        SELECT nodes.device, nodes.inode, aliases.path_key, nodes.id, nodes.own_bytes
-        FROM nodes JOIN file_aliases aliases
-          ON aliases.parent_id = nodes.parent_id AND aliases.name = nodes.name
-            AND aliases.device = nodes.device AND aliases.inode = nodes.inode
-        WHERE nodes.kind = 'file' AND nodes.device <> '' AND nodes.inode <> '';
-      DROP INDEX nodes_parent_preview;
-      DROP INDEX nodes_identity_idx;
-      DROP TABLE directory_tasks;
-      DROP TABLE hardlink_owners;
-      DROP TABLE scan_state;
-      DROP TABLE size_estimates;
-      DROP TABLE estimate_roots;
-      DROP TABLE dirty_scopes;
-      DROP TABLE scan_counters;
-      DROP TABLE scan_run;
-    `)
+  }
+
+  finalize(): void {
+    this.#assertBuilding()
+    this.#flushPendingMetadataBatch()
+    this.#assertNoPendingTasks()
+    finalizeConstructionSchema(this.#database)
   }
 
   complete(): void {
     this.#assertBuilding()
+    this.#flushPendingMetadataBatch()
     measureScan("database-commit", () => this.#database.exec("COMMIT"))
     this.#state = "committed"
-    try { measureScan("database-optimize", () => this.#database.exec("PRAGMA optimize")) }
+    try {
+      this.#database.exec('PRAGMA synchronous=FULL')
+      measureScan("database-checkpoint", () => this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)"))
+      measureScan("database-optimize", () => this.#database.exec("PRAGMA optimize"))
+    }
     finally { this.#close() }
   }
 
@@ -928,6 +1444,18 @@ export class ProgressiveScanDatabase implements ChartDataSource {
         descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
         unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
     `)
+    // The recompute above bakes every unreadable node's accumulated state
+    // into its ancestors, so record it as already propagated: a completion
+    // walk that later reaches the node must push only the delta re-scanned
+    // after the resume.
+    this.#propagatedToParent.clear()
+    for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
+      this.#propagatedToParent.set(row.id, {
+        bytes: Number(row.sizeBytes) - Number(row.ownBytes),
+        descendants: Number(row.descendantCount),
+        unreadable: Number(row.unreadableCount)
+      })
+    }
   }
 
   #applyAncestorDelta(parentId: string | null, bytes: number, descendants: number, unreadable: number): void {
@@ -944,10 +1472,6 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     batch.ancestorDeltas.set(parentId, delta)
   }
 
-  #applyUnreadableDelta(id: string, delta: number): void {
-    this.#applyAncestorDelta(id, 0, 0, delta)
-  }
-
   #parentId(id: string): string | null {
     const row = this.#parentIdStatement.get(id) as unknown as { parentId: string | null } | undefined
     return row?.parentId ?? null
@@ -959,6 +1483,128 @@ export class ProgressiveScanDatabase implements ChartDataSource {
     try { measureScan("database-close", () => this.#database.close()) }
     finally { this.#state = "closed" }
   }
+}
+
+function migrateConstructionSchema(database: DatabaseSync): void {
+  const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scan_run'").get() as { sql?: string } | undefined
+  const schema = row?.sql ?? ''
+  if (schema.includes("'scanning'") && schema.includes("'paused'")) return
+  if (!schema.includes("'traversing'") && !schema.includes("'scanning'")) throw new Error('Unsupported construction database schema')
+  database.exec('BEGIN IMMEDIATE')
+  try {
+    database.exec(`
+      ALTER TABLE scan_run RENAME TO scan_run_legacy;
+      CREATE TABLE scan_run (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        scan_id TEXT NOT NULL UNIQUE,
+        node_id_seed TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('scanning', 'paused', 'awaiting-reconciliation', 'finalizing')),
+        checkpoint_sequence INTEGER NOT NULL DEFAULT 0,
+        active_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        journal_device TEXT NOT NULL,
+        journal_uuid TEXT NOT NULL,
+        journal_baseline TEXT NOT NULL,
+        drained_through TEXT NOT NULL,
+        checkpointed_at TEXT NOT NULL
+      );
+      INSERT INTO scan_run (singleton, scan_id, node_id_seed, phase, checkpoint_sequence, active_elapsed_ms,
+        journal_device, journal_uuid, journal_baseline, drained_through, checkpointed_at)
+        SELECT singleton, scan_id, node_id_seed,
+          CASE phase WHEN 'traversing' THEN 'scanning' ELSE phase END,
+          checkpoint_sequence, active_elapsed_ms, journal_device, journal_uuid, journal_baseline,
+          drained_through, checkpointed_at
+        FROM scan_run_legacy;
+      DROP TABLE scan_run_legacy;
+      COMMIT;
+    `)
+  } catch (error) {
+    try { database.exec('ROLLBACK') } catch { /* Preserve the migration error. */ }
+    throw error
+  }
+}
+
+function emptyConstructionPageResult(): MutableConstructionPageResult {
+  return {
+    scannedItems: 0, discoveredBytes: 0, skippedItems: 0, unreadableItems: 0, disappearingItems: 0,
+    symlinks: 0, nestedMounts: 0, duplicateHardLinks: 0, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+  }
+}
+
+function comparePathKeys(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'))
+}
+
+function isDecimalEventId(value: string): boolean { return /^(?:0|[1-9]\d*)$/u.test(value) }
+
+function validateFinalCandidateFile(path: string, metadata: ScanDatabaseMeta): void {
+  const database = new DatabaseSync(path, { readOnly: true })
+  try {
+    const integrity = database.prepare('PRAGMA integrity_check').get() as { integrity_check?: string }
+    database.exec('PRAGMA foreign_keys=ON')
+    if (integrity.integrity_check !== 'ok' || database.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('Final candidate failed SQLite validation')
+    const constructionTables = database.prepare(`SELECT COUNT(*) AS count FROM sqlite_master
+      WHERE type = 'table' AND name IN ('directory_tasks', 'hardlink_owners', 'scan_state', 'scan_run', 'scan_counters', 'dirty_scopes', 'size_estimates', 'estimate_roots')`).get() as { count?: number }
+    if (Number(constructionTables.count ?? 0) !== 0) throw new Error('Final candidate still contains construction tables')
+    const values = Object.fromEntries((database.prepare('SELECT key, value FROM metadata').all() as unknown as Array<{ key: string; value: string }>).map((row) => [row.key, row.value]))
+    const pending = database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE scan_state IN ('queued', 'scanning')").get() as { count?: number }
+    const roots = database.prepare('SELECT COUNT(*) AS count FROM nodes WHERE parent_id IS NULL').get() as { count?: number }
+    const root = database.prepare('SELECT id, size_bytes AS sizeBytes FROM nodes WHERE parent_id IS NULL').get() as { id?: string; sizeBytes?: number } | undefined
+    if (values.target !== metadata.target || values.rootId !== metadata.rootId || Number(values.scannedBytes) !== metadata.scannedBytes
+      || Number(pending.count ?? 0) !== 0 || Number(roots.count ?? 0) !== 1 || root?.id !== metadata.rootId || Number(root.sizeBytes) !== metadata.scannedBytes) {
+      throw new Error('Final candidate metadata does not match construction state')
+    }
+  } finally { database.close() }
+}
+
+function finalizeConstructionSchema(database: DatabaseSync): void {
+  database.exec(`
+    CREATE INDEX nodes_parent_size ON nodes (parent_id, size_bytes DESC, name COLLATE NOCASE ASC, id ASC);
+    INSERT INTO hardlink_groups (device, inode, owner_path_key, node_id, allocated_bytes)
+      SELECT nodes.device, nodes.inode, aliases.path_key, nodes.id, nodes.own_bytes
+      FROM nodes JOIN file_aliases aliases
+        ON aliases.parent_id = nodes.parent_id AND aliases.name = nodes.name
+          AND aliases.device = nodes.device AND aliases.inode = nodes.inode
+      WHERE nodes.kind = 'file' AND nodes.device <> '' AND nodes.inode <> '';
+    DROP INDEX nodes_parent_preview;
+    DROP INDEX nodes_identity_idx;
+    DROP TABLE directory_tasks;
+    DROP TABLE hardlink_owners;
+    DROP TABLE scan_state;
+    DROP TABLE size_estimates;
+    DROP TABLE estimate_roots;
+    DROP TABLE dirty_scopes;
+    DROP TABLE scan_counters;
+    DROP TABLE scan_run;
+  `)
+}
+
+function removeDatabaseArtifacts(path: string): void {
+  for (const suffix of ['', '-journal', '-wal', '-shm']) {
+    try { rmSync(`${path}${suffix}`, { force: true }) } catch { /* Cleanup is best effort. */ }
+  }
+}
+
+function syncFile(path: string): void {
+  const descriptor = openSync(path, 'r')
+  try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
+}
+
+function syncDirectory(path: string): void {
+  const descriptor = openSync(path, 'r')
+  try { fsyncSync(descriptor) } finally { closeSync(descriptor) }
+}
+
+function finalizeCandidateFile(path: string): void {
+  const database = new DatabaseSync(path)
+  try {
+    database.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; BEGIN')
+    finalizeConstructionSchema(database)
+    database.exec('COMMIT')
+    database.exec('PRAGMA optimize')
+  } catch (error) {
+    try { database.exec('ROLLBACK') } catch { /* Preserve the candidate error. */ }
+    throw error
+  } finally { database.close() }
 }
 
 function hardLinkIdentity(device: string, inode: string): string { return `${device}\0${inode}` }

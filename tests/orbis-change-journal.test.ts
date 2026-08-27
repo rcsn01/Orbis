@@ -46,4 +46,20 @@ describe('Orbis change journal', () => {
     }))
     expect(malformed.readChanges('/tmp/root', { uuid: 'volume-uuid', eventId: '1' }, 100, 2_000)).toEqual({ throughEventId: '1', events: [], requiresFullScan: true, reason: 'malformed-history' })
   })
+
+  it('forwards the quiet deadline to the native addon and clamps it', () => {
+    const calls: number[][] = []
+    const journal = new NativeChangeJournal(addon({
+      readChanges: (_target, _expectedUuid, sinceId, maxEvents, timeoutMs, quietMs) => {
+        calls.push([maxEvents, timeoutMs, quietMs])
+        return { throughEventId: sinceId, events: [], requiresFullScan: false }
+      }
+    }))
+    journal.readChanges('/tmp/root', { uuid: 'volume-uuid', eventId: '10' }, 100, 2_000, 10)
+    expect(calls).toEqual([[100, 2_000, 10]])
+    journal.readChanges('/tmp/root', { uuid: 'volume-uuid', eventId: '10' }, 100, 2_000)
+    expect(calls[1]).toEqual([100, 2_000, 100])
+    journal.readChanges('/tmp/root', { uuid: 'volume-uuid', eventId: '10' }, 100, 2_000, 99_999)
+    expect(calls[2]).toEqual([100, 2_000, 30_000])
+  })
 })

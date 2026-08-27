@@ -1,10 +1,10 @@
 import { DatabaseSync } from 'node:sqlite'
-import { link, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { defaultScanFileSystem, ProgressiveScanControl, ScanCanceledError, scanFilesystem, type ProgressivePreview, type ScanFileSystem, type ScanTotals } from '../src/main/scanner'
-import { ProgressiveScanDatabase } from '../src/main/progressive-database'
+import { ConstructionDatabase } from '../src/main/construction-database'
 import type { DirectoryMetadataEntry, DirectoryMetadataSource } from '../src/main/scan-metadata'
 
 const cleanup: string[] = []
@@ -134,7 +134,7 @@ describe('progressive Orbis scanner', () => {
   it('subtracts provisional child display sizes from an estimated remainder', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-estimate-remainder-'))
     cleanup.push(directory)
-    const database = new ProgressiveScanDatabase(join(directory, 'partial.sqlite'))
+    const database = new ConstructionDatabase(join(directory, 'partial.sqlite'))
     try {
       database.insertRoot({ id: 'n-root', parentId: null, name: 'root', path: join(directory, 'root'), kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
       database.applyEstimates({ items: [{ name: 'folder', estimatedBytes: 4096 }] })
@@ -148,18 +148,24 @@ describe('progressive Orbis scanner', () => {
   it('rolls back JSON page writes and pending hard-link ownership when a batch fails', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-page-rollback-'))
     cleanup.push(directory)
-    const database = new ProgressiveScanDatabase(join(directory, 'construction.sqlite'))
+    const database = new ConstructionDatabase(join(directory, 'construction.sqlite'))
     try {
       database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
-      expect(() => database.applyMetadataBatch(() => {
+      database.applyMetadataBatch(() => {
         database.insertChild({ id: 'file', parentId: 'root', name: 'file', path: join(directory, 'file'), kind: 'file', ownBytes: 512, device: '1', inode: '2' }, 1, false)
         database.insertFileAlias('root', 'file', 'file', '1', '2', 512)
         database.insertFileAlias('root', 'file-copy', 'file', '1', '2', 512)
         database.setHardLinkOwner('1', '2', 'file', 'file')
-      })).toThrow()
-      expect(database.getNode('file')).toBeUndefined()
-      expect(database.getHardLinkOwner('1', '2')).toBeUndefined()
-      expect(database.semanticTotals().scannedItems).toBe(1)
+      })
+      // The duplicate path_key is only written when the deferred flush runs;
+      // the failure propagates and the whole construction transaction rolls
+      // back, leaving no rows at all.
+      expect(() => database.semanticTotals()).toThrow()
+      database.abort()
+      const reopened = new DatabaseSync(join(directory, 'construction.sqlite'), { readOnly: true })
+      try {
+        expect(reopened.prepare('SELECT COUNT(*) AS count FROM nodes').get()).toEqual({ count: 0 })
+      } finally { reopened.close() }
     } finally { database.abort() }
   })
 
@@ -248,6 +254,144 @@ describe('progressive Orbis scanner', () => {
       expect(database.prepare('SELECT path_key AS pathKey FROM file_aliases ORDER BY path_key').all()).toEqual([{ pathKey: 'a.dat' }, { pathKey: 'z.dat' }])
       expect(database.prepare('SELECT owner_path_key AS ownerPathKey FROM hardlink_groups').all()).toEqual([{ ownerPathKey: 'a.dat' }])
     } finally { database.close() }
+  })
+
+  it('propagates exact totals up a deep chain as each level completes', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-deep-chain-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    let current = root
+    await mkdir(current, { recursive: true })
+    for (let level = 0; level < 6; level += 1) {
+      current = join(current, `d${level}`)
+      await mkdir(current)
+      await writeFile(join(current, `file-${level}.dat`), Buffer.alloc(1024 * (level + 1), level))
+    }
+    const result = await scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'deep.partial.sqlite'),
+      publishedPath: join(indexes, 'deep.sqlite'), indexDirectory: indexes
+    })
+    const rows = readComparableRows(result.publishedPath) as unknown as ComparableRow[]
+    // Every directory's size must equal its own bytes plus every descendant's
+    // own bytes, and descendant counts must match the subtree sizes — the
+    // post-order propagation must be exact at every level of the chain.
+    for (const row of rows) {
+      if (row.kind !== 'directory') continue
+      const descendants = rows.filter((candidate) => candidate.path.startsWith(`${row.path}/`))
+      expect(row.sizeBytes).toBe(row.ownBytes + descendants.reduce((sum, child) => sum + child.ownBytes, 0))
+      expect(row.descendantCount).toBe(descendants.length)
+      expect(row.scanState).toBe('complete')
+    }
+  })
+
+  it('propagates a partially enumerated unreadable directory to its ancestors', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-unreadable-partial-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    const sub = join(root, 'sub')
+    await mkdir(sub, { recursive: true })
+    await writeFile(join(sub, 'f1.dat'), Buffer.alloc(1024, 1))
+    await writeFile(join(sub, 'f2.dat'), Buffer.alloc(2048, 2))
+    await chmod(sub, 0o000)
+    const source: DirectoryMetadataSource = {
+      open: async (path) => {
+        if (path === sub) {
+          let calls = 0
+          return {
+            readPage: async () => {
+              calls += 1
+              if (calls === 1) return {
+                entries: [metadataEntry('f1.dat', 'file', { allocatedBytes: 1024 }), metadataEntry('f2.dat', 'file', { allocatedBytes: 2048 })],
+                done: false, bulkEntries: 2, fallbackEntries: 0
+              }
+              throw Object.assign(new Error('denied'), { code: 'EACCES' })
+            },
+            close: async () => undefined
+          }
+        }
+        return {
+          readPage: async () => ({ entries: [metadataEntry('sub', 'directory')], done: true, bulkEntries: 1, fallbackEntries: 0 }),
+          close: async () => undefined
+        }
+      }
+    }
+    const result = await scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'unreadable.partial.sqlite'),
+      publishedPath: join(indexes, 'unreadable.sqlite'), indexDirectory: indexes,
+      directoryMetadataSource: source, metadataBatchSize: 1
+    })
+    // The root counts as one scanned item, plus the subdirectory and its two files.
+    expect(result.totals).toMatchObject({ scannedItems: 4, unreadableItems: 1, skippedItems: 1, discoveredBytes: 3072 })
+    await chmod(sub, 0o755)
+    const rows = readComparableRows(result.publishedPath) as unknown as ComparableRow[]
+    const byPath = new Map(rows.map((row) => [row.path, row]))
+    const rootRow = byPath.get(root)!
+    const subRow = byPath.get(sub)!
+    expect(subRow.scanState).toBe('unreadable')
+    expect(subRow.sizeBytes).toBe(3072)
+    expect(subRow.descendantCount).toBe(2)
+    expect(subRow.unreadableCount).toBe(1)
+    expect(rootRow.scanState).toBe('complete')
+    expect(rootRow.sizeBytes).toBe(rootRow.ownBytes + 3072)
+    expect(rootRow.descendantCount).toBe(3)
+    expect(rootRow.unreadableCount).toBe(1)
+  })
+
+  it('shrinks completed ancestors when a hard-link owner is replaced after its directory finished', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-hardlink-late-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    // The first owner lives in a lexically later directory so the replacement
+    // discovered in the earlier directory wins the full-path comparison.
+    const dirZ = join(root, 'z')
+    const dirA = join(root, 'a')
+    await mkdir(dirZ, { recursive: true })
+    await mkdir(dirA, { recursive: true })
+    const firstOwner = join(dirZ, 'z.dat')
+    const betterOwner = join(dirA, 'a.dat')
+    await writeFile(firstOwner, Buffer.alloc(2048, 3))
+    await link(firstOwner, betterOwner)
+    const stats = await lstat(firstOwner)
+    const bytes = Number(stats.blocks) * 512
+    const source: DirectoryMetadataSource = {
+      open: async (path) => {
+        const pages: DirectoryMetadataEntry[][] = path === root
+          ? [[metadataEntry('z', 'directory'), metadataEntry('a', 'directory')]]
+          : path === dirZ
+            ? [[metadataEntry('z.dat', 'file', { device: String(stats.dev), inode: String(stats.ino), allocatedBytes: bytes })]]
+            : [[metadataEntry('a.dat', 'file', { device: String(stats.dev), inode: String(stats.ino), allocatedBytes: bytes })]]
+        let offset = 0
+        return {
+          readPage: async () => {
+            const page = pages[offset] ?? []
+            offset += 1
+            return { entries: page, done: offset === pages.length, bulkEntries: page.length, fallbackEntries: 0 }
+          },
+          close: async () => undefined
+        }
+      }
+    }
+    const result = await scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'late.partial.sqlite'),
+      publishedPath: join(indexes, 'late.sqlite'), indexDirectory: indexes,
+      directoryMetadataSource: source, metadataBatchSize: 1
+    })
+    const rows = readComparableRows(result.publishedPath) as unknown as ComparableRow[]
+    const byPath = new Map(rows.map((row) => [row.path, row]))
+    const rootRow = byPath.get(root)!
+    const zRow = byPath.get(dirZ)!
+    const aRow = byPath.get(dirA)!
+    expect(byPath.get(firstOwner)).toBeUndefined()
+    expect(byPath.get(betterOwner)?.sizeBytes).toBe(bytes)
+    // The owner's directory completed and propagated before the replacement,
+    // so the removal must shrink the completed chain, not just the parent.
+    expect(zRow.sizeBytes).toBe(zRow.ownBytes)
+    expect(aRow.sizeBytes).toBe(aRow.ownBytes + bytes)
+    expect(rootRow.sizeBytes).toBe(rootRow.ownBytes + zRow.ownBytes + aRow.ownBytes + bytes)
+    expect(rootRow.descendantCount).toBe(3)
   })
 
   it('uses UTF-8 binary path ordering for non-BMP hard-link aliases', async () => {
@@ -532,3 +676,5 @@ function readComparableRows(path: string): readonly Record<string, unknown>[] {
     })).sort((left, right) => String(left.path).localeCompare(String(right.path)))
   } finally { database.close() }
 }
+
+type ComparableRow = { path: string; kind: string; ownBytes: number; sizeBytes: number; descendantCount: number; unreadableCount: number; scanState: string }

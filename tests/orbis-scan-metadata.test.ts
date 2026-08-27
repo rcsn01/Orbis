@@ -29,7 +29,7 @@ function stats(kind: "directory" | "file", blocks: number, inode: number): ScanS
 describe("Orbis scan metadata adapters", () => {
   it("maps native bulk pages and preserves native counters", async () => {
     const cursor: NativeDirectoryCursor = {
-      readPage: vi.fn(() => ({
+      readPage: vi.fn(async () => ({
         entries: [
           { name: "folder", kind: "directory", device: "7", inode: "2", allocatedBytes: 512, mountPoint: false, errorCode: null },
           { name: "unreadable", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 13 }
@@ -50,13 +50,14 @@ describe("Orbis scan metadata adapters", () => {
     expect(page.fallbackEntries).toBe(0)
     expect(page.entries[0]).toMatchObject({ name: "folder", kind: "directory", allocatedBytes: 512 })
     expect(page.entries[1]?.error).toBeInstanceOf(Error)
+    expect((page.entries[1]?.error as Error & { code?: string }).code).toBe("EACCES")
     expect(readMetadataCursorDiagnostics()).toMatchObject({ nativeReadPageCalls: 1, nodeReadPageCalls: 0 })
   })
 
   it('passes 256 and 512 entry requests to native cursors and caps larger requests', async () => {
     const requested: number[] = []
     const cursor: NativeDirectoryCursor = {
-      readPage: (limit) => { requested.push(limit); return { entries: [], done: false } },
+      readPage: async (limit) => { requested.push(limit); return { entries: [], done: false } },
       close: () => undefined
     }
     const source = new BulkExactMetadataSource({ openDirectory: () => cursor }, minimalFileSystem())
@@ -107,6 +108,33 @@ describe("Orbis scan metadata adapters", () => {
     expect(maximum).toBe(3)
     expect(leftPage.entries.map((entry) => entry.name)).toEqual(['a-a', 'a-b', 'a-c', 'a-d'])
     expect(rightPage.entries.map((entry) => entry.name)).toEqual(['b-a', 'b-b', 'b-c', 'b-d'])
+  })
+
+  it('maps bulk errno values to code names', async () => {
+    const cursor: NativeDirectoryCursor = {
+      readPage: vi.fn(async () => ({
+        entries: [
+          { name: "missing", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 2 },
+          { name: "denied", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 13 },
+          { name: "unknown", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 99 }
+        ],
+        done: true,
+        bulkEntries: 3,
+        fallbackEntries: 0
+      })),
+      close: vi.fn()
+    }
+    const source = new BulkExactMetadataSource({ openDirectory: () => cursor }, minimalFileSystem())
+    const page = await (await source.open('/target', '/target')).readPage(32, new AbortController().signal)
+    const codes = page.entries.map((entry) => (entry.error as Error & { code?: string }).code)
+    expect(codes).toEqual(["ENOENT", "EACCES", "99"])
+  })
+
+  it('clamps bulk page concurrency to the supported range', () => {
+    const addon: NativeMetadataAddon = { openDirectory: () => ({ readPage: async () => ({ entries: [], done: true }), close: () => undefined }) }
+    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 0).pageConcurrency).toBe(1)
+    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 8).pageConcurrency).toBe(8)
+    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 128).pageConcurrency).toBe(64)
   })
 
   it('can disable bulk metadata without disabling the FSEvents addon API', async () => {

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
 import { IndexManifestStore } from '../src/main/index-manifest'
 import { ProgressiveScanControl, ScanCanceledError, scanFilesystem } from '../src/main/scanner'
-import { ProgressiveScanDatabase } from '../src/main/progressive-database'
+import { ConstructionDatabase } from '../src/main/construction-database'
 import type { DirectoryMetadataEntry, DirectoryMetadataSource } from '../src/main/scan-metadata'
 
 const cleanup: string[] = []
@@ -46,7 +46,7 @@ describe('resumable Orbis full scans', () => {
     expect(sequences.length).toBeGreaterThan(1)
     const loaded = await store.load(target)
     expect(loaded).toMatchObject({ kind: 'construction', descriptor: { scanId } })
-    const drain = ProgressiveScanDatabase.openResumable(partialPath)
+    const drain = ConstructionDatabase.openResumable(partialPath)
     drain.setJournalDrain([join(target, 'changed-scope')], '12')
     drain.checkpoint()
     drain.setJournalDrain([join(target, 'later-scope')], '14')
@@ -116,6 +116,50 @@ describe('resumable Orbis full scans', () => {
       expect(checkpoint.prepare('SELECT COUNT(*) AS count FROM nodes').get()).toEqual({ count: 33 })
     } finally { checkpoint.close() }
 
+    interrupt = false
+    const resumed = await scanFilesystem({
+      generation: 4, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
+      directoryMetadataSource: source, metadataBatchSize: 256, resumable: { descriptor, store, resume: true }
+    })
+    const fresh = await scanFilesystem({
+      generation: 5, target, indexDirectory: join(directory, 'fresh-indexes'), partialPath: join(directory, 'fresh.partial.sqlite'),
+      publishedPath: join(directory, 'fresh.sqlite'), directoryMetadataSource: source, metadataBatchSize: 256
+    })
+    expect(resumed.totals).toMatchObject({ scannedItems: fresh.totals.scannedItems, discoveredBytes: fresh.totals.discoveredBytes, skippedItems: fresh.totals.skippedItems })
+    expect(comparableRows(resumed.publishedPath)).toEqual(comparableRows(fresh.publishedPath))
+  })
+
+  it('checkpoints unflushed metadata batches across an interrupted scan of many files', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-resume-batch-large-'))
+    cleanup.push(directory)
+    const target = join(directory, 'target')
+    const indexes = join(directory, 'indexes')
+    await mkdir(target, { recursive: true })
+    await mkdir(indexes, { recursive: true })
+    const targetStats = await lstat(target)
+    const indexStats = await lstat(indexes)
+    const store = new FullScanResumeStore(indexes)
+    const descriptor = store.descriptor({
+      scanId, target, targetDevice: String(targetStats.dev), targetInode: String(targetStats.ino),
+      indexDirectoryIdentity: `${String(indexStats.dev)}:${String(indexStats.ino)}`, startupRoot: false,
+      checkpoint: { device: String(targetStats.dev), journalUuid: 'test-journal', eventId: '10' }
+    })
+    const partialPath = join(indexes, descriptor.partialFile)
+    const candidatePath = join(indexes, descriptor.candidateFile)
+    const abort = new AbortController()
+    let interrupt = true
+    // The abort lands mid-page with thousands of files still unflushed in
+    // the metadata accumulator; the failure-path checkpoint must commit them
+    // so the resume re-reads only the aborted page's tail.
+    const source = metadataSource(5_000, (index) => {
+      if (interrupt && index === 4_200) abort.abort()
+    })
+    const interrupted = scanFilesystem({
+      generation: 3, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
+      signal: abort.signal, control: new ProgressiveScanControl(), directoryMetadataSource: source, metadataBatchSize: 256,
+      resumable: { descriptor, store, resume: false }, onCheckpoint: () => undefined, onPreview: () => undefined
+    })
+    await expect(interrupted).rejects.toBeInstanceOf(ScanCanceledError)
     interrupt = false
     const resumed = await scanFilesystem({
       generation: 4, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,

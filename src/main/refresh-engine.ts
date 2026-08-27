@@ -29,6 +29,10 @@ export type RefreshOutcome =
 
 const MAX_EVENTS = 50_000
 const HISTORY_TIMEOUT_MS = 10_000
+// Drains and replays return as soon as history is caught up plus a short
+// straggler hedge; the cursor model catches anything later at the next drain
+// or scan. The resume-validation read keeps the default 100ms quiet wait.
+const REPLAY_QUIET_MS = 10
 const MAX_RESUME_RESTARTS = 3
 
 export function refreshPersistentIndex(request: RefreshRequest): Promise<RefreshOutcome> {
@@ -53,7 +57,7 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
   const identityFailure = await validateActiveTarget(active.manifest)
   if (identityFailure) return fullRefresh(request, journal, identityFailure)
 
-  const batch = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, activeCursor, MAX_EVENTS, HISTORY_TIMEOUT_MS))
+  const batch = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, activeCursor, MAX_EVENTS, HISTORY_TIMEOUT_MS, REPLAY_QUIET_MS))
   if (batch.requiresFullScan) return fullRefresh(request, journal, batch.reason ?? 'history-unavailable')
   const nextCursor = { uuid: activeCursor.uuid, eventId: batch.throughEventId }
   if (batch.events.length === 0) {
@@ -152,7 +156,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
   // rather than publishing a snapshot invalidated during traversal.
   if (cursor && journal) {
     let reconciled = false
-    const batch = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, cursor!, MAX_EVENTS, HISTORY_TIMEOUT_MS))
+    const batch = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, cursor!, MAX_EVENTS, HISTORY_TIMEOUT_MS, REPLAY_QUIET_MS))
     if (batch.requiresFullScan) return retryFullRefresh(request, journal, batch.reason ?? 'post-scan-history-unavailable', raceRetry, resumeRestarts)
     else if (batch.events.length === 0 && (privateDrain?.dirtyScopes.length ?? 0) === 0) cursor = { uuid: cursor.uuid, eventId: batch.throughEventId }
     else {
@@ -179,7 +183,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
     if (reconciled) {
       let closed = false
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const closing = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, cursor!, MAX_EVENTS, HISTORY_TIMEOUT_MS))
+        const closing = await measureScanAsync('journal-replay', async () => journal.readChanges(request.target, cursor!, MAX_EVENTS, HISTORY_TIMEOUT_MS, REPLAY_QUIET_MS))
         if (closing.requiresFullScan) return retryFullRefresh(request, journal, closing.reason ?? 'reconciliation-history-unavailable', raceRetry, resumeRestarts)
         const newEvents = closing.events.filter((event) => BigInt(event.eventId) > BigInt(cursor!.eventId))
         if (newEvents.length === 0) {
@@ -227,7 +231,7 @@ async function reconcileFullCandidate(request: RefreshRequest, result: ScanResul
 
 export function createResumeJournalDrain(request: RefreshRequest, journal: ChangeJournal, descriptor: FullScanResumeDescriptor) {
   return (eventId: string): { readonly throughEventId: string; readonly scopes: readonly string[]; readonly restartReason?: string } => {
-    const batch = journal.readChanges(request.target, { uuid: descriptor.journalUuid, eventId }, MAX_EVENTS, HISTORY_TIMEOUT_MS)
+    const batch = journal.readChanges(request.target, { uuid: descriptor.journalUuid, eventId }, MAX_EVENTS, HISTORY_TIMEOUT_MS, REPLAY_QUIET_MS)
     if (batch.requiresFullScan) return { throughEventId: eventId, scopes: [], restartReason: batch.reason ?? 'history-unavailable' }
     const target = normalize(resolve(request.target))
     const indexDirectory = normalize(resolve(request.indexDirectory))

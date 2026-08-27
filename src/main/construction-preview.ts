@@ -132,7 +132,7 @@ async function openConstructionDatabase(load: ConstructionResumeLoad): Promise<{
     if (run.scanId !== descriptor.scanId || run.journalDevice !== descriptor.journalDevice
       || run.journalUuid !== descriptor.journalUuid || run.journalBaseline !== descriptor.journalBaseline
       || run.checkpointSequence !== load.checkpointSequence || run.checkpointedAt !== load.checkpointedAt
-      || run.phase !== 'traversing' && run.phase !== 'awaiting-reconciliation' && run.phase !== 'finalizing'
+      || run.phase !== 'scanning' && run.phase !== 'paused' && run.phase !== 'awaiting-reconciliation' && run.phase !== 'finalizing' && run.phase !== 'traversing'
       || typeof run.seed !== 'string' || !/^[0-9a-f]{64}$/u.test(run.seed)) return undefined
 
     const revisionRow = database.prepare("SELECT value FROM scan_state WHERE key = 'revision'").get() as { value?: unknown } | undefined

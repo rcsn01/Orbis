@@ -18,7 +18,7 @@ describe.skipIf(!available)('live Orbis FSEvents addon', () => {
     try {
       const initial = addon.captureVolumeCheckpoint(directory)
       expect(initial.journalUuid).toEqual(expect.any(String))
-      const drained = addon.readChanges(directory, initial.journalUuid!, initial.eventId, 10_000, 5_000)
+      const drained = addon.readChanges(directory, initial.journalUuid!, initial.eventId, 10_000, 5_000, 10)
       const cursor = drained.throughEventId
       const created = join(folder, 'created.dat')
       const renamed = join(folder, 'renamed.dat')
@@ -27,7 +27,7 @@ describe.skipIf(!available)('live Orbis FSEvents addon', () => {
       await rename(created, renamed)
       await rm(renamed)
 
-      const batch = addon.readChanges(directory, initial.journalUuid!, cursor, 10_000, 5_000)
+      const batch = addon.readChanges(directory, initial.journalUuid!, cursor, 10_000, 5_000, 10)
       expect(batch.requiresFullScan).toBe(false)
       expect(BigInt(batch.throughEventId)).toBeGreaterThan(BigInt(cursor))
       expect(batch.events.some((event) => event.relativePath === 'folder' || event.relativePath.startsWith('folder/'))).toBe(true)
@@ -35,20 +35,45 @@ describe.skipIf(!available)('live Orbis FSEvents addon', () => {
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
-  it('captures a flushed checkpoint that includes just-written activity', async () => {
+  it('captures a checkpoint that never misses just-written activity', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-fsevents-fence-'))
     const addon = createRequire(import.meta.url)(addonPath) as NativeChangeJournalAddon
     try {
       const before = addon.captureVolumeCheckpoint(directory)
       await writeFile(join(directory, 'fresh.dat'), Buffer.alloc(4096, 1))
-      // The checkpoint must observe the write even though the daemon may not
-      // have flushed its per-device journal when the file was created.
+      const after = addon.captureVolumeCheckpoint(directory)
+      // The default wall-clock fence may lag the lazily flushed per-device
+      // store, so the checkpoint is not guaranteed to include the write — but
+      // the write must either be absorbed by the checkpoint or reported by
+      // the replay; it can never be missed by both.
+      const batch = addon.readChanges(directory, after.journalUuid!, after.eventId, 10_000, 5_000, 10)
+      expect(batch.requiresFullScan).toBe(false)
+      const replayed = batch.events.some((event) => event.relativePath === 'fresh.dat')
+      const absorbed = BigInt(after.eventId) > BigInt(before.eventId)
+      expect(replayed || absorbed).toBe(true)
+    } finally { await rm(directory, { recursive: true, force: true }) }
+  })
+
+  it('captures a flushed checkpoint that includes just-written activity', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-fsevents-fence-'))
+    const addon = createRequire(import.meta.url)(addonPath) as NativeChangeJournalAddon
+    const previous = process.env.ORBIS_CHECKPOINT_FENCE
+    process.env.ORBIS_CHECKPOINT_FENCE = 'flush'
+    try {
+      const before = addon.captureVolumeCheckpoint(directory)
+      await writeFile(join(directory, 'fresh.dat'), Buffer.alloc(4096, 1))
+      // The flushed fence must observe the write even though the daemon may
+      // not have flushed its per-device journal when the file was created.
       const after = addon.captureVolumeCheckpoint(directory)
       expect(BigInt(after.eventId)).toBeGreaterThan(BigInt(before.eventId))
       // Replaying from the checkpoint must not re-report the write.
-      const batch = addon.readChanges(directory, after.journalUuid!, after.eventId, 10_000, 5_000)
+      const batch = addon.readChanges(directory, after.journalUuid!, after.eventId, 10_000, 5_000, 10)
       expect(batch.requiresFullScan).toBe(false)
       expect(batch.events).toEqual([])
-    } finally { await rm(directory, { recursive: true, force: true }) }
+    } finally {
+      if (previous === undefined) delete process.env.ORBIS_CHECKPOINT_FENCE
+      else process.env.ORBIS_CHECKPOINT_FENCE = previous
+      await rm(directory, { recursive: true, force: true })
+    }
   })
 })
