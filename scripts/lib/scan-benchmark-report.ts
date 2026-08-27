@@ -63,8 +63,12 @@ function validateResume(resume: ResumeBenchmarkSample): void {
   if (!resume.phases || typeof resume.phases !== 'object' || Array.isArray(resume.phases)) throw new Error('Resume phases are invalid')
   const actualPhases = Object.keys(resume.phases).sort()
   const expectedPhases: string[] = [...RESUME_SCAN_PHASES].sort()
-  if (actualPhases.length !== expectedPhases.length || actualPhases.some((phase, index) => phase !== expectedPhases[index])) throw new Error('Resume phases do not match the diagnostic schema')
+  const legacyOptionalPhases = ['resume-aggregate-fallback']
+  const missingRequired = expectedPhases.some((phase) => !actualPhases.includes(phase))
+  const unknown = actualPhases.some((phase) => !expectedPhases.includes(phase) && !legacyOptionalPhases.includes(phase))
+  if (missingRequired || unknown) throw new Error('Resume phases do not match the diagnostic schema')
   for (const phase of RESUME_SCAN_PHASES) assertDuration(resume.phases[phase], phase)
+  for (const phase of legacyOptionalPhases) if (actualPhases.includes(phase)) assertDuration(resume.phases[phase], phase)
   validateCounters(resume.counters)
 }
 

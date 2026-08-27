@@ -130,7 +130,7 @@ Publish `resume-first-metadata-page` once, when the first page accepted after re
 
 ### Benchmark schema
 
-Move the scan benchmark report to schema 8. Add a `resume` section per sample with the required resume phases. Aggregate fallback is no longer a recovery phase; retain its counter as a zero-valued compatibility field for existing schema-8 reports:
+Move the scan benchmark report to schema 8. Add a `resume` section per sample with the required resume phases. Aggregate fallback is no longer a recovery phase; new reports do not emit it. The validator accepts the old optional phase and retains its counter as zero-valued compatibility fields for existing schema-8 reports:
 
 ```ts
 interface ResumeBenchmarkSample {

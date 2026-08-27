@@ -2,7 +2,7 @@
 
 ## Stage 1 instrumentation
 
-Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and retains the aggregate-fallback counter as a legacy compatibility field. Schema-7 reports below are historical artifacts.
+Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and retains the aggregate-fallback counter as a legacy compatibility field. The validator also accepts the old optional aggregate-fallback phase, but new reports never emit it. Schema-7 reports below are historical artifacts.
 
 ### Timing interpretation
 
