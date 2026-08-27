@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ConstructionDatabase, ConstructionError, type ConstructionPage } from '../src/main/construction-database'
+import type { InsertNode } from '../src/main/database'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
-import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters } from '../src/main/diagnostics'
+import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
 import { readConstructionSnapshot, recoverWithLegacyReference } from './helpers/orbis-resume-recovery'
 
 const cleanup: string[] = []
@@ -173,7 +174,7 @@ describe('ConstructionDatabase construction lifecycle', () => {
       const resumed = ConstructionDatabase.openResumable(path)
       try {
         const recovery = resumed.recoverIncompleteDirectories()
-        expect(recovery).toEqual({ roots: 2, deletedNodes: 2, affectedHardlinkIdentities: 1, repairedAncestors: 7, repairedSchedulerRows: 6 })
+        expect(recovery).toEqual({ roots: 2, deletedNodes: 2, affectedHardlinkIdentities: 1, repairedAncestors: 6, repairedSchedulerRows: 6 })
         expect(resumed.taskIsFocused('reset')).toBe(true)
         expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: hardLinkId('stable', 'external'), pathKey: 'left/stable/external' })
         expect(resumed.takeWork({ limit: 2, focusTurns: 0 }).work.map((task) => task.id)).toEqual(['reset', 'reset-right'])
@@ -183,6 +184,14 @@ describe('ConstructionDatabase construction lifecycle', () => {
 
       const after = readConstructionSnapshot(path)
       expect(after.nodes).toEqual(legacy.nodes)
+      expect(after.nodes.find((row) => row.id === hardLinkId('stable', 'external'))).toMatchObject({
+        parentId: 'stable', sizeBytes: 10, directChildren: 0, descendantCount: 0, unreadableCount: 0
+      })
+      expect(after.nodes.find((row) => row.id === 'stable')).toMatchObject({ sizeBytes: 10, directChildren: 1, descendantCount: 1, unreadableCount: 0 })
+      expect(after.nodes.find((row) => row.id === 'left')).toMatchObject({ sizeBytes: 10, directChildren: 2, descendantCount: 3, unreadableCount: 0 })
+      expect(after.nodes.find((row) => row.id === 'stable-right')).toMatchObject({ sizeBytes: 20, directChildren: 2, descendantCount: 2, unreadableCount: 0 })
+      expect(after.nodes.find((row) => row.id === 'right')).toMatchObject({ sizeBytes: 20, directChildren: 2, descendantCount: 4, unreadableCount: 1 })
+      expect(after.nodes.find((row) => row.id === 'root')).toMatchObject({ sizeBytes: 30, directChildren: 2, descendantCount: 9, unreadableCount: 1 })
       expect(after.hardlinkOwners).toEqual(legacy.hardlinkOwners)
       expect(after.hardlinkPaths).toEqual(legacy.hardlinkPaths)
       expect(after.directoryObservations).toEqual(legacy.directoryObservations)
@@ -200,6 +209,168 @@ describe('ConstructionDatabase construction lifecycle', () => {
       expect(after.directoryObservations.find((row) => row.nodeId === 'stable')?.directDuplicateCount).toBe(0)
       expect(after.directoryObservations.find((row) => row.nodeId === 'stable-right')).toEqual(before.directoryObservations.find((row) => row.nodeId === 'stable-right'))
       expect(after.nodes.some((row) => row.nodeId === 'nested')).toBe(false)
+    } finally { database.abort() }
+  })
+
+  it('repairs scoped aggregates and uses the diagnostic fallback only after an affected mismatch', async () => {
+    const fixture = await createAggregateRecoveryFixture()
+    installAggregateAudit(fixture.path)
+    installAggregateFault(fixture.path, 'one-shot')
+    const counters = emptyScanCounters()
+    const events: OrbisTimingEvent[] = []
+    const unsubscribeCounters = subscribeScanCounters((event) => { if (event.generation === 101) counters[event.counter] += event.value })
+    const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 101) events.push(event) })
+    const resumed = ConstructionDatabase.openResumable(fixture.path)
+    try {
+      const recovery = runWithScanDiagnostics(101, () => resumed.recoverIncompleteDirectories())
+      expect(recovery.repairedAncestors).toBe(2)
+      resumed.checkpoint({ reason: 'resume' })
+      expect(counters.resumeAggregateFallbacks).toBe(1)
+      expect(events.filter((event) => event.phase === 'resume-aggregate-fallback')).toHaveLength(1)
+    } finally {
+      resumed.abort()
+      unsubscribeCounters()
+      unsubscribeTimings()
+    }
+    const snapshot = readConstructionSnapshot(fixture.path)
+    expect(snapshot.directoryAggregateOracle).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: fixture.rootId }), expect.objectContaining({ id: fixture.affectedId })
+    ]))
+    for (const aggregate of snapshot.directoryAggregateOracle) {
+      const node = snapshot.nodes.find((row) => row.id === aggregate.id)
+      expect(node).toMatchObject(aggregate)
+    }
+    const audit = new DatabaseSync(fixture.path, { readOnly: true })
+    try {
+      const writes = (audit.prepare('SELECT node_id AS nodeId FROM aggregate_audit').all() as unknown as Array<{ nodeId: string }>).map((row) => row.nodeId)
+      expect(new Set(writes)).toEqual(new Set([fixture.rootId, fixture.affectedId, fixture.stableId, fixture.unrelatedId]))
+    } finally { audit.close() }
+  })
+
+  it('rejects unrelated aggregate corruption instead of invoking the global fallback', async () => {
+    const fixture = await createAggregateRecoveryFixture()
+    const malformed = new DatabaseSync(fixture.path)
+    try { malformed.prepare('UPDATE nodes SET size_bytes = size_bytes + 1 WHERE id = ?').run(fixture.stableId) }
+    finally { malformed.close() }
+    installAggregateFault(fixture.path, 'one-shot')
+    const before = readConstructionSnapshot(fixture.path)
+    const counters = emptyScanCounters()
+    const events: OrbisTimingEvent[] = []
+    const unsubscribeCounters = subscribeScanCounters((event) => { if (event.generation === 102) counters[event.counter] += event.value })
+    const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 102) events.push(event) })
+    const resumed = ConstructionDatabase.openResumable(fixture.path)
+    let error: unknown
+    try { runWithScanDiagnostics(102, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+      resumed.abort()
+      unsubscribeCounters()
+      unsubscribeTimings()
+    }
+    expect(error).not.toBeInstanceOf(ConstructionError)
+    expect(String((error as Error)?.message)).toMatch(/unrelated.*aggregate/i)
+    expect(counters.resumeAggregateFallbacks).toBe(0)
+    expect(events.filter((event) => event.phase === 'resume-aggregate-fallback')).toHaveLength(0)
+    expect(readConstructionSnapshot(fixture.path)).toEqual(before)
+  })
+
+  it('rolls back a persistent aggregate fallback fault with the durable checkpoint intact', async () => {
+    const fixture = await createAggregateRecoveryFixture()
+    installAggregateFault(fixture.path, 'persistent')
+    const before = readConstructionSnapshot(fixture.path)
+    const counters = emptyScanCounters()
+    const unsubscribe = subscribeScanCounters((event) => { if (event.generation === 103) counters[event.counter] += event.value })
+    const resumed = ConstructionDatabase.openResumable(fixture.path)
+    let error: unknown
+    try { runWithScanDiagnostics(103, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+      resumed.abort()
+      unsubscribe()
+    }
+    expect(error).not.toBeInstanceOf(ConstructionError)
+    expect(String((error as Error)?.message)).toMatch(/after resume fallback|aggregate/i)
+    expect(counters.resumeAggregateFallbacks).toBe(1)
+    expect(readConstructionSnapshot(fixture.path)).toEqual(before)
+  })
+
+  it.each([11, 23, 47])('matches the independent aggregate oracle for generated checkpoint seed %i', async (seed) => {
+    const fixture = await createGeneratedRecoveryFixture(seed)
+    const legacy = recoverWithLegacyReference(fixture.path, join(fixture.directory, 'legacy.sqlite'))
+    const resumed = ConstructionDatabase.openResumable(fixture.path)
+    try {
+      const recovery = resumed.recoverIncompleteDirectories()
+      expect(recovery.roots).toBe(fixture.selectedRoots.length)
+      expect(recovery.repairedAncestors).toBe(fixture.selectedRoots.length + 1)
+      resumed.checkpoint({ reason: 'resume' })
+      const recovered = readConstructionSnapshot(fixture.path)
+      expect(recovered.nodes).toEqual(legacy.nodes)
+      expect(recovered.directoryObservations).toEqual(legacy.directoryObservations)
+      expect(recovered.hardlinkOwners).toEqual(legacy.hardlinkOwners)
+      expect(recovered.hardlinkPaths).toEqual(legacy.hardlinkPaths)
+
+      replayGeneratedEntries(resumed, fixture)
+      resumed.checkpoint({ reason: 'scheduled' })
+    } finally { resumed.abort() }
+    const final = readConstructionSnapshot(fixture.path)
+    for (const aggregate of final.directoryAggregateOracle) {
+      expect(final.nodes.find((row) => row.id === aggregate.id)).toMatchObject(aggregate)
+    }
+  })
+
+  it('scales aggregate writes with an affected deep chain', async () => {
+    const fixture = await createDeepAggregateFixture()
+    installAggregateAudit(fixture.path)
+    const resumed = ConstructionDatabase.openResumable(fixture.path)
+    try {
+      const recovery = resumed.recoverIncompleteDirectories()
+      expect(recovery.repairedAncestors).toBe(fixture.chain.length)
+      resumed.checkpoint({ reason: 'resume' })
+    } finally { resumed.abort() }
+    const snapshot = readConstructionSnapshot(fixture.path)
+    expect(snapshot.nodes.filter((row) => row.kind === 'directory')).toHaveLength(fixture.chain.length + fixture.siblingCount)
+    const database = new DatabaseSync(fixture.path, { readOnly: true })
+    try {
+      const writes = (database.prepare('SELECT DISTINCT node_id AS nodeId FROM aggregate_audit').all() as unknown as Array<{ nodeId: string }>).map((row) => row.nodeId)
+      expect(new Set(writes)).toEqual(new Set(fixture.chain.map((node) => node.id)))
+    } finally { database.close() }
+  })
+
+  it('does not double-count an unreadable parent when a recovered child settles', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-unreadable-recovery-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const directoryEntry = (id: string, parentId: string, name: string, inode: string) => ({
+      kind: 'node' as const,
+      node: { node: { id, parentId, name, path: join(directory, name), kind: 'directory' as const, ownBytes: 0, device: '1', inode }, pathKey: name }
+    })
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([directoryEntry('blocked', 'root', 'blocked', '2')]) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([directoryEntry('child', 'blocked', 'child', '3')], false, 0, 'blocked'), depth: 1 } })
+      database.markUnreadable('blocked')
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, repairedAncestors: 3 })
+        const before = resumed.getNode('root')
+        expect(before?.unreadableCount).toBe(1)
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).work.map((task) => task.id)).toEqual(['child'])
+        resumed.accept({ kind: 'page', page: {
+          ...page([{ kind: 'node', node: { node: { id: 'file', parentId: 'child', name: 'file', path: join(directory, 'blocked', 'child', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '4' }, pathKey: 'blocked/child/file' }}], true, 0, 'child'), depth: 2
+        } })
+        expect(resumed.getNode('root')?.unreadableCount).toBe(1)
+        expect(resumed.getNode('blocked')?.unreadableCount).toBe(1)
+        resumed.checkpoint({ reason: 'resume' })
+      } finally { resumed.abort() }
+
+      const snapshot = readConstructionSnapshot(path)
+      expect(snapshot.nodes.find((row) => row.id === 'root')).toMatchObject({ sizeBytes: 10, descendantCount: 3, unreadableCount: 1 })
+      expect(snapshot.nodes.find((row) => row.id === 'blocked')).toMatchObject({ sizeBytes: 10, descendantCount: 2, unreadableCount: 1 })
+      for (const aggregate of snapshot.directoryAggregateOracle) {
+        expect(snapshot.nodes.find((row) => row.id === aggregate.id)).toMatchObject(aggregate)
+      }
     } finally { database.abort() }
   })
 
@@ -527,3 +698,228 @@ describe('ConstructionDatabase construction lifecycle', () => {
     } finally { candidate.close() }
   })
 })
+
+async function createAggregateRecoveryFixture(): Promise<{
+  readonly directory: string
+  readonly path: string
+  readonly rootId: string
+  readonly affectedId: string
+  readonly stableId: string
+  readonly unrelatedId: string
+}> {
+  const directory = await mkdtemp(join(tmpdir(), 'orbis-database-aggregate-fault-'))
+  cleanup.push(directory)
+  const path = join(directory, 'partial.sqlite')
+  const database = ConstructionDatabase.create(path, options())
+  const entry = (id: string, name: string, kind: 'directory' | 'file', parentId: string, inode: string, ownBytes = 0) => ({
+    kind: 'node' as const,
+    node: { node: { id, parentId, name, path: join(directory, name), kind, ownBytes, device: '1', inode }, pathKey: name }
+  })
+  try {
+    database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+    database.takeWork({ limit: 1, focusTurns: 0 })
+    database.accept({ kind: 'page', page: page([
+      entry('affected', 'affected', 'directory', 'root', '2'),
+      entry('stable', 'stable', 'directory', 'root', '3'),
+      entry('unrelated', 'unrelated', 'directory', 'root', '4')
+    ]) })
+    database.takeWork({ limit: 1, focusTurns: 0 })
+    database.accept({ kind: 'page', page: { ...page([
+      entry('file', 'file', 'file', 'affected', '5', 10)
+    ], false, 0, 'affected'), depth: 1 } })
+    database.takeWork({ limit: 1, focusTurns: 0 })
+    database.accept({ kind: 'page', page: { ...page([], true, 0, 'stable'), depth: 1 } })
+    database.takeWork({ limit: 1, focusTurns: 0 })
+    database.accept({ kind: 'page', page: { ...page([], true, 0, 'unrelated'), depth: 1 } })
+    database.checkpoint({ reason: 'scheduled' })
+  } finally { database.abort() }
+  return { directory, path, rootId: 'root', affectedId: 'affected', stableId: 'stable', unrelatedId: 'unrelated' }
+}
+
+function installAggregateAudit(path: string): void {
+  const database = new DatabaseSync(path)
+  try {
+    database.exec(`
+      CREATE TABLE aggregate_audit (node_id TEXT NOT NULL);
+      CREATE TRIGGER aggregate_audit_update
+      AFTER UPDATE OF size_bytes, direct_children, descendant_count, unreadable_count ON nodes
+      BEGIN INSERT INTO aggregate_audit (node_id) VALUES (NEW.id); END;
+    `)
+  } finally { database.close() }
+}
+
+function installAggregateFault(path: string, mode: 'one-shot' | 'persistent'): void {
+  const database = new DatabaseSync(path)
+  try {
+    if (mode === 'one-shot') database.exec(`
+      CREATE TABLE aggregate_fault (remaining INTEGER NOT NULL);
+      INSERT INTO aggregate_fault VALUES (1);
+      CREATE TRIGGER aggregate_fault_update
+      AFTER UPDATE OF size_bytes ON nodes
+      WHEN (SELECT remaining FROM aggregate_fault) > 0 AND NEW.id = 'root'
+      BEGIN
+        UPDATE aggregate_fault SET remaining = remaining - 1;
+        UPDATE nodes SET size_bytes = NEW.size_bytes + 1 WHERE id = NEW.id;
+      END;
+    `)
+    else database.exec(`
+      CREATE TRIGGER aggregate_fault_update
+      AFTER UPDATE OF size_bytes ON nodes
+      WHEN NEW.kind = 'directory'
+      BEGIN UPDATE nodes SET size_bytes = NEW.size_bytes + 1 WHERE id=NEW.id; END;
+    `)
+  } finally { database.close() }
+}
+
+interface GeneratedRecoveryNode extends InsertNode {
+  readonly depth: number
+  readonly children: GeneratedRecoveryNode[]
+}
+
+interface GeneratedRecoveryFixture {
+  readonly directory: string
+  readonly path: string
+  readonly root: GeneratedRecoveryNode
+  readonly selectedRoots: readonly GeneratedRecoveryNode[]
+}
+
+interface DeepAggregateFixture {
+  readonly directory: string
+  readonly path: string
+  readonly chain: readonly GeneratedRecoveryNode[]
+  readonly siblingCount: number
+}
+
+async function createDeepAggregateFixture(): Promise<DeepAggregateFixture> {
+  const directory = await mkdtemp(join(tmpdir(), 'orbis-deep-aggregate-'))
+  cleanup.push(directory)
+  const path = join(directory, 'partial.sqlite')
+  const root: GeneratedRecoveryNode = {
+    id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0,
+    device: '', inode: '', depth: 0, children: []
+  }
+  const chain = [root]
+  const database = ConstructionDatabase.create(path, options())
+  try {
+    database.insertRoot(root)
+    let parent = root
+    for (let depth = 1; depth <= 20; depth += 1) {
+      const child: GeneratedRecoveryNode = {
+        id: `chain-${depth}`, parentId: parent.id, name: `chain-${depth}`, path: join(parent.path, `chain-${depth}`),
+        kind: 'directory', ownBytes: 0, device: '', inode: '', depth, children: []
+      }
+      const sibling: GeneratedRecoveryNode = {
+        id: `sibling-${depth}`, parentId: parent.id, name: `sibling-${depth}`, path: join(parent.path, `sibling-${depth}`),
+        kind: 'directory', ownBytes: 0, device: '', inode: '', depth, children: []
+      }
+      parent.children.push(child, sibling)
+      database.insertChild(child, depth, false)
+      database.insertChild(sibling, depth, false)
+      parent = child
+      chain.push(child)
+    }
+    const file: GeneratedRecoveryNode = {
+      id: 'deep-file', parentId: parent.id, name: 'deep-file', path: join(parent.path, 'deep-file'),
+      kind: 'file', ownBytes: 17, device: '', inode: '', depth: parent.depth + 1, children: []
+    }
+    parent.children.push(file)
+    database.insertChild(file, file.depth, false)
+    for (const node of [...chain, ...chain.flatMap((item) => item.children.filter((child) => child.kind === 'directory'))]
+      .filter((node) => node.id !== parent.id).sort((left, right) => right.depth - left.depth)) database.finishEnumeration(node.id)
+    database.startTask(parent.id)
+    database.checkpoint({ reason: 'scheduled' })
+  } finally { database.abort() }
+  return { directory, path, chain, siblingCount: 20 }
+}
+
+async function createGeneratedRecoveryFixture(seed: number): Promise<GeneratedRecoveryFixture> {
+  const directory = await mkdtemp(join(tmpdir(), `orbis-generated-recovery-${seed}-`))
+  cleanup.push(directory)
+  const random = deterministicRandom(seed)
+  let nextId = 0
+  let directoryCount = 1
+  let fileCount = 0
+  const root: GeneratedRecoveryNode = {
+    id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0,
+    device: '', inode: '', depth: 0, children: []
+  }
+  const directories = [root]
+  while (directories.length > 0) {
+    const parent = directories.shift()!
+    const directoryLimit = parent.depth < 5 && directoryCount < 40 ? Math.min(3, 40 - directoryCount) : 0
+    let childDirectories = directoryLimit === 0 ? 0 : random() % (directoryLimit + 1)
+    if (parent === root) childDirectories = Math.min(directoryLimit, 2 + random() % 2)
+    for (let index = 0; index < childDirectories; index += 1) {
+      const name = `dir-${String(nextId++).padStart(2, '0')}`
+      const child: GeneratedRecoveryNode = {
+        id: name, parentId: parent.id, name, path: join(parent.path, name), kind: 'directory', ownBytes: 0,
+        device: '', inode: '', depth: parent.depth + 1, children: []
+      }
+      parent.children.push(child)
+      directories.push(child)
+      directoryCount += 1
+    }
+    const files = Math.min(5, 80 - fileCount, random() % 6)
+    for (let index = 0; index < files; index += 1) {
+      const name = `file-${String(nextId++).padStart(2, '0')}`
+      parent.children.push({
+        id: name, parentId: parent.id, name, path: join(parent.path, name), kind: 'file', ownBytes: (random() % 31) + 1,
+        device: '', inode: '', depth: parent.depth + 1, children: []
+      })
+      fileCount += 1
+    }
+    if (directoryCount >= 40 && fileCount >= 80) break
+  }
+  const rootDirectories = root.children.filter((child) => child.kind === 'directory')
+  const selectedCount = Math.max(1, Math.min(3, rootDirectories.length > 1 ? rootDirectories.length - 1 : rootDirectories.length))
+  const selectedRoots = rootDirectories.slice(-selectedCount)
+  const path = join(directory, 'partial.sqlite')
+  const database = ConstructionDatabase.create(path, options())
+  try {
+    database.insertRoot(root)
+    for (const node of preorder(root).slice(1)) database.insertChild(node, node.depth, false)
+    for (const node of [...directoriesFor(root)].sort((left, right) => right.depth - left.depth)) {
+      if (selectedRoots.includes(node)) {
+        database.startTask(node.id)
+        database.advanceTask(node.id, Math.floor(node.children.length / 2))
+      } else database.finishEnumeration(node.id)
+    }
+    database.checkpoint({ reason: 'scheduled' })
+  } finally { database.abort() }
+  return { directory, path, root, selectedRoots }
+}
+
+function replayGeneratedEntries(database: ConstructionDatabase, fixture: GeneratedRecoveryFixture): void {
+  const byId = new Map(preorder(fixture.root).map((node) => [node.id, node]))
+  while (true) {
+    const batch = database.takeWork({ limit: 1, focusTurns: 0 })
+    if (batch.done) return
+    const task = batch.work[0]
+    if (!task) throw new Error('Generated recovery fixture returned an empty work batch')
+    const node = byId.get(task.id)
+    if (!node) throw new Error(`Missing generated directory ${task.id}`)
+    database.accept({ kind: 'page', page: {
+      taskId: task.id, depth: task.depth, focused: task.focused, entriesRead: task.entriesRead, done: true,
+      entries: node.children.map((child) => ({ kind: 'node' as const, node: { node: child, pathKey: child.path.slice(fixture.root.path.length + 1) } })),
+      bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+    } })
+  }
+}
+
+function preorder(root: GeneratedRecoveryNode): GeneratedRecoveryNode[] {
+  return [root, ...root.children.flatMap((child) => child.kind === 'directory' ? preorder(child) : [child])]
+}
+
+function directoriesFor(root: GeneratedRecoveryNode): GeneratedRecoveryNode[] {
+  return preorder(root).filter((node) => node.kind === 'directory')
+}
+
+function deterministicRandom(seed: number): () => number {
+  let state = (seed >>> 0) || 1
+  return () => {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    return state >>> 0
+  }
+}

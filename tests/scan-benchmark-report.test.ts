@@ -29,8 +29,14 @@ describe('scan benchmark report schema', () => {
   })
 
   it('rejects the wrong schema and missing resume metrics', () => {
-    expect(() => validateScanBenchmarkReport({ ...report(), schemaVersion: 6 })).toThrow(/schema/)
+    expect(() => validateScanBenchmarkReport({ ...report(), schemaVersion: 7 })).toThrow(/schema/)
     expect(() => validateScanBenchmarkReport(report('resume-process-restart'))).toThrow(/no resume metrics/)
+  })
+
+  it('accepts an optional aggregate fallback work phase', () => {
+    const value = resume()
+    ;(value.phases as Record<string, number>)['resume-aggregate-fallback'] = 1
+    expect(() => validateScanBenchmarkReport(report('resume-clean-pause', value))).not.toThrow()
   })
 
   it('rejects missing counters and invalid durations', () => {

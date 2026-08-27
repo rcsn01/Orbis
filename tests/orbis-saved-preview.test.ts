@@ -7,6 +7,8 @@ import type { OrbisSnapshot } from '../src/shared/contracts'
 import { OrbisController, type OrbisShell } from '../src/main/controller'
 import { WorkerScanExecution, type WorkerTransport, type WorkerTransportFactory } from '../src/main/scan-execution'
 import { FullScanResumeStore, type FullScanResumeDescriptor } from '../src/main/full-scan-resume'
+import { ConstructionDatabase } from '../src/main/construction-database'
+import { readConstructionPreview } from '../src/main/construction-preview'
 import { ProgressiveScanControl, ScanCanceledError, scanFilesystem, type ProgressivePreview } from '../src/main/scanner'
 
 const cleanup: string[] = []
@@ -78,6 +80,24 @@ describe('saved Orbis previews', () => {
       expect(snapshot.largestItems.find((item) => item.name === 'folder')).toMatchObject({ kind: 'directory' })
       expect(JSON.stringify(snapshot)).not.toContain(fixture.target)
     } finally { await restarted.close() }
+  })
+
+  it('keeps the recovered root aggregate and saved preview totals in sync', async () => {
+    const fixture = await createSavedFixture()
+    const loaded = await fixture.resumeStore.load(fixture.target)
+    expect(loaded.kind).toBe('construction')
+    if (loaded.kind !== 'construction') throw new Error('Expected a construction receipt')
+    const recovered = ConstructionDatabase.openResumable(loaded.partialPath)
+    try {
+      recovered.recoverIncompleteDirectories()
+      recovered.checkpoint({ reason: 'resume' })
+    } finally { recovered.abort() }
+    const afterRecovery = await fixture.resumeStore.load(fixture.target)
+    expect(afterRecovery.kind).toBe('construction')
+    if (afterRecovery.kind !== 'construction') throw new Error('Expected a recovered construction receipt')
+    const preview = await readConstructionPreview(afterRecovery, 9)
+    expect(preview).toBeDefined()
+    expect(preview?.focus.sizeBytes).toBe(preview?.volume.scannedBytes)
   })
 
   it('restores the durable preview immediately after Pause', async () => {

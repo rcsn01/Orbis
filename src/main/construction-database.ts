@@ -54,6 +54,13 @@ export class ConstructionError extends Error {
   }
 }
 
+class ScopedAggregateMismatch extends Error {
+  constructor(readonly attemptedRows: number, readonly nodeId: string) {
+    super(`Scoped aggregate repair did not converge for directory ${nodeId}`)
+    this.name = "ScopedAggregateMismatch"
+  }
+}
+
 export interface ConstructionStatus {
   readonly phase: ConstructionPhase
   readonly revision: number
@@ -1200,6 +1207,7 @@ export class ConstructionDatabase implements ChartDataSource {
     const schedulerTiming = createScanTimingAccumulator('resume-scheduler-repair')
     let recoveryTablesCreated = false
     let recoveryFailed = false
+    const propagatedSnapshot = new Map([...this.#propagatedToParent].map(([key, delta]) => [key, { ...delta }]))
     try {
       const phase = this.phase
       const pendingTasks = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM directory_tasks WHERE status IN ('queued', 'scanning')").get() as { count: number }).count)
@@ -1284,12 +1292,15 @@ export class ConstructionDatabase implements ChartDataSource {
 
       const affectedHardlinkIdentities = this.#repairAffectedHardLinks()
       this.#expandRecoveryAncestors()
-      const repairedAncestors = this.#rebuildAllDirectoryAggregates()
+      const repairedAncestors = this.#repairAggregatesWithFallback()
+      this.#rebuildAffectedPropagationBookkeeping()
       const repairedSchedulerRows = schedulerTiming.measure(() => this.#repairAffectedScheduler())
       this.#pendingSubtrees = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks WHERE subtree_complete = 0').get() as { count: number }).count)
       return { roots, deletedNodes, affectedHardlinkIdentities, repairedAncestors, repairedSchedulerRows }
     } catch (error) {
       recoveryFailed = true
+      this.#propagatedToParent.clear()
+      for (const [key, delta] of propagatedSnapshot) this.#propagatedToParent.set(key, delta)
       throw error
     } finally {
       let cleanupError: unknown
@@ -1497,36 +1508,100 @@ export class ConstructionDatabase implements ChartDataSource {
     `)
   }
 
-  #rebuildAllDirectoryAggregates(): number {
-    const aggregates = createScanTimingAccumulator('resume-aggregate-repair')
-    let repairedAncestors = 0
+  #repairAggregatesWithFallback(): number {
     try {
-      aggregates.measure(() => {
-        repairedAncestors = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'directory'").get() as { count: number }).count)
-        this.#database.exec(`
-          UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
-          UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
-          WITH RECURSIVE closure(ancestor, descendant) AS (
-            SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
-            UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
-          ), totals AS (
-            SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
-            FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
-          ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
-            descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
-            unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
-        `)
-        this.#propagatedToParent.clear()
-        for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
-          this.#propagatedToParent.set(row.id, {
-            bytes: Number(row.sizeBytes) - Number(row.ownBytes),
-            descendants: Number(row.descendantCount),
-            unreadable: Number(row.unreadableCount)
-          })
-        }
+      return this.#repairAffectedDirectoryAggregates()
+    } catch (error) {
+      if (!(error instanceof ScopedAggregateMismatch)) throw error
+      const unrelated = this.#findDirectoryAggregateMismatch("unaffected")
+      if (unrelated) throw new Error(`Unrelated directory aggregate mismatch for ${unrelated}`)
+      const fallback = createScanTimingAccumulator("resume-aggregate-fallback")
+      try {
+        recordScanCounter("resumeAggregateFallbacks")
+        fallback.measure(() => this.#rebuildAllDirectoryAggregatesFallback())
+        const mismatch = this.#findDirectoryAggregateMismatch()
+        if (mismatch) throw new Error(`Directory aggregate mismatch after resume fallback for ${mismatch}`)
+      } finally { fallback.publish() }
+      return error.attemptedRows
+    }
+  }
+
+  #repairAffectedDirectoryAggregates(): number {
+    const aggregates = createScanTimingAccumulator("resume-aggregate-repair")
+    try {
+      return aggregates.measure(() => {
+        const rows = this.#database.prepare(`SELECT affected.id, affected.depth
+          FROM recovery_ancestors affected JOIN nodes ON nodes.id = affected.id
+          WHERE nodes.kind = 'directory'
+          ORDER BY affected.depth DESC, affected.id COLLATE BINARY`).all() as unknown as Array<{ id: string; depth: number }>
+        const update = this.#database.prepare(`UPDATE nodes SET
+          size_bytes = own_bytes + COALESCE((SELECT SUM(child.size_bytes) FROM nodes child WHERE child.parent_id = nodes.id), 0),
+          direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id),
+          descendant_count = COALESCE((SELECT SUM(1 + child.descendant_count) FROM nodes child WHERE child.parent_id = nodes.id), 0),
+          unreadable_count = own_unreadable + COALESCE((SELECT SUM(child.unreadable_count) FROM nodes child WHERE child.parent_id = nodes.id), 0)
+          WHERE id = ? AND kind = 'directory'`)
+        for (const row of rows) update.run(row.id)
+        const mismatch = this.#findDirectoryAggregateMismatch("affected")
+        if (mismatch) throw new ScopedAggregateMismatch(rows.length, mismatch)
+        return rows.length
       })
-      return repairedAncestors
     } finally { aggregates.publish() }
+  }
+
+  #findDirectoryAggregateMismatch(scope: "all" | "affected" | "unaffected" = "all"): string | undefined {
+    const membership = scope === "affected"
+      ? "EXISTS (SELECT 1 FROM recovery_ancestors affected WHERE affected.id = node.id)"
+      : scope === "unaffected"
+        ? "NOT EXISTS (SELECT 1 FROM recovery_ancestors unaffected WHERE unaffected.id = node.id)"
+        : "1 = 1"
+    const row = this.#database.prepare(`SELECT node.id
+      FROM nodes node
+      WHERE node.kind = 'directory' AND ${membership}
+        AND (node.size_bytes <> node.own_bytes + COALESCE((SELECT SUM(child.size_bytes)
+              FROM nodes child WHERE child.parent_id = node.id), 0)
+          OR node.direct_children <> (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = node.id)
+          OR node.descendant_count <> COALESCE((SELECT SUM(1 + child.descendant_count)
+              FROM nodes child WHERE child.parent_id = node.id), 0)
+          OR node.unreadable_count <> node.own_unreadable + COALESCE((SELECT SUM(child.unreadable_count)
+              FROM nodes child WHERE child.parent_id = node.id), 0))
+      ORDER BY node.id COLLATE BINARY LIMIT 1`).get() as { id?: string } | undefined
+    return row?.id
+  }
+
+  #rebuildAffectedPropagationBookkeeping(): void {
+    this.#propagatedToParent.clear()
+    const rows = this.#database.prepare(`SELECT node.id, node.size_bytes AS sizeBytes, node.own_bytes AS ownBytes,
+        node.descendant_count AS descendantCount, node.unreadable_count AS unreadableCount
+      FROM nodes node
+      WHERE node.scan_state = 'unreadable' AND (
+        EXISTS (SELECT 1 FROM recovery_ancestors parent WHERE parent.id = node.parent_id)
+        OR EXISTS (SELECT 1 FROM recovery_roots root WHERE root.id = node.id)
+      )`).all() as unknown as Array<{
+        id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number
+      }>
+    for (const row of rows) {
+      this.#propagatedToParent.set(row.id, {
+        bytes: Number(row.sizeBytes) - Number(row.ownBytes),
+        descendants: Number(row.descendantCount),
+        unreadable: Number(row.unreadableCount)
+      })
+    }
+  }
+
+  #rebuildAllDirectoryAggregatesFallback(): void {
+    this.#database.exec(`
+      UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
+      UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
+      WITH RECURSIVE closure(ancestor, descendant) AS (
+        SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
+        UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
+      ), totals AS (
+        SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
+        FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
+      ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
+        descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
+        unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
+    `)
   }
 
   #repairAffectedScheduler(): number {

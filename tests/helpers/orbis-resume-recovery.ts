@@ -9,6 +9,15 @@ export interface ConstructionSnapshot {
   readonly hardlinkOwners: readonly Record<string, unknown>[]
   readonly hardlinkPaths: readonly Record<string, unknown>[]
   readonly directoryObservations: readonly Record<string, unknown>[]
+  readonly directoryAggregateOracle: readonly DirectoryAggregateOracleRow[]
+}
+
+export interface DirectoryAggregateOracleRow {
+  readonly id: string
+  readonly sizeBytes: number
+  readonly directChildren: number
+  readonly descendantCount: number
+  readonly unreadableCount: number
 }
 
 export function readConstructionSnapshot(path: string): ConstructionSnapshot {
@@ -31,7 +40,8 @@ export function readConstructionSnapshot(path: string): ConstructionSnapshot {
         direct_unreadable_count AS directUnreadableCount, direct_disappearing_count AS directDisappearingCount,
         direct_symlink_count AS directSymlinkCount, direct_nested_mount_count AS directNestedMountCount,
         direct_duplicate_count AS directDuplicateCount, enumeration_status AS enumerationStatus
-        FROM directory_observations ORDER BY node_id`)
+        FROM directory_observations ORDER BY node_id`),
+      directoryAggregateOracle: readDirectoryAggregateOracleFromDatabase(database)
     }
   } finally { database.close() }
 }
@@ -41,6 +51,41 @@ export function readConstructionSnapshot(path: string): ConstructionSnapshot {
  * This is deliberately test-only: it provides a semantic oracle, not a
  * production fallback or a second recovery implementation.
  */
+export function readDirectoryAggregateOracle(path: string): readonly DirectoryAggregateOracleRow[] {
+  const database = new DatabaseSync(path, { readOnly: true })
+  try { return readDirectoryAggregateOracleFromDatabase(database) }
+  finally { database.close() }
+}
+
+function readDirectoryAggregateOracleFromDatabase(database: DatabaseSync): readonly DirectoryAggregateOracleRow[] {
+  type Node = { id: string; parentId: string | null; kind: string; ownBytes: number; ownUnreadable: number; depth: number }
+  const nodes = database.prepare(`SELECT id, parent_id AS parentId, kind, own_bytes AS ownBytes,
+    own_unreadable AS ownUnreadable, depth FROM nodes`).all() as unknown as Node[]
+  const children = new Map<string, Node[]>()
+  for (const node of nodes) {
+    if (!node.parentId) continue
+    const siblings = children.get(node.parentId) ?? []
+    siblings.push(node)
+    children.set(node.parentId, siblings)
+  }
+  const aggregates = new Map<string, DirectoryAggregateOracleRow>()
+  for (const node of [...nodes].sort((left, right) => right.depth - left.depth || left.id.localeCompare(right.id))) {
+    if (node.kind !== 'directory') continue
+    const direct = children.get(node.id) ?? []
+    let sizeBytes = Number(node.ownBytes)
+    let descendantCount = 0
+    let unreadableCount = Number(node.ownUnreadable)
+    for (const child of direct) {
+      const aggregate = child.kind === 'directory' ? aggregates.get(child.id) : undefined
+      sizeBytes += aggregate?.sizeBytes ?? Number(child.ownBytes)
+      descendantCount += 1 + (aggregate?.descendantCount ?? 0)
+      unreadableCount += aggregate?.unreadableCount ?? Number(child.ownUnreadable)
+    }
+    aggregates.set(node.id, { id: node.id, sizeBytes, directChildren: direct.length, descendantCount, unreadableCount })
+  }
+  return [...aggregates.values()].sort((left, right) => left.id.localeCompare(right.id))
+}
+
 export function recoverWithLegacyReference(sourcePath: string, destinationPath: string): ConstructionSnapshot {
   copySQLiteFamily(sourcePath, destinationPath)
   const database = new DatabaseSync(destinationPath)
@@ -167,13 +212,16 @@ function copySQLiteFamily(sourcePath: string, destinationPath: string): void {
   }
 }
 
-export function readCandidateSemantics(path: string): {
+export interface CandidateSemantics {
   readonly nodes: readonly Record<string, unknown>[]
   readonly observations: readonly Record<string, unknown>[]
   readonly hardlinkPaths: readonly Record<string, unknown>[]
   readonly hardlinkGroups: readonly Record<string, unknown>[]
   readonly metadata: readonly Record<string, unknown>[]
-} {
+  readonly semanticTotals: Readonly<Record<string, unknown>>
+}
+
+export function readCandidateSemantics(path: string): CandidateSemantics {
   const database = new DatabaseSync(path, { readOnly: true })
   try {
     return {
@@ -193,9 +241,57 @@ export function readCandidateSemantics(path: string): {
       hardlinkGroups: rows(database, `SELECT groups.device, groups.inode, groups.owner_path_key AS ownerPathKey,
         owner.path, groups.allocated_bytes AS allocatedBytes
         FROM hardlink_groups groups JOIN nodes owner ON owner.id = groups.node_id ORDER BY groups.device, groups.inode`),
-      metadata: rows(database, 'SELECT key, value FROM metadata ORDER BY key')
+      metadata: rows(database, 'SELECT key, value FROM metadata ORDER BY key'),
+      semanticTotals: readSemanticTotals(database)
     }
   } finally { database.close() }
+}
+
+export function normalizeCandidateSemantics(value: CandidateSemantics): CandidateSemantics {
+  const volatileMetadata = new Set(['capturedAt', 'refreshedAt', 'indexDirectoryIdentity', 'resumeDrainedThrough', 'resumeDirtyScopes'])
+  const metadata = value.metadata
+    .filter((row) => typeof row.key !== 'string' || !volatileMetadata.has(row.key))
+    .map((row) => {
+      if (row.key === 'rootId') return { ...row, value: '<root>' }
+      if (row.key !== 'totals' && row.key !== 'volume' || typeof row.value !== 'string') return row
+      try {
+        const metadata = JSON.parse(row.value) as Record<string, unknown>
+        if (row.key === 'totals') delete metadata.elapsedMs
+        else delete metadata.freeBytes
+        return { ...row, value: JSON.stringify(metadata) }
+      } catch { return row }
+    })
+  const semanticTotals = { ...value.semanticTotals }
+  delete semanticTotals.elapsedMs
+  return { ...value, metadata, semanticTotals }
+}
+
+function readSemanticTotals(database: DatabaseSync): Readonly<Record<string, unknown>> {
+  const nodes = database.prepare(`SELECT COUNT(*) AS scannedItems,
+    COALESCE((SELECT size_bytes FROM nodes WHERE parent_id IS NULL), 0) AS discoveredBytes FROM nodes`).get() as {
+    scannedItems?: number; discoveredBytes?: number
+  }
+  const observations = database.prepare(`SELECT COALESCE(SUM(direct_skipped_count), 0) AS skippedItems,
+    COALESCE(SUM(direct_unreadable_count), 0) AS unreadableItems,
+    COALESCE(SUM(direct_disappearing_count), 0) AS disappearingItems,
+    COALESCE(SUM(direct_symlink_count), 0) AS symlinks,
+    COALESCE(SUM(direct_nested_mount_count), 0) AS nestedMounts,
+    COALESCE(SUM(direct_duplicate_count), 0) AS duplicateHardLinks
+    FROM directory_observations`).get() as Record<string, number>
+  const row = database.prepare("SELECT value FROM metadata WHERE key = 'totals'").get() as { value?: unknown } | undefined
+  let persisted: Record<string, unknown> = {}
+  if (typeof row?.value === 'string') {
+    try { persisted = JSON.parse(row.value) as Record<string, unknown> }
+    catch { persisted = {} }
+  }
+  return {
+    scannedItems: Number(nodes.scannedItems ?? 0), discoveredBytes: Number(nodes.discoveredBytes ?? 0),
+    skippedItems: Number(observations.skippedItems ?? 0), unreadableItems: Number(observations.unreadableItems ?? 0),
+    disappearingItems: Number(observations.disappearingItems ?? 0), symlinks: Number(observations.symlinks ?? 0),
+    nestedMounts: Number(observations.nestedMounts ?? 0), duplicateHardLinks: Number(observations.duplicateHardLinks ?? 0),
+    bulkMetadataEntries: Number(persisted.bulkMetadataEntries ?? 0), fallbackMetadataEntries: Number(persisted.fallbackMetadataEntries ?? 0),
+    activeElapsedMs: Number(persisted.activeElapsedMs ?? 0)
+  }
 }
 
 function rows(database: DatabaseSync, query: string): readonly Record<string, unknown>[] {

@@ -265,7 +265,7 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
     const counts = readCounts(result.publishedPath)
     validateResult(result, counts, manifest)
     const workerStartupMs = await measuredWorker.workerStartupMs
-    validateDiagnostics(measuredWorker, controllerTimings)
+    validateDiagnostics(measuredWorker, controllerTimings, manifest)
     const scanTimings = timingMap(measuredWorker.scanTimings)
     const scanTotal = scanTimings['refresh-total'] ?? scanTimings['scan-total'] ?? 0
     const measuredPhases = Object.entries(scanTimings).filter(([phase]) => isScanLeafPhase(phase)).reduce((sum, [, duration]) => sum + duration, 0)
@@ -683,7 +683,10 @@ function makeResumeSample(
     clickToFirstMetadataPreviewMs: required('resume-click-to-first-metadata-preview'),
     workerToFirstMetadataPageMs: firstPage,
     completionMs,
-    phases: Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
+    phases: {
+      ...Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
+      ...(scanTimings['resume-aggregate-fallback'] === undefined ? {} : { 'resume-aggregate-fallback': scanTimings['resume-aggregate-fallback'] })
+    },
     counters
   }
 }
@@ -723,20 +726,28 @@ function makeFixtureReport(fixture: string, manifest: FixtureReport['manifest'],
         clickToFirstMetadataPageMs: values((sample) => sample.resume!.clickToFirstMetadataPageMs),
         clickToFirstMetadataPreviewMs: values((sample) => sample.resume!.clickToFirstMetadataPreviewMs),
         completionMs: values((sample) => sample.resume!.completionMs),
-        phases: Object.fromEntries(RESUME_SCAN_PHASES.map((phase) => [phase, values((sample) => sample.resume!.phases[phase] ?? 0)])),
+        phases: Object.fromEntries([
+          ...RESUME_SCAN_PHASES.map((phase) => [phase, values((sample) => sample.resume!.phases[phase] ?? 0)] as const),
+          ...(samples.some((sample) => sample.resume!.phases['resume-aggregate-fallback'] !== undefined)
+            ? [['resume-aggregate-fallback', values((sample) => sample.resume!.phases['resume-aggregate-fallback'] ?? 0)] as const] : [])
+        ]),
         counters: Object.fromEntries(SCAN_COUNTER_NAMES.map((counter) => [counter, values((sample) => sample.resume!.counters[counter])]))
       } } : {})
     }
   }
 }
 
-function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly OrbisTimingEvent[]): void {
+function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly OrbisTimingEvent[], manifest: ScanFixtureManifest | LiveManifest): void {
   if (isResumeBenchmarkScenario(options.scenario)) {
     validateTimingSet(worker.scanTimings, RESUME_SCAN_PHASES, 'worker')
     validateTimingSet(controllerEvents, RESUME_CONTROLLER_PHASES, 'controller')
     classifyResumeValidation(worker)
     if (worker.counters.resumeRecoveryRoots < 1) throw new Error('Resume diagnostics did not report a recovery root')
     if (worker.counters.resumeReplayedEntries < 1) throw new Error('Resume diagnostics did not report replayed entries')
+    if (worker.counters.resumeAggregateFallbacks !== 0) throw new Error('Stage 5 resume used the aggregate fallback')
+    if (manifest.profile !== 'live' && manifest.name === 'deep' && worker.counters.resumeRepairedAncestors >= manifest.directories) {
+      throw new Error('Deep resume repaired every directory instead of only affected ancestors')
+    }
     if (!worker.diagnosticMessageBeforeComplete) throw new Error('The worker diagnostics message did not arrive before completion')
     return
   }

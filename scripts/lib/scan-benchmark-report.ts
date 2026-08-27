@@ -1,6 +1,6 @@
 import { RESUME_SCAN_PHASES, SCAN_COUNTER_NAMES, type ScanCounterRecord } from '../../src/main/diagnostics'
 
-export const SCAN_BENCHMARK_SCHEMA_VERSION = 7
+export const SCAN_BENCHMARK_SCHEMA_VERSION = 8
 export const RESUME_BENCHMARK_SCENARIOS = ['resume-clean-pause', 'resume-process-restart', 'resume-unacknowledged-pause'] as const
 export type ResumeBenchmarkScenario = typeof RESUME_BENCHMARK_SCENARIOS[number]
 
@@ -62,9 +62,13 @@ function validateResume(resume: ResumeBenchmarkSample): void {
   })) assertDuration(duration, name)
   if (!resume.phases || typeof resume.phases !== 'object' || Array.isArray(resume.phases)) throw new Error('Resume phases are invalid')
   const actualPhases = Object.keys(resume.phases).sort()
-  const expectedPhases = [...RESUME_SCAN_PHASES].sort()
-  if (actualPhases.length !== expectedPhases.length || actualPhases.some((phase, index) => phase !== expectedPhases[index])) throw new Error('Resume phases do not match the diagnostic schema')
+  const requiredPhases: string[] = [...RESUME_SCAN_PHASES].sort()
+  const optionalPhases = ['resume-aggregate-fallback']
+  const missingRequired = requiredPhases.some((phase) => !actualPhases.includes(phase))
+  const unknown = actualPhases.some((phase) => !requiredPhases.includes(phase) && !optionalPhases.includes(phase))
+  if (missingRequired || unknown) throw new Error('Resume phases do not match the diagnostic schema')
   for (const phase of RESUME_SCAN_PHASES) assertDuration(resume.phases[phase], phase)
+  for (const phase of optionalPhases) if (resume.phases[phase] !== undefined) assertDuration(resume.phases[phase], phase)
   validateCounters(resume.counters)
 }
 

@@ -21,7 +21,7 @@ export const RESUME_SCAN_PHASES = [
 export const RESUME_SCAN_WORK_PHASES = [
   'resume-descriptor-validation', 'resume-file-validation', 'resume-candidate-validation',
   'resume-construction-validation', 'resume-integrity-check', 'resume-foreign-key-check',
-  'resume-hardlink-repair', 'resume-aggregate-repair', 'resume-scheduler-repair'
+  'resume-hardlink-repair', 'resume-aggregate-repair', 'resume-aggregate-fallback', 'resume-scheduler-repair'
 ] as const
 
 export const RESUME_SCAN_MILESTONE_PHASES = ['resume-first-metadata-page'] as const
@@ -73,7 +73,7 @@ export const SCAN_COUNTER_NAMES = [
   'completionTransitions', 'databaseCheckpoints', 'hardlinkPathRows',
   'resumeFullValidations', 'resumeReceiptValidations', 'resumeReceiptFallbacks', 'resumeRecoveryRoots',
   'resumeDeletedNodes', 'resumeAffectedHardlinkIdentities', 'resumeRepairedAncestors',
-  'resumeRepairedSchedulerRows', 'resumeReplayedEntries'
+  'resumeAggregateFallbacks', 'resumeRepairedSchedulerRows', 'resumeReplayedEntries'
 ] as const
 export type ScanCounterName = typeof SCAN_COUNTER_NAMES[number]
 export type ScanCounterRecord = Readonly<Record<ScanCounterName, number>>

@@ -13,6 +13,7 @@ import {
   type OrbisTimingEvent
 } from '../src/main/diagnostics'
 import type { DirectoryMetadataEntry, DirectoryMetadataSource } from '../src/main/scan-metadata'
+import { normalizeCandidateSemantics, readCandidateSemantics } from './helpers/orbis-resume-recovery'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -275,7 +276,8 @@ describe('resumable Orbis full scans', () => {
       publishedPath: join(directory, 'fresh.sqlite'), directoryMetadataSource: source, metadataBatchSize: 256
     })
     expect(resumed.totals).toMatchObject({ scannedItems: fresh.totals.scannedItems, discoveredBytes: fresh.totals.discoveredBytes, skippedItems: fresh.totals.skippedItems })
-    expect(comparableRows(resumed.publishedPath)).toEqual(comparableRows(fresh.publishedPath))
+    expect(normalizeCandidateSemantics(readCandidateSemantics(resumed.publishedPath)))
+      .toEqual(normalizeCandidateSemantics(readCandidateSemantics(fresh.publishedPath)))
   })
 
   it('checkpoints unflushed metadata batches across an interrupted scan of many files', async () => {
@@ -319,7 +321,8 @@ describe('resumable Orbis full scans', () => {
       publishedPath: join(directory, 'fresh.sqlite'), directoryMetadataSource: source, metadataBatchSize: 256
     })
     expect(resumed.totals).toMatchObject({ scannedItems: fresh.totals.scannedItems, discoveredBytes: fresh.totals.discoveredBytes, skippedItems: fresh.totals.skippedItems })
-    expect(comparableRows(resumed.publishedPath)).toEqual(comparableRows(fresh.publishedPath))
+    expect(normalizeCandidateSemantics(readCandidateSemantics(resumed.publishedPath)))
+      .toEqual(normalizeCandidateSemantics(readCandidateSemantics(fresh.publishedPath)))
   })
 
   it('preserves descriptor-owned SQLite files during orphan cleanup and discards only those files', async () => {
@@ -382,13 +385,4 @@ function metadataSource(count: number, onEntry: (index: number) => void): Direct
       }
     }
   }
-}
-
-function comparableRows(path: string): readonly Record<string, unknown>[] {
-  const database = new DatabaseSync(path, { readOnly: true })
-  try {
-    return database.prepare(`SELECT name, path, kind, own_bytes AS ownBytes, size_bytes AS sizeBytes,
-      direct_children AS directChildren, descendant_count AS descendantCount, scan_state AS scanState
-      FROM nodes ORDER BY path`).all() as unknown as readonly Record<string, unknown>[]
-  } finally { database.close() }
 }
