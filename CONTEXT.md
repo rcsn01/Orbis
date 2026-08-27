@@ -36,3 +36,22 @@ new symbols or writing docs.
   (`COMMITTED_NODE_SELECT`, `CONSTRUCTION_NODE_SELECT`) and the single
   `nodeFromRow` mapping. Breadcrumbs are all-or-nothing: a corrupt parent
   chain yields `[]`, never a partial trail.
+
+- **hard-link path** — one row in schema-3 `hardlink_paths`. Orbis stores these rows only for file identities whose observed link count is not exactly one. A tracked identity has all observed paths, one visible `nodes` row at the UTF-8 binary-minimum path, and one `hardlink_groups` row. Exact single-link files have no hard-link path row.
+
+- **ready task** — a construction directory task whose parent enumeration is terminal. `pending_children` counts unsettled direct child subtrees, while `subtree_complete` records whether the task and every descendant are terminal. Enumeration status and subtree completion are separate states.
+
+- **scan execution** — one active worker-backed scan session. It owns worker
+  creation, private message ordering, ordered progress and previews, focus and
+  live-node resolution, pause acknowledgement, termination, and stale-result
+  cleanup. It ends by handing a finalized candidate or unchanged result to the
+  controller; published index validation and publication remain controller
+  responsibilities.
+
+- **publication-owned artifact** — a recognized direct child of the private
+  indexes directory that Orbis may remove: a published index, construction
+  database, finalized candidate, SQLite journal family, database or metadata
+  staging file, or incremental reconciliation directory. A matching filename
+  proves only that an entry is eligible for policy evaluation; current manifest
+  and resume references still decide retention. Unrecognized entries are never
+  removed.

@@ -15,7 +15,7 @@ function manifest(publicationId = '01234567-89ab-4cde-8fab-0123456789ab'): Index
     target: '/tmp/example',
     targetDevice: '1',
     targetInode: '2',
-    schemaVersion: 2,
+    schemaVersion: 3,
     indexRevision: 1,
     journal: null
   }

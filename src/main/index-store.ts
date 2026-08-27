@@ -217,7 +217,7 @@ export function nodeFromRow(row: Record<string, unknown>): DatabaseNode {
 
 function validatePersistentSchema(database: DatabaseSync, version: string): void {
   if (version !== String(PERSISTENT_INDEX_SCHEMA_VERSION)) throw new Error("Unsupported Orbis index schema")
-  const required = new Set(["nodes", "metadata", "file_aliases", "hardlink_groups", "directory_observations"])
+  const required = new Set(["nodes", "metadata", "hardlink_paths", "hardlink_groups", "directory_observations"])
   const rows = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as unknown as Array<{ name: string }>
   for (const row of rows) required.delete(row.name)
   if (required.size > 0) throw new Error("Invalid persistent Orbis index")

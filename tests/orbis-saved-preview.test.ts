@@ -3,7 +3,8 @@ import { lstat, mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { OrbisController, type OrbisShell, type OrbisWorker } from '../src/main/controller'
+import { OrbisController, type OrbisShell } from '../src/main/controller'
+import { WorkerScanExecution, type WorkerTransport, type WorkerTransportFactory } from '../src/main/scan-execution'
 import { FullScanResumeStore, type FullScanResumeDescriptor } from '../src/main/full-scan-resume'
 import { ProgressiveScanControl, ScanCanceledError, scanFilesystem, type ProgressivePreview } from '../src/main/scanner'
 
@@ -21,7 +22,7 @@ interface SavedFixture {
   readonly resumeStore: FullScanResumeStore
 }
 
-class TestWorker implements OrbisWorker {
+class TestWorker implements WorkerTransport {
   readonly messages: unknown[] = []
   readonly #listeners = new Map<'message' | 'error' | 'exit', Array<(value: unknown) => void>>()
 
@@ -31,7 +32,7 @@ class TestWorker implements OrbisWorker {
     if (paused.type === 'pause') queueMicrotask(() => this.emit('message', { type: 'paused', generation: paused.generation, requestId: paused.requestId, checkpointSequence: 1 }))
   }
 
-  on(event: 'message' | 'error' | 'exit', listener: (value: never) => void): OrbisWorker {
+  on(event: 'message' | 'error' | 'exit', listener: (value: never) => void): WorkerTransport {
     const listeners = this.#listeners.get(event) ?? []
     listeners.push(listener as (value: unknown) => void)
     this.#listeners.set(event, listeners)
@@ -45,6 +46,10 @@ class TestWorker implements OrbisWorker {
   }
 }
 
+function createController(workers: WorkerTransportFactory, options: ConstructorParameters<typeof OrbisController>[1]): OrbisController {
+  return new OrbisController(new WorkerScanExecution(workers), options)
+}
+
 class TestShell implements OrbisShell {
   readonly revealed: string[] = []
   showItemInFolder(path: string): void { this.revealed.push(path) }
@@ -55,7 +60,7 @@ describe('saved Orbis previews', () => {
   it('restores the saved root preview before resume without creating a worker', async () => {
     const fixture = await createSavedFixture()
     let createdWorkers = 0
-    const restarted = new OrbisController({
+    const restarted = createController({
       create: () => { createdWorkers += 1; return new TestWorker() }
     }, { indexDirectory: fixture.indexDirectory })
     try {
@@ -77,7 +82,7 @@ describe('saved Orbis previews', () => {
   it('restores the durable preview immediately after Pause', async () => {
     const fixture = await createSavedFixture()
     const workers: TestWorker[] = []
-    const controller = new OrbisController({ create: () => { const worker = new TestWorker(); workers.push(worker); return worker } }, { indexDirectory: fixture.indexDirectory })
+    const controller = createController({ create: () => { const worker = new TestWorker(); workers.push(worker); return worker } }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
       await controller.startScan()
@@ -92,7 +97,7 @@ describe('saved Orbis previews', () => {
 
   it('reopens the saved construction read-only when focusing a folder', async () => {
     const fixture = await createSavedFixture()
-    const controller = new OrbisController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory })
+    const controller = createController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
       const folder = controller.snapshot().largestItems.find((item) => item.name === 'folder')
@@ -107,7 +112,7 @@ describe('saved Orbis previews', () => {
   it('uses the private construction path and existing Finder safety checks', async () => {
     const fixture = await createSavedFixture()
     const shell = new TestShell()
-    const controller = new OrbisController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory, shell })
+    const controller = createController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory, shell })
     try {
       await controller.initialize()
       const file = controller.snapshot().largestItems.find((item) => item.name === 'file-00')
@@ -127,7 +132,7 @@ describe('saved Orbis previews', () => {
     const database = new DatabaseSync(join(fixture.indexDirectory, fixture.descriptor.partialFile))
     try { database.exec('DROP TABLE size_estimates') } finally { database.close() }
 
-    const controller = new OrbisController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory })
+    const controller = createController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
       expect(controller.snapshot()).toMatchObject({ committed: false, focus: null, chart: [], scan: { status: 'canceled', resume: { available: true } } })
@@ -139,7 +144,7 @@ describe('saved Orbis previews', () => {
   it('resumes with the saved publication only after the user clicks Resume', async () => {
     const fixture = await createSavedFixture()
     const workers: TestWorker[] = []
-    const controller = new OrbisController({ create: () => { const worker = new TestWorker(); workers.push(worker); return worker } }, { indexDirectory: fixture.indexDirectory })
+    const controller = createController({ create: () => { const worker = new TestWorker(); workers.push(worker); return worker } }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
       expect(workers).toHaveLength(0)
@@ -160,7 +165,7 @@ describe('saved Orbis previews', () => {
   it('restores a checkpoint after a worker failure and leaves the scan paused', async () => {
     const fixture = await createSavedFixture()
     let worker: TestWorker | undefined
-    const controller = new OrbisController({ create: () => (worker = new TestWorker()) }, { indexDirectory: fixture.indexDirectory })
+    const controller = createController({ create: () => (worker = new TestWorker()) }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
       await controller.rescan()
@@ -192,12 +197,14 @@ async function createSavedFixture(): Promise<SavedFixture> {
   })
   const abort = new AbortController()
   let preview: ProgressivePreview | undefined
+  let previewCount = 0
   const partialScan = scanFilesystem({
     generation: 1, target, indexDirectory, partialPath: join(indexDirectory, descriptor.partialFile),
     publishedPath: join(indexDirectory, descriptor.candidateFile), signal: abort.signal,
     control: new ProgressiveScanControl(), resumable: { descriptor, store: resumeStore, resume: false },
     onPreview: (nextPreview) => {
-      if (!preview) {
+      previewCount += 1
+      if (previewCount === 2) {
         preview = nextPreview
         abort.abort()
       }

@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from
 import type { Breadcrumb, ChartSegment, NodeSummary, VolumeSnapshot } from "../shared/contracts"
 import { buildChart } from "./chart"
 import { prepareDatabaseDirectory, removeDatabaseFiles } from "./database"
-import { createScanTimingAccumulator, measureScan, measureScanAsync, runWithScanDiagnostics } from "./diagnostics"
+import { createScanTimingAccumulator, measureScan, measureScanAsync, publishScanWork, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone, type ScanTimingAccumulator } from "./diagnostics"
 import {
   ConstructionDatabase,
   type ConstructionCheckpointRequest,
@@ -22,6 +22,15 @@ import {
   DEFAULT_METADATA_CONCURRENCY, STARTUP_EXCLUSIONS, ScanCanceledError,
   type ScanFileSystem, type ScanOptions, type ScanProgress, type ScanResult, type ScanStats, type ScanTotals
 } from "./legacy-scanner"
+
+interface ScanWorkTimings {
+  readonly scheduler: ScanTimingAccumulator
+  readonly metadataOpen: ScanTimingAccumulator
+  readonly metadataRead: ScanTimingAccumulator
+  readonly pageNormalize: ScanTimingAccumulator
+  readonly aggregation: ScanTimingAccumulator
+  readonly candidateFinalize: ScanTimingAccumulator
+}
 
 interface ActiveCursor {
   readonly cursor: DirectoryMetadataCursor
@@ -52,6 +61,8 @@ export interface ProgressiveScanOptions extends ScanOptions {
   readonly directoryMetadataSource?: DirectoryMetadataSource
   readonly nativeAddonPath?: string
   readonly onCheckpoint?: (sequence: number) => void
+  readonly onResumeMilestone?: (milestone: ResumeMilestone) => void
+  readonly onMetadataPageAccepted?: () => void
   readonly drainResumeJournal?: (eventId: string) => { readonly throughEventId: string; readonly scopes: readonly string[]; readonly restartReason?: string }
   /** Internal traversal tuning. The benchmark worker uses ORBIS_METADATA_BATCH_SIZE instead. */
   readonly metadataBatchSize?: number
@@ -114,17 +125,38 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   const metadataBatchSize = resolveMetadataBatchSize(options.metadataBatchSize)
   const nativeAddon = await loadNativeMetadataAddon(options.nativeAddonPath)
   const nodeMetadataSource = new NodeDirectoryMetadataSource(fileSystem, metadataConcurrency)
-  const bulkMetadataSource = options.directoryMetadataSource
-    ?? createDirectoryMetadataSource(nativeAddon, fileSystem, metadataConcurrency)
+  let bulkMetadataSource = options.directoryMetadataSource
   const startedAt = Date.now()
   const totals = mutableTotals()
   const reporter = new PreviewReporter(options, startedAt, totals)
+  const workTimings: ScanWorkTimings = {
+    scheduler: createScanTimingAccumulator('scheduler'), metadataOpen: createScanTimingAccumulator('metadata-open'),
+    metadataRead: createScanTimingAccumulator('metadata-read'), pageNormalize: createScanTimingAccumulator('page-normalize'),
+    aggregation: createScanTimingAccumulator('aggregation'), candidateFinalize: createScanTimingAccumulator('candidate-finalize')
+  }
+  let workTimingsPublished = false
+  const publishWorkTimings = (): void => {
+    if (workTimingsPublished) return
+    workTimingsPublished = true
+    for (const timing of Object.values(workTimings)) timing.publish()
+    publishScanWork('metadata-batch-flush')
+    publishScanWork('database-checkpoint')
+    reporter.publishTimings()
+  }
   let key = randomBytes(32)
   const nodeId = (parentId: string, name: string): string => `n-${createHmac("sha256", key).update(parentId).update("\0").update(name).digest("hex").slice(0, 32)}`
   const cursors = new Map<string, ActiveCursor>()
   const bulkFallbackDirectories = new Set<string>()
   let database: ConstructionDatabase | undefined
   let constructionActive = true
+  let resumeMetadataPageReported = false
+  const reportAcceptedMetadataPage = (): boolean => {
+    options.onMetadataPageAccepted?.()
+    if (!options.resumable?.resume || resumeMetadataPageReported) return false
+    resumeMetadataPageReported = true
+    options.onResumeMilestone?.('first-metadata-page')
+    return true
+  }
 
   let preflight: Awaited<ReturnType<typeof preflightShape>>
   try {
@@ -147,9 +179,12 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     })
   } catch (error) {
     options.control.detach()
+    publishWorkTimings()
     if (!options.resumable) await removeDatabaseFiles(options.partialPath)
     throw error
   }
+
+  bulkMetadataSource ??= createDirectoryMetadataSource(nativeAddon, fileSystem, metadataConcurrency, preflight.target)
 
   let rootId = ''
   let activeElapsedBefore = 0
@@ -159,24 +194,31 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   let resumeJournal: { readonly drainedThrough: string; readonly dirtyScopes: readonly string[] } | undefined
   try {
     if (options.resumable?.resume) {
-      database = measureScan('database-resume', () => ConstructionDatabase.openResumable(options.partialPath, { candidatePath: options.publishedPath }))
+      database = measureScan('resume-database-open', () => ConstructionDatabase.openResumable(options.partialPath, {
+        candidatePath: options.publishedPath, onCheckpoint: (_reason, sequence) => options.onCheckpoint?.(sequence)
+      }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
-      const recovered = database.recoverIncompleteDirectories()
-      const persisted = database.semanticTotals()
+      const recovered = measureScan('resume-incomplete-recovery', () => database!.recoverIncompleteDirectories())
+      recordScanCounter('resumeRecoveryRoots', recovered.reset)
+      recordScanCounter('resumeDeletedNodes', recovered.deletedNodes)
+      recordScanCounter('resumeAffectedHardlinkIdentities', recovered.affectedHardlinkIdentities)
+      recordScanCounter('resumeRepairedAncestors', recovered.repairedAncestors)
+      recordScanCounter('resumeRepairedSchedulerRows', recovered.repairedSchedulerRows)
+      const persisted = measureScan('resume-semantic-totals', () => database!.semanticTotals())
       Object.assign(totals, persisted)
       activeElapsedBefore = persisted.activeElapsedMs
-      void recovered
-      notifyCheckpoint(options, database.checkpoint({ reason: 'resume' }))
+      measureScan('resume-checkpoint', () => database!.checkpoint({ reason: 'resume' }))
     } else if (options.resumable) {
       const descriptor = options.resumable.descriptor
       database = measureScan('database-create', () => ConstructionDatabase.create(options.partialPath, {
         scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid,
-        journalBaseline: descriptor.journalBaseline, candidatePath: options.publishedPath
+        journalBaseline: descriptor.journalBaseline, candidatePath: options.publishedPath,
+        onCheckpoint: (_reason, sequence) => options.onCheckpoint?.(sequence)
       }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
-      notifyCheckpoint(options, database.checkpoint({ reason: 'startup' }))
+      database.checkpoint({ reason: 'startup' })
       await options.resumable.store.publish(descriptor)
     } else {
       database = measureScan("database-create", () => new ConstructionDatabase(options.partialPath))
@@ -192,15 +234,14 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     })
     if (totals.scannedItems === 0) totals.scannedItems = 1
     if (totals.discoveredBytes === 0) totals.discoveredBytes = rootBytes
-    reporter.progress(displayName(preflight.target), true)
 
     if (options.initialEstimate && !options.resumable?.resume) {
       database.applyEstimates(options.initialEstimate)
       database.bumpRevision()
     }
-    if (options.resumable?.resume) reporter.resume(database, preflight)
+    reporter.initial(database, preflight)
+    reporter.progress(displayName(preflight.target), true)
 
-    const aggregationTiming = createScanTimingAccumulator("aggregation")
     let focusTurns = 0
     const checkpointNow = (finalDrain: boolean): void => {
       if (!options.resumable || !database) return
@@ -213,10 +254,10 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
         journalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
         lastJournalDrainAt = now
       }
-      notifyCheckpoint(options, database.checkpoint({
+      database.checkpoint({
         reason: finalDrain ? 'finalize' : 'scheduled', activeElapsedDeltaMs: now - lastCheckpointAt,
         ...(journalDrain ? { journalDrain } : {})
-      }))
+      })
       lastCheckpointAt = now
       entriesSinceCheckpoint = 0
     }
@@ -224,10 +265,8 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       if (!options.resumable || !database) return
       const now = Date.now()
       const journalDue = Boolean(options.drainResumeJournal) && now - lastJournalDrainAt >= 30_000
-      if (now - lastCheckpointAt >= 2_000 || entriesSinceCheckpoint >= 4_096 || journalDue) checkpointNow(false)
+      if (now - lastCheckpointAt >= 5_000 || entriesSinceCheckpoint >= 32_768 || journalDue) checkpointNow(false)
     }
-    const checkpointForced = (finalDrain = false): void => checkpointNow(finalDrain)
-
     await measureScanAsync("traversal", async () => {
       // Native bulk pages are synchronous and already contain metadata. Node
       // fallback uses the Stage 5 scan-wide mapper, so keep several eligible
@@ -238,7 +277,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
         : metadataConcurrency
       while (true) {
         throwIfCanceled(options.signal)
-        const batch = database!.takeWork({ limit: pageConcurrency, focusTurns })
+        const batch = workTimings.scheduler.measure(() => database!.takeWork({ limit: pageConcurrency, focusTurns }))
         const tasks = batch.work
         focusTurns = batch.focusTurns
         if (batch.done) break
@@ -253,7 +292,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
           for (const task of tasks) {
             if (cursors.has(task.id)) continue
             try {
-              const active = await openCursor(task.path, preflight.targetRealpath, undefined, nodeMetadataSource, bulkFallbackDirectories)
+              const active = await openCursor(task.path, preflight.targetRealpath, undefined, nodeMetadataSource, bulkFallbackDirectories, workTimings)
               await skipEntries(active.cursor, task.entriesRead, metadataBatchSize, options.signal)
               cursors.set(task.id, active)
             } catch (error) { preparationErrors.set(task.id, error) }
@@ -262,17 +301,18 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
         const reads = await Promise.all(tasks.map((task) => {
           const preparationError = preparationErrors.get(task.id)
           return preparationError === undefined
-            ? readTaskPage(task, cursors, preflight.targetRealpath, bulkMetadataSource, nodeMetadataSource, bulkFallbackDirectories, metadataBatchSize, options)
+            ? readTaskPage(task, cursors, preflight.targetRealpath, bulkMetadataSource, nodeMetadataSource, bulkFallbackDirectories, metadataBatchSize, options, workTimings)
             : Promise.resolve<TaskPageRead>({ ok: false, task, error: preparationError })
         }))
         for (const read of reads) {
           throwIfCanceled(options.signal)
           const task = read.task
           if (!read.ok) {
-            const delta = aggregationTiming.measure(() => database!.accept({ kind: 'unreadable', taskId: task.id, disappearing: isDisappearing(read.error) }))
+            const delta = workTimings.aggregation.measure(() => database!.accept({ kind: 'unreadable', taskId: task.id, disappearing: isDisappearing(read.error) }))
             addConstructionTotals(totals, delta)
+            const firstResumePage = reportAcceptedMetadataPage()
             checkpointDue()
-            reporter.batch(database!, task.id, preflight, task.id === rootId)
+            reporter.batch(database!, task, preflight, task.id === rootId || firstResumePage)
             continue
           }
           const page = read.page
@@ -280,27 +320,37 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
           const focused = task.focused || database!.taskIsFocused(task.id)
           const input: ConstructionInput = {
             kind: 'page',
-            page: normalizeConstructionPage(page, task, focused, options, preflight, nodeId)
+            page: workTimings.pageNormalize.measure(() => normalizeConstructionPage(page, task, focused, options, preflight, nodeId))
           }
-          const delta = aggregationTiming.measure(() => database!.accept(input))
+          const delta = workTimings.aggregation.measure(() => database!.accept(input))
           addConstructionTotals(totals, delta)
           entriesSinceCheckpoint += page.entries.length
+          if (options.resumable?.resume) recordScanCounter('resumeReplayedEntries', page.entries.length)
+          const firstResumePage = page.entries.length > 0 || page.done ? reportAcceptedMetadataPage() : false
+          if (page.entries.length === 0 && !page.done) options.onMetadataPageAccepted?.()
           if (page.done) await closeCursor(cursors, task.id)
-          reporter.batch(database!, task.id, preflight, task.id === rootId && firstRootPage)
+          reporter.batch(database!, task, preflight, task.id === rootId && firstRootPage || firstResumePage)
           checkpointDue()
         }
       }
     })
-    aggregationTiming.publish()
     await closeAll(cursors)
     await bulkMetadataSource?.close?.()
     constructionActive = false
     throwIfCanceled(options.signal)
-    if (options.resumable) checkpointForced(true)
+    let finalJournalDrain: ConstructionCheckpointRequest['journalDrain']
+    if (options.resumable && options.drainResumeJournal) {
+      const drain = options.drainResumeJournal(database.drainedThrough)
+      if (drain.restartReason) throw new Error(`resume-invalidated:${drain.restartReason}`)
+      finalJournalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
+    }
     const root = database.getNode(rootId)
     if (!root || root.scanState !== "complete" && root.scanState !== "unreadable") throw new Error("Progressive scan root did not reach a terminal state")
     reporter.progress(displayName(preflight.target), true, "indexing")
-    if (options.resumable) resumeJournal = { drainedThrough: database.drainedThrough, dirtyScopes: database.dirtyScopes }
+    if (options.resumable) {
+      const dirtyScopes = [...new Set([...database.dirtyScopes, ...(finalJournalDrain?.scopes ?? [])])].sort()
+      resumeJournal = { drainedThrough: finalJournalDrain?.throughEventId ?? database.drainedThrough, dirtyScopes }
+    }
     const elapsedMs = activeElapsedBefore + Date.now() - startedAt
     const finalTotals: ScanTotals = {
       scannedItems: totals.scannedItems, discoveredBytes: root.confirmedBytes, elapsedMs, skippedItems: totals.skippedItems,
@@ -315,15 +365,18 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       indexRevision: 1, capturedAt, refreshedAt: capturedAt, ...(resumeJournal ? { resume: resumeJournal } : {})
     }
     if (options.resumable) {
-      const finalization = measureScan("index-create", () => database!.finish({
-        kind: 'finalize', metadata, checkpoint: { activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt) }
-      }))
+      const finalization = measureScan("index-create", () => workTimings.candidateFinalize.measure(() => database!.finish({
+        kind: 'finalize', metadata, checkpoint: {
+          activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt), ...(finalJournalDrain ? { journalDrain: finalJournalDrain } : {})
+        }
+      })))
       if (finalization.kind !== 'candidate') throw new Error(`Unexpected construction finish result: ${finalization.kind}`)
       database = undefined
       options.control.detach()
       throwIfCanceled(options.signal)
       reporter.progress(displayName(preflight.target), true, "indexing")
       throwIfCanceled(options.signal)
+      publishWorkTimings()
       return {
         generation: options.generation, target: preflight.target, rootId, publishedPath: finalization.candidatePath,
         capacityBytes: preflight.capacityBytes, freeBytes: preflight.freeBytes, scannedBytes: root.confirmedBytes, totals: finalTotals,
@@ -333,7 +386,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
         }
       }
     }
-    measureScan("index-create", () => database!.finalize())
+    measureScan("index-create", () => workTimings.candidateFinalize.measure(() => database!.finalize()))
     measureScan("metadata-write", () => database!.writeMetadata(metadata))
     database.complete()
     database = undefined
@@ -342,6 +395,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     await measureScanAsync("publish-rename", () => durableRename(options.partialPath, options.publishedPath))
     reporter.progress(displayName(preflight.target), true, "indexing")
     throwIfCanceled(options.signal)
+    publishWorkTimings()
     return {
       generation: options.generation, target: preflight.target, rootId, publishedPath: options.publishedPath,
       capacityBytes: preflight.capacityBytes, freeBytes: preflight.freeBytes, scannedBytes: root.confirmedBytes, totals: finalTotals,
@@ -368,19 +422,23 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
             kind: 'pause', activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt),
             ...(journalDrain ? { journalDrain } : {})
           })
-          if (result.kind === 'paused') notifyCheckpoint(options, result.checkpointSequence)
-        } else failedDatabase.finish({ kind: 'unexpected-failure', cause: error })
+          void result
+        } else {
+          if (error instanceof Error && error.message.startsWith('resume-invalidated:') && options.drainResumeJournal) {
+            try { options.drainResumeJournal(failedDatabase.drainedThrough) } catch { /* The original invalidation remains authoritative. */ }
+          }
+          failedDatabase.finish({ kind: 'unexpected-failure', cause: error })
+        }
       } catch { failedDatabase.abort() }
     } else failedDatabase?.abort()
     if (!options.resumable) {
       await removeDatabaseFiles(options.partialPath)
       await removeDatabaseFiles(options.publishedPath)
     }
+    publishWorkTimings()
     throw error
   }
 }
-
-function notifyCheckpoint(options: ProgressiveScanOptions, sequence: number): void { options.onCheckpoint?.(sequence) }
 
 async function durableRename(partialPath: string, publishedPath: string): Promise<void> {
   const partial = await open(partialPath, 'r')
@@ -395,13 +453,13 @@ async function openCursor(
   targetRealpath: string,
   bulk: DirectoryMetadataSource | undefined,
   node: DirectoryMetadataSource,
-  fallbackDirectories: Set<string>
+  fallbackDirectories: Set<string>, timings: Pick<ScanWorkTimings, 'metadataOpen'>
 ): Promise<ActiveCursor> {
   if (bulk && !fallbackDirectories.has(path)) {
-    try { return { cursor: await bulk.open(path, targetRealpath), source: "bulk" } }
+    try { return { cursor: await timings.metadataOpen.measureAsync(() => bulk.open(path, targetRealpath)), source: "bulk" } }
     catch { fallbackDirectories.add(path) }
   }
-  return { cursor: await node.open(path, targetRealpath), source: "node" }
+  return { cursor: await timings.metadataOpen.measureAsync(() => node.open(path, targetRealpath)), source: "node" }
 }
 
 async function skipEntries(cursor: DirectoryMetadataCursor, count: number, batchSize: number, signal: AbortSignal | undefined): Promise<void> {
@@ -422,29 +480,30 @@ type TaskPageRead =
 async function readTaskPage(
   task: DirectoryTask, cursors: Map<string, ActiveCursor>, targetRealpath: string,
   bulk: DirectoryMetadataSource | undefined, node: DirectoryMetadataSource,
-  fallbackDirectories: Set<string>, batchSize: number, options: ProgressiveScanOptions
+  fallbackDirectories: Set<string>, batchSize: number, options: ProgressiveScanOptions,
+  timings: Pick<ScanWorkTimings, 'metadataOpen' | 'metadataRead'>
 ): Promise<TaskPageRead> {
   let active = cursors.get(task.id)
   try {
     if (!active) {
-      active = await openCursor(task.path, targetRealpath, bulk, node, fallbackDirectories)
+      active = await openCursor(task.path, targetRealpath, bulk, node, fallbackDirectories, timings)
       await skipEntries(active.cursor, task.entriesRead, batchSize, options.signal)
       cursors.set(task.id, active)
     }
     const firstRootBatch = Boolean(options.onPreview) && task.depth === 0 && task.entriesRead === 0
-    const page = await active.cursor.readPage(firstRootBatch ? FIRST_PREVIEW_ENTRIES : batchSize, options.signal ?? new AbortController().signal)
+    const page = await timings.metadataRead.measureAsync(() => active!.cursor.readPage(firstRootBatch ? FIRST_PREVIEW_ENTRIES : batchSize, options.signal ?? new AbortController().signal))
     return { ok: true, task, page }
   } catch (error) {
     if (active?.source === "bulk" && !options.signal?.aborted) {
       await closeCursor(cursors, task.id)
       fallbackDirectories.add(task.path)
       try {
-        const fallback = await node.open(task.path, targetRealpath)
+        const fallback = await timings.metadataOpen.measureAsync(() => node.open(task.path, targetRealpath))
         await skipEntries(fallback, task.entriesRead, batchSize, options.signal)
         active = { cursor: fallback, source: "node" }
         cursors.set(task.id, active)
         const firstRootBatch = Boolean(options.onPreview) && task.depth === 0 && task.entriesRead === 0
-        const page = await fallback.readPage(firstRootBatch ? FIRST_PREVIEW_ENTRIES : batchSize, options.signal ?? new AbortController().signal)
+        const page = await timings.metadataRead.measureAsync(() => fallback.readPage(firstRootBatch ? FIRST_PREVIEW_ENTRIES : batchSize, options.signal ?? new AbortController().signal))
         return { ok: true, task, page }
       } catch (fallbackError) {
         await closeCursor(cursors, task.id)
@@ -523,6 +582,7 @@ class PreviewReporter {
   #lastProgress = 0
   #lastPreview = 0
   #firstPreview = false
+  readonly #previewTiming = createScanTimingAccumulator('preview-build')
   constructor(private readonly options: ProgressiveScanOptions, private readonly startedAt: number, private readonly totals: ReturnType<typeof mutableTotals>) {}
   progress(item: string, force = false, stage: ScanProgress["stage"] = "traversing"): void {
     const now = Date.now()
@@ -538,12 +598,16 @@ class PreviewReporter {
     if (!this.#firstPreview) return
     this.emit(database, volume, false)
   }
-  resume(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  initial(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
     if (!this.options.onPreview) return
-    this.emit(database, volume, true)
+    this.emit(database, volume, true, false)
+    // This bootstrap preview gives the renderer a root model before progress
+    // starts. It must not delay the first data-bearing root-page preview.
+    this.#firstPreview = false
+    this.#lastPreview = 0
   }
-  batch(database: ConstructionDatabase, taskId: string, volume: { target: string; capacityBytes: number; freeBytes: number }, rootPageCompleted: boolean): void {
-    this.progress(database.getNode(taskId)?.name ?? "")
+  batch(database: ConstructionDatabase, task: DirectoryTask, volume: { target: string; capacityBytes: number; freeBytes: number }, rootPageCompleted: boolean): void {
+    this.progress(displayName(task.path))
     this.options.control.consumeFocusRequest()
     if (!this.options.onPreview) return
     const now = Date.now()
@@ -555,7 +619,14 @@ class PreviewReporter {
     if (now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
     this.emit(database, volume, false)
   }
-  private emit(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean): void {
+  publishTimings(): void { this.#previewTiming.publish() }
+  private emit(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean, prepare = true): void {
+    this.#previewTiming.measure(() => {
+      if (prepare) database.preparePreviewReadModel()
+      this.build(database, volume, first)
+    })
+  }
+  private build(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean): void {
     const now = Date.now()
     if (!first && now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
     const onPreview = this.options.onPreview

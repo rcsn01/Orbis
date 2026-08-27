@@ -7,10 +7,19 @@ import { dirname, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
-import { OrbisController, type OrbisWorker, type OrbisWorkerFactory } from '../src/main/controller'
-import { subscribeControllerDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
+import { OrbisController } from '../src/main/controller'
+import { WorkerScanExecution, type WorkerTransport, type WorkerTransportFactory } from '../src/main/scan-execution'
+import {
+  emptyScanCounters, RESUME_CONTROLLER_PHASES, RESUME_SCAN_MILESTONE_PHASES, RESUME_SCAN_PHASES,
+  RESUME_SCAN_WORK_PHASES, SCAN_COUNTER_NAMES, subscribeControllerDiagnostics,
+  type OrbisTimingEvent, type ScanCounterRecord
+} from '../src/main/diagnostics'
 import { DEFAULT_METADATA_CONCURRENCY, type ScanResult } from '../src/main/scanner'
 import { createScanFixture, type ScanFixtureManifest, type ScanFixtureName, type ScanFixtureProfile } from './lib/scan-fixtures'
+import {
+  isResumeBenchmarkScenario, SCAN_BENCHMARK_SCHEMA_VERSION, validateScanBenchmarkReport,
+  type ResumeBenchmarkSample, type ResumeBenchmarkScenario
+} from './lib/scan-benchmark-report'
 
 interface BenchmarkOptions {
   readonly workerPath: string
@@ -27,10 +36,11 @@ interface BenchmarkOptions {
   readonly metadataConcurrency: number
   readonly batchSize: number
   readonly scanner: 'progressive' | 'legacy'
-  readonly scenario: RefreshScenario
+  readonly scenario: BenchmarkScenario
 }
 
 type RefreshScenario = 'initial-full' | 'warm-no-change' | 'one-file-allocation' | 'directory-rename' | 'hardlink-owner-change' | 'dropped-history-fallback'
+type BenchmarkScenario = RefreshScenario | ResumeBenchmarkScenario
 
 type PerformanceFixture = ScanFixtureName
 type LiveManifest = { readonly name: 'live'; readonly profile: 'live'; readonly isStartup: boolean }
@@ -39,7 +49,7 @@ interface TimingSummary { readonly min: number; readonly median: number; readonl
 
 interface SampleReport {
   readonly sample: number
-  readonly scenario: RefreshScenario
+  readonly scenario: BenchmarkScenario
   readonly outcomeKind: 'candidate' | 'unchanged'
   readonly strategy: 'full' | 'incremental'
   readonly fallbackReason: string | null
@@ -47,6 +57,8 @@ interface SampleReport {
   readonly workerRunMs: number
   readonly scanTotalMs: number
   readonly scanTimings: Readonly<Record<string, number>>
+  readonly scanWorkTimings: Readonly<Record<string, number>>
+  readonly counters: ScanCounterRecord
   readonly scanUnattributedMs: number
   readonly controllerTimings: Readonly<Record<string, number>>
   readonly databaseBytes: number
@@ -80,8 +92,10 @@ interface SampleReport {
   readonly aggregateRepairMs: number
   readonly validationMs: number
   readonly candidatePublicationMs: number
-  readonly aliasRows: number
+  readonly hardlinkPathRows: number
   readonly persistentTableBytes: number
+  readonly persistentTableBytesByTable: Readonly<Record<string, number>>
+  readonly resume?: ResumeBenchmarkSample
 }
 
 interface FixtureReport {
@@ -101,6 +115,17 @@ interface FixtureReport {
     readonly itemsPerSecond: TimingSummary
     readonly firstPreviewMs: TimingSummary
     readonly maxPreviewPayloadBytes: TimingSummary
+    readonly workTimings: Readonly<Record<string, TimingSummary>>
+    readonly counters: Readonly<Record<string, TimingSummary>>
+    readonly resume?: {
+      readonly clickToPreparationMs: TimingSummary
+      readonly clickToFirstProgressMs: TimingSummary
+      readonly clickToFirstMetadataPageMs: TimingSummary
+      readonly clickToFirstMetadataPreviewMs: TimingSummary
+      readonly completionMs: TimingSummary
+      readonly phases: Readonly<Record<string, TimingSummary>>
+      readonly counters: Readonly<Record<string, TimingSummary>>
+    }
   }
 }
 
@@ -115,7 +140,7 @@ async function runBenchmark(): Promise<void> {
   if (options.target) reports.push(await runLiveTarget(options.target))
 
   const report = {
-    schemaVersion: 5,
+    schemaVersion: SCAN_BENCHMARK_SCHEMA_VERSION,
     capturedAt: new Date().toISOString(),
     environment: {
       moirasia: gitState(rootDirectory),
@@ -144,6 +169,7 @@ async function runBenchmark(): Promise<void> {
     },
     fixtures: reports
   }
+  validateScanBenchmarkReport(report)
   await mkdir(dirname(options.outputPath), { recursive: true })
   await writeFile(options.outputPath, `${JSON.stringify(report, null, 2)}\n`)
   printSummary(reports, options.outputPath)
@@ -176,24 +202,61 @@ async function runSamples(target: string, manifest: ScanFixtureManifest | LiveMa
 async function runSample(target: string, manifest: ScanFixtureManifest | LiveManifest, sample: number): Promise<SampleReport> {
   const indexDirectory = resolve(dirname(options.outputPath), `.run-${process.pid}-${manifest.name}-${sample}`)
   await rm(indexDirectory, { recursive: true, force: true })
-  if (options.scenario !== 'initial-full') {
+  const resumeScenario = isResumeBenchmarkScenario(options.scenario)
+  if (!resumeScenario && options.scenario !== 'initial-full') {
     if (options.scanner !== 'progressive') throw new Error('Refresh scenarios require --scanner progressive')
     if (options.scenario === 'hardlink-owner-change') await ensureBenchmarkHardLinks(target)
     await preparePersistentBaseline(target, indexDirectory)
     await applyRefreshScenario(target, indexDirectory, options.scenario, sample)
   }
+  if (resumeScenario && options.scanner !== 'progressive') throw new Error('Resume scenarios require --scanner progressive')
+  let worker: MeasuredWorker | undefined
+  const prepareInChild = options.scenario === 'resume-process-restart'
+  let preparingResume = resumeScenario && !prepareInChild
+  let latestWorker: MeasuredWorker | undefined
+  const workers: WorkerTransportFactory = { create: () => {
+    const created = new MeasuredWorker(options.workerPath, options.scanner, options.nativeAddonPath, preparingResume ? {
+      benchmarkPageTarget: resumePausePage(manifest), dropPauseAcknowledgement: options.scenario === 'resume-unacknowledged-pause'
+    } : {})
+    latestWorker = created
+    if (!preparingResume) worker = created
+    return created
+  } }
+  let controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+  if (prepareInChild) {
+    prepareResumeInChild(target, indexDirectory, resumePausePage(manifest))
+    preparingResume = false
+  } else if (resumeScenario) {
+    const premature = waitForCompletion(controller, options.timeoutMs)
+    await controller.startScan()
+    const preparationWorker = latestWorker
+    if (!preparationWorker) throw new Error('The resume benchmark did not create its preparation worker')
+    try {
+      await Promise.race([
+        preparationWorker.benchmarkPageReached,
+        premature.promise.then(() => { throw new Error(`The ${manifest.name} preparation scan completed before the requested pause page`) })
+      ])
+    } finally { premature.cancel() }
+    await controller.cancelScan()
+    if (!controller.snapshot().scan.resume?.available) throw new Error('The resume benchmark did not preserve a durable construction')
+    preparingResume = false
+    if (options.scenario === 'resume-unacknowledged-pause') {
+      await controller.close()
+      controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+    }
+  }
   const controllerTimings: OrbisTimingEvent[] = []
   const unsubscribeDiagnostics = subscribeControllerDiagnostics((event) => controllerTimings.push(event))
-  let worker: MeasuredWorker | undefined
-  const workers: OrbisWorkerFactory = { create: () => { worker = new MeasuredWorker(options.workerPath, options.scanner, options.nativeAddonPath); return worker } }
-  const controller = new OrbisController(workers, { indexDirectory, initialTarget: target })
   const baselineRssBytes = process.memoryUsage.rss()
   let sampledPeakRssBytes = baselineRssBytes
   const memorySampler = setInterval(() => { sampledPeakRssBytes = Math.max(sampledPeakRssBytes, process.memoryUsage.rss()) }, 20)
-  const completion = waitForCompletion(controller, options.timeoutMs)
+  const completion = waitForCompletion(controller, options.timeoutMs, resumeScenario ? controller.snapshot().scan.generation + 1 : undefined, resumeScenario)
+  const resumeStartedAt = performance.now()
   try {
-    await controller.startScan()
+    if (resumeScenario) await controller.rescan()
+    else await controller.startScan()
     await completion.promise
+    const resumeCompletionMs = performance.now() - resumeStartedAt
     await new Promise((resolveImmediate) => setImmediate(resolveImmediate))
     const measuredWorker = worker
     if (!measuredWorker?.outcomeKind || !measuredWorker.refresh) throw new Error('The benchmark worker completed without a refresh outcome')
@@ -217,6 +280,8 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
       workerRunMs: measuredWorker.workerRunMs,
       scanTotalMs: scanTotal,
       scanTimings,
+      scanWorkTimings: Object.fromEntries(Object.entries(scanTimings).filter(([phase]) => isNestedWorkPhase(phase))),
+      counters: measuredWorker.counters,
       scanUnattributedMs: Math.max(0, scanTotal - measuredPhases),
       controllerTimings: timingMap(controllerTimings),
       databaseBytes,
@@ -250,8 +315,10 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
       aggregateRepairMs: scanTimings['incremental-aggregate-repair'] ?? 0,
       validationMs: scanTimings['incremental-validation'] ?? 0,
       candidatePublicationMs: scanTimings['candidate-publication'] ?? 0,
-      aliasRows: persistent.aliasRows,
-      persistentTableBytes: persistent.tableBytes
+      hardlinkPathRows: persistent.hardlinkPathRows,
+      persistentTableBytes: persistent.tableBytes,
+      persistentTableBytesByTable: persistent.tableBytesByTable,
+      ...(resumeScenario ? { resume: makeResumeSample(scanTimings, controllerTimings, measuredWorker.counters, resumeCompletionMs) } : {})
     }
   } finally {
     completion.cancel()
@@ -264,13 +331,13 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
 
 async function preparePersistentBaseline(target: string, indexDirectory: string): Promise<void> {
   const environment: NodeJS.ProcessEnv = { ...process.env }
-  const factory: OrbisWorkerFactory = {
-    create: () => new Worker(options.workerPath, { env: environment, ...(options.nativeAddonPath ? { workerData: { nativeAddonPath: options.nativeAddonPath } } : {}) }) as unknown as OrbisWorker
+  const factory: WorkerTransportFactory = {
+    create: () => new Worker(options.workerPath, { env: environment, ...(options.nativeAddonPath ? { workerData: { nativeAddonPath: options.nativeAddonPath } } : {}) }) as unknown as WorkerTransport
   }
   // A freshly generated fixture can still have pre-baseline events waiting for
   // IDs. A second unmeasured refresh drains those events before mutation.
   for (let pass = 0; pass < 2; pass += 1) {
-    const controller = new OrbisController(factory, { indexDirectory, initialTarget: target })
+    const controller = new OrbisController(new WorkerScanExecution(factory), { indexDirectory, initialTarget: target })
     const completion = waitForCompletion(controller, options.timeoutMs)
     try { await controller.startScan(); await completion.promise }
     finally { completion.cancel(); await controller.close() }
@@ -351,22 +418,22 @@ function readActiveResult(indexDirectory: string, generation: number): ScanResul
   } finally { database.close() }
 }
 
-function readPersistentStats(path: string): { aliasRows: number; tableBytes: number } {
+function readPersistentStats(path: string): { hardlinkPathRows: number; tableBytes: number; tableBytesByTable: Readonly<Record<string, number>> } {
   const database = new DatabaseSync(path, { readOnly: true })
   try {
-    const hasAliases = database.prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'file_aliases'").get() as { found?: number } | undefined
-    if (!hasAliases?.found) return { aliasRows: 0, tableBytes: 0 }
-    const aliases = database.prepare('SELECT COUNT(*) AS count FROM file_aliases').get() as { count: number }
-    let tableBytes = 0
+    const hasPaths = database.prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'hardlink_paths'").get() as { found?: number } | undefined
+    if (!hasPaths?.found) return { hardlinkPathRows: 0, tableBytes: 0, tableBytesByTable: {} }
+    const paths = database.prepare('SELECT COUNT(*) AS count FROM hardlink_paths').get() as { count: number }
+    const tableBytesByTable: Record<string, number> = { nodes: 0, hardlink_paths: 0, hardlink_groups: 0, directory_observations: 0 }
     try {
-      const row = database.prepare("SELECT COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE name IN ('file_aliases', 'hardlink_groups', 'directory_observations')").get() as { bytes: number }
-      tableBytes = Number(row.bytes)
+      const rows = database.prepare("SELECT name, COALESCE(SUM(pgsize), 0) AS bytes FROM dbstat WHERE name IN ('nodes', 'hardlink_paths', 'hardlink_groups', 'directory_observations') GROUP BY name").all() as unknown as Array<{ name: string; bytes: number }>
+      for (const row of rows) tableBytesByTable[row.name] = Number(row.bytes)
     } catch { /* dbstat can be omitted from custom SQLite builds. */ }
-    return { aliasRows: Number(aliases.count), tableBytes }
+    return { hardlinkPathRows: Number(paths.count), tableBytes: Object.values(tableBytesByTable).reduce((sum, bytes) => sum + bytes, 0), tableBytesByTable }
   } finally { database.close() }
 }
 
-function waitForCompletion(controller: OrbisController, timeoutMs: number): { readonly promise: Promise<void>; cancel(): void } {
+function waitForCompletion(controller: OrbisController, timeoutMs: number, minimumGeneration = 0, ignoreCanceled = false): { readonly promise: Promise<void>; cancel(): void } {
   let settled = false
   let unsubscribe = (): void => undefined
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -379,22 +446,29 @@ function waitForCompletion(controller: OrbisController, timeoutMs: number): { re
       operation()
     }
     unsubscribe = controller.subscribe((snapshot) => {
+      if (snapshot.scan.generation < minimumGeneration) return
       if (snapshot.scan.status === 'completed') settle(resolveCompleted)
       else if (snapshot.scan.status === 'fatal-error') settle(() => rejectCompleted(new Error(snapshot.scan.error ?? 'The benchmark scan failed')))
-      else if (snapshot.scan.status === 'canceled') settle(() => rejectCompleted(new Error('The benchmark scan was canceled')))
+      else if (snapshot.scan.status === 'canceled' && !ignoreCanceled) settle(() => rejectCompleted(new Error('The benchmark scan was canceled')))
     })
     timer = setTimeout(() => settle(() => rejectCompleted(new Error(`The benchmark scan timed out after ${timeoutMs} ms`))), timeoutMs)
   })
   return { promise, cancel: () => { if (!settled) { settled = true; if (timer) clearTimeout(timer); unsubscribe() } } }
 }
 
-class MeasuredWorker implements OrbisWorker {
+interface MeasuredWorkerOptions {
+  readonly benchmarkPageTarget?: number
+  readonly dropPauseAcknowledgement?: boolean
+}
+
+class MeasuredWorker implements WorkerTransport {
   readonly #worker: Worker
   readonly #createdAt = performance.now()
   readonly #messageListeners: Array<(message: unknown) => void> = []
   readonly #errorListeners: Array<(error: unknown) => void> = []
   readonly #exitListeners: Array<(code: number) => void> = []
   readonly workerStartupMs: Promise<number>
+  readonly benchmarkPageReached: Promise<number>
   scanTimings: readonly OrbisTimingEvent[] = []
   result: ScanResult | undefined
   outcomeKind: 'candidate' | 'unchanged' | undefined
@@ -406,27 +480,49 @@ class MeasuredWorker implements OrbisWorker {
   nativeCursorReadPageCalls = 0
   nodeCursorReadPageCalls = 0
   checkpointCount = 0
+  counters: ScanCounterRecord = emptyScanCounters()
   #startedAt = 0
   #receivedComplete = false
+  #resolveBenchmarkPage: ((page: number) => void) | undefined
+  #rejectBenchmarkPage: ((error: Error) => void) | undefined
 
-  constructor(path: string, scanner: 'progressive' | 'legacy', nativeAddonPath: string | undefined) {
+  constructor(path: string, scanner: 'progressive' | 'legacy', nativeAddonPath: string | undefined, private readonly measuredOptions: MeasuredWorkerOptions = {}) {
     const environment: NodeJS.ProcessEnv = { ...process.env, ORBIS_SCAN_DIAGNOSTICS: '1' }
-    const workerData = { ...(nativeAddonPath ? { nativeAddonPath } : {}), ...(scanner === 'legacy' ? { referenceScan: true } : {}) }
+    const workerData = {
+      ...(nativeAddonPath ? { nativeAddonPath } : {}), ...(scanner === 'legacy' ? { referenceScan: true } : {}),
+      ...(measuredOptions.benchmarkPageTarget !== undefined ? { benchmarkPageSignals: true } : {})
+    }
     this.#worker = new Worker(path, { env: environment, workerData })
     this.workerStartupMs = new Promise((resolveOnline) => this.#worker.once('online', () => resolveOnline(performance.now() - this.#createdAt)))
+    this.benchmarkPageReached = measuredOptions.benchmarkPageTarget === undefined
+      ? Promise.resolve(0)
+      : new Promise<number>((resolvePage, rejectPage) => { this.#resolveBenchmarkPage = resolvePage; this.#rejectBenchmarkPage = rejectPage })
     this.#worker.on('message', (message: unknown) => {
       const value = message as {
         readonly type?: string
         readonly timings?: readonly OrbisTimingEvent[]
-        readonly counters?: { readonly nativeReadPageCalls?: number; readonly nodeReadPageCalls?: number }
+        readonly counters?: Partial<ScanCounterRecord>
         readonly checkpointCount?: number
+        readonly page?: number
+        readonly error?: { readonly message?: string }
         readonly result?: ScanResult
         readonly refresh?: { readonly strategy: 'full' | 'incremental'; readonly fallbackReason?: string }
       }
+      if (value.type === 'benchmark-page') {
+        const page = Number(value.page ?? 0)
+        if (page >= (this.measuredOptions.benchmarkPageTarget ?? Number.POSITIVE_INFINITY)) {
+          this.#resolveBenchmarkPage?.(page)
+          this.#resolveBenchmarkPage = undefined
+          this.#rejectBenchmarkPage = undefined
+        }
+        return
+      }
+      if (value.type === 'paused' && this.measuredOptions.dropPauseAcknowledgement) return
       if (value.type === 'diagnostics') {
         this.scanTimings = value.timings ?? []
-        this.nativeCursorReadPageCalls = Number(value.counters?.nativeReadPageCalls ?? 0)
-        this.nodeCursorReadPageCalls = Number(value.counters?.nodeReadPageCalls ?? 0)
+        this.counters = { ...emptyScanCounters(), ...value.counters }
+        this.nativeCursorReadPageCalls = this.counters.nativePageReads
+        this.nodeCursorReadPageCalls = this.counters.nodePageReads
         this.checkpointCount = Number(value.checkpointCount ?? 0)
         this.diagnosticMessageBeforeComplete = !this.#receivedComplete
         return
@@ -436,6 +532,9 @@ class MeasuredWorker implements OrbisWorker {
         this.maxPreviewPayloadBytes = Math.max(this.maxPreviewPayloadBytes, Buffer.byteLength(JSON.stringify(message)))
       }
       if (value.type === 'complete' && value.result) {
+        this.#rejectBenchmarkPage?.(new Error('The preparation worker completed before its benchmark page'))
+        this.#resolveBenchmarkPage = undefined
+        this.#rejectBenchmarkPage = undefined
         this.#receivedComplete = true
         this.workerRunMs = performance.now() - this.#startedAt
         this.result = value.result
@@ -449,8 +548,14 @@ class MeasuredWorker implements OrbisWorker {
       }
       for (const listener of this.#messageListeners) listener(message)
     })
-    this.#worker.on('error', (error) => { for (const listener of this.#errorListeners) listener(error) })
-    this.#worker.on('exit', (code) => { for (const listener of this.#exitListeners) listener(code) })
+    this.#worker.on('error', (error) => {
+      this.#rejectBenchmarkPage?.(error instanceof Error ? error : new Error(String(error)))
+      for (const listener of this.#errorListeners) listener(error)
+    })
+    this.#worker.on('exit', (code) => {
+      if (code !== 0) this.#rejectBenchmarkPage?.(new Error(`Preparation worker exited with code ${code}`))
+      for (const listener of this.#exitListeners) listener(code)
+    })
   }
 
   postMessage(message: unknown): void {
@@ -458,10 +563,10 @@ class MeasuredWorker implements OrbisWorker {
     this.#worker.postMessage(message)
   }
 
-  on(event: 'message', listener: (message: unknown) => void): OrbisWorker
-  on(event: 'error', listener: (error: unknown) => void): OrbisWorker
-  on(event: 'exit', listener: (code: number) => void): OrbisWorker
-  on(event: 'message' | 'error' | 'exit', listener: ((value: unknown) => void) | ((code: number) => void)): OrbisWorker {
+  on(event: 'message', listener: (message: unknown) => void): WorkerTransport
+  on(event: 'error', listener: (error: unknown) => void): WorkerTransport
+  on(event: 'exit', listener: (code: number) => void): WorkerTransport
+  on(event: 'message' | 'error' | 'exit', listener: ((value: unknown) => void) | ((code: number) => void)): WorkerTransport {
     if (event === 'message') this.#messageListeners.push(listener as (message: unknown) => void)
     else if (event === 'error') this.#errorListeners.push(listener as (error: unknown) => void)
     else this.#exitListeners.push(listener as (code: number) => void)
@@ -500,6 +605,85 @@ function validateResult(result: ScanResult, counts: ReturnType<typeof readCounts
   }
 }
 
+function prepareResumeInChild(target: string, indexDirectory: string, page: number): void {
+  const arguments_ = [
+    process.argv[1]!, '--prepare-resume-only', '--target', target, '--allow-live-target',
+    '--resume-index-directory', indexDirectory, '--resume-pause-page', String(page),
+    '--worker', options.workerPath, '--profile', options.profile, '--samples', '1', '--warmup', '0',
+    '--scenario', 'resume-process-restart', '--output', `${options.outputPath}.preparation`
+  ]
+  if (options.nativeAddonPath) arguments_.push('--native-addon', options.nativeAddonPath)
+  const prepared = spawnSync(process.execPath, arguments_, { env: process.env, encoding: 'utf8' })
+  if (prepared.status !== 0) throw new Error(`Resume preparation process failed: ${prepared.stderr.trim() || prepared.stdout.trim()}`)
+}
+
+async function runResumePreparationProcess(): Promise<void> {
+  const value = (name: string): string | undefined => { const index = process.argv.indexOf(name); return index >= 0 ? process.argv[index + 1] : undefined }
+  const target = value('--target')
+  const indexDirectory = value('--resume-index-directory')
+  const page = Number(value('--resume-pause-page'))
+  if (!target || !indexDirectory || !Number.isInteger(page) || page < 1) throw new Error('Invalid resume preparation process arguments')
+  let worker: MeasuredWorker | undefined
+  const workers: WorkerTransportFactory = { create: () => {
+    worker = new MeasuredWorker(options.workerPath, options.scanner, options.nativeAddonPath, { benchmarkPageTarget: page })
+    return worker
+  } }
+  const controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+  const premature = waitForCompletion(controller, options.timeoutMs)
+  try {
+    await controller.startScan()
+    if (!worker) throw new Error('Resume preparation process did not create a worker')
+    await Promise.race([
+      worker.benchmarkPageReached,
+      premature.promise.then(() => { throw new Error('Resume preparation process completed before the requested page') })
+    ])
+    premature.cancel()
+    await controller.cancelScan()
+    if (!controller.snapshot().scan.resume?.available) throw new Error('Resume preparation process did not preserve construction')
+  } finally {
+    premature.cancel()
+    await controller.close()
+  }
+}
+
+function resumePausePage(manifest: ScanFixtureManifest | LiveManifest): number {
+  if (manifest.profile === 'live') return 1
+  if (manifest.name === 'deep') return Math.max(2, Math.floor(manifest.directories / 2))
+  if (manifest.name === 'hardlinks') return 4
+  return 1
+}
+
+function makeResumeSample(
+  scanTimings: Readonly<Record<string, number>>,
+  controllerEvents: readonly OrbisTimingEvent[],
+  counters: ScanCounterRecord,
+  completionMs: number
+): ResumeBenchmarkSample {
+  const controller = timingMap(controllerEvents)
+  const required = (phase: typeof RESUME_CONTROLLER_PHASES[number]): number => {
+    const value = controller[phase]
+    if (value === undefined) throw new Error(`Resume diagnostics did not include ${phase}`)
+    return value
+  }
+  const phase = (name: typeof RESUME_SCAN_PHASES[number]): number => {
+    const value = scanTimings[name]
+    if (value === undefined) throw new Error(`Resume diagnostics did not include ${name}`)
+    return value
+  }
+  const firstPage = phase('resume-first-metadata-page')
+  return {
+    validation: 'full',
+    clickToPreparationMs: required('resume-click-to-preparation'),
+    clickToFirstProgressMs: required('resume-click-to-first-progress'),
+    clickToFirstMetadataPageMs: required('resume-click-to-first-metadata-page'),
+    clickToFirstMetadataPreviewMs: required('resume-click-to-first-metadata-preview'),
+    workerToFirstMetadataPageMs: firstPage,
+    completionMs,
+    phases: Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
+    counters
+  }
+}
+
 function makeFixtureReport(fixture: string, manifest: FixtureReport['manifest'], samples: readonly SampleReport[]): FixtureReport {
   const values = (select: (sample: SampleReport) => number): TimingSummary => summarize(samples.map(select))
   return {
@@ -518,19 +702,39 @@ function makeFixtureReport(fixture: string, manifest: FixtureReport['manifest'],
       rssIncreaseBytes: values((sample) => sample.rssIncreaseBytes),
       itemsPerSecond: values((sample) => sample.itemsPerSecond),
       firstPreviewMs: values((sample) => sample.firstPreviewMs),
-      maxPreviewPayloadBytes: values((sample) => sample.maxPreviewPayloadBytes)
+      maxPreviewPayloadBytes: values((sample) => sample.maxPreviewPayloadBytes),
+      workTimings: Object.fromEntries(NESTED_WORK_PHASES.map((phase) => [phase, values((sample) => sample.scanTimings[phase] ?? 0)])),
+      counters: Object.fromEntries(SCAN_COUNTER_NAMES.map((counter) => [counter, values((sample) => sample.counters[counter])])),
+      ...(samples.every((sample) => sample.resume) ? { resume: {
+        clickToPreparationMs: values((sample) => sample.resume!.clickToPreparationMs),
+        clickToFirstProgressMs: values((sample) => sample.resume!.clickToFirstProgressMs),
+        clickToFirstMetadataPageMs: values((sample) => sample.resume!.clickToFirstMetadataPageMs),
+        clickToFirstMetadataPreviewMs: values((sample) => sample.resume!.clickToFirstMetadataPreviewMs),
+        completionMs: values((sample) => sample.resume!.completionMs),
+        phases: Object.fromEntries(RESUME_SCAN_PHASES.map((phase) => [phase, values((sample) => sample.resume!.phases[phase] ?? 0)])),
+        counters: Object.fromEntries(SCAN_COUNTER_NAMES.map((counter) => [counter, values((sample) => sample.resume!.counters[counter])]))
+      } } : {})
     }
   }
 }
 
 function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly OrbisTimingEvent[]): void {
+  if (isResumeBenchmarkScenario(options.scenario)) {
+    validateTimingSet(worker.scanTimings, RESUME_SCAN_PHASES, 'worker')
+    validateTimingSet(controllerEvents, RESUME_CONTROLLER_PHASES, 'controller')
+    if (worker.counters.resumeFullValidations < 1) throw new Error('Resume diagnostics did not report a full validation')
+    if (worker.counters.resumeRecoveryRoots < 1) throw new Error('Resume diagnostics did not report a recovery root')
+    if (worker.counters.resumeReplayedEntries < 1) throw new Error('Resume diagnostics did not report replayed entries')
+    if (!worker.diagnosticMessageBeforeComplete) throw new Error('The worker diagnostics message did not arrive before completion')
+    return
+  }
   if (options.scenario !== 'initial-full') {
     if (!worker.scanTimings.some((event) => event.phase === 'refresh-total')) throw new Error('Refresh diagnostics did not include refresh-total')
     if (!worker.scanTimings.some((event) => event.phase === 'journal-replay')) throw new Error('Refresh diagnostics did not include journal-replay')
     if (!worker.diagnosticMessageBeforeComplete) throw new Error('The worker diagnostics message did not arrive before completion')
     return
   }
-  const requiredScanPhases = ['preflight', 'database-create', 'traversal', 'aggregation', 'index-create', 'metadata-write', 'database-commit', 'database-optimize', 'database-close', 'publish-rename', 'scan-total']
+  const requiredScanPhases = ['preflight', 'database-create', 'traversal', ...BASE_NESTED_WORK_PHASES, 'index-create', 'database-close', 'scan-total']
   const requiredControllerPhases = ['index-open', 'partial-index-cleanup', 'snapshot-focus-query', 'snapshot-root-query', 'snapshot-breadcrumbs-query', 'snapshot-chart-query', 'snapshot-largest-items-query', 'snapshot-total', 'listener-notify', 'publication-total']
   validateTimingSet(worker.scanTimings, requiredScanPhases, 'worker', false)
   validateTimingSet(controllerEvents, requiredControllerPhases, 'controller')
@@ -541,7 +745,16 @@ function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly 
   if (leafTotal > enclosingTotal + 0.1) throw new Error('Worker phase durations exceed the enclosing refresh total')
 }
 
-function isScanLeafPhase(phase: string): boolean { return phase !== 'scan-total' && phase !== 'refresh-total' && phase !== 'aggregation' }
+const BASE_NESTED_WORK_PHASES = [
+  'scheduler', 'metadata-open', 'metadata-read', 'page-normalize', 'aggregation', 'metadata-batch-flush',
+  'preview-build', 'database-checkpoint', 'candidate-finalize'
+] as const
+const NESTED_WORK_PHASES = [...BASE_NESTED_WORK_PHASES, ...RESUME_SCAN_WORK_PHASES] as const
+function isNestedWorkPhase(phase: string): boolean { return (NESTED_WORK_PHASES as readonly string[]).includes(phase) }
+function isScanLeafPhase(phase: string): boolean {
+  return phase !== 'scan-total' && phase !== 'refresh-total'
+    && !(RESUME_SCAN_MILESTONE_PHASES as readonly string[]).includes(phase) && !isNestedWorkPhase(phase)
+}
 
 function validateTimingSet(events: readonly OrbisTimingEvent[], required: readonly string[], label: string, exact = true): void {
   for (const phase of required) {
@@ -582,16 +795,19 @@ function parseArguments(arguments_: readonly string[]): BenchmarkOptions {
   const scanner = value('--scanner') ?? 'progressive'
   if (scanner !== 'progressive' && scanner !== 'legacy') throw new Error('--scanner must be progressive or legacy')
   const scenario = value('--scenario') ?? 'initial-full'
-  const scenarios: readonly RefreshScenario[] = ['initial-full', 'warm-no-change', 'one-file-allocation', 'directory-rename', 'hardlink-owner-change', 'dropped-history-fallback']
+  const scenarios: readonly BenchmarkScenario[] = [
+    'initial-full', 'warm-no-change', 'one-file-allocation', 'directory-rename', 'hardlink-owner-change', 'dropped-history-fallback',
+    'resume-clean-pause', 'resume-process-restart', 'resume-unacknowledged-pause'
+  ]
   if (!scenarios.includes(scenario as RefreshScenario)) throw new Error(`--scenario must be one of ${scenarios.join(', ')}`)
   const samples = positiveInteger(value('--samples') ?? (profile === 'quick' ? '1' : '5'), '--samples')
   const warmup = nonnegativeInteger(value('--warmup') ?? '1', '--warmup')
-  const defaultFixture = scenario === 'initial-full' ? 'all' : scenario === 'hardlink-owner-change' || scenario === 'directory-rename' ? 'deep' : 'mixed'
+  const defaultFixture = scenario === 'initial-full' ? 'all' : scenario.startsWith('resume-') ? 'wide' : scenario === 'hardlink-owner-change' || scenario === 'directory-rename' ? 'deep' : 'mixed'
   const fixture = value('--fixture') ?? defaultFixture
-  const allowed: readonly PerformanceFixture[] = ['wide', 'deep', 'tiny', 'mixed', 'semantics']
+  const allowed: readonly PerformanceFixture[] = ['wide', 'deep', 'tiny', 'mixed', 'semantics', 'directories', 'hardlinks']
   const fixtures = fixture === 'all' ? allowed : allowed.includes(fixture as PerformanceFixture) ? [fixture as PerformanceFixture] : []
   const target = value('--target')
-  if (fixtures.length === 0 && !target) throw new Error('--fixture must be wide, deep, tiny, mixed, semantics, or all')
+  if (fixtures.length === 0 && !target) throw new Error('--fixture must be wide, deep, tiny, mixed, semantics, directories, hardlinks, or all')
   const workerPath = resolve(value('--worker') ?? resolve(process.cwd(), 'worker-dist/scan-worker.mjs'))
   const requestedNativeAddon = value('--native-addon')
   const defaultNativeAddon = resolve(process.cwd(), 'native', `orbis-metadata.darwin-${process.arch === 'arm64' ? 'arm64' : 'x64'}.node`)
@@ -602,7 +818,7 @@ function parseArguments(arguments_: readonly string[]): BenchmarkOptions {
   if (metadataConcurrency > 64) throw new Error('--concurrency must be at most 64')
   const batchSize = positiveInteger(value('--batch-size') ?? '256', '--batch-size')
   if (batchSize > 1_024) throw new Error('--batch-size must be at most 1024')
-  return { workerPath, ...(nativeAddonPath ? { nativeAddonPath } : {}), profile, samples, warmup, fixtures: target ? [] : fixtures, outputPath, ...(target ? { target: resolve(target) } : {}), allowLiveTarget: arguments_.includes('--allow-live-target'), cacheState: value('--cache-state') ?? (target ? 'uncontrolled' : 'warm'), timeoutMs, metadataConcurrency, batchSize, scanner, scenario: scenario as RefreshScenario }
+  return { workerPath, ...(nativeAddonPath ? { nativeAddonPath } : {}), profile, samples, warmup, fixtures: target ? [] : fixtures, outputPath, ...(target ? { target: resolve(target) } : {}), allowLiveTarget: arguments_.includes('--allow-live-target'), cacheState: value('--cache-state') ?? (target ? 'uncontrolled' : 'warm'), timeoutMs, metadataConcurrency, batchSize, scanner, scenario: scenario as BenchmarkScenario }
 }
 
 function positiveInteger(value: string, name: string): number { const parsed = Number(value); if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`); return parsed }
@@ -650,12 +866,16 @@ function printSummary(reports: readonly FixtureReport[], outputPath: string): vo
     'journal ms': round(report.samples[0]?.journalReplayMs ?? 0),
     'clone ms': round(report.samples[0]?.candidateCloneMs ?? 0),
     'incremental traversal ms': round(report.samples[0]?.incrementalTraversalMs ?? 0),
-    'alias rows': report.samples[0]?.aliasRows ?? 0,
+    'hard-link path rows': report.samples[0]?.hardlinkPathRows ?? 0,
     'persistent tables MiB': round((report.samples[0]?.persistentTableBytes ?? 0) / 1024 / 1024),
-    'DB MiB': round(report.summary.databaseBytes.median / 1024 / 1024)
+    'DB MiB': round(report.summary.databaseBytes.median / 1024 / 1024),
+    'resume first page ms': report.summary.resume ? round(report.summary.resume.clickToFirstMetadataPageMs.median) : 0,
+    'resume first preview ms': report.summary.resume ? round(report.summary.resume.clickToFirstMetadataPreviewMs.median) : 0,
+    'resume complete ms': report.summary.resume ? round(report.summary.resume.completionMs.median) : 0
   })))
 }
 
 function round(value: number): number { return Math.round(value * 100) / 100 }
 
-await runBenchmark()
+if (process.argv.includes('--prepare-resume-only')) await runResumePreparationProcess()
+else await runBenchmark()

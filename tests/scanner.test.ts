@@ -265,14 +265,15 @@ describe("Orbis scanner", () => {
       expect("diagnostics" in second).toBe(false)
       expect(withoutElapsed(first.totals)).toEqual(withoutElapsed(second.totals))
       expect(readComparableNodeRows(first.publishedPath)).toEqual(readComparableNodeRows(second.publishedPath))
-      const required = ["preflight", "database-create", "traversal", "aggregation", "index-create", "metadata-write", "database-commit", "database-optimize", "database-close", "publish-rename", "scan-total"]
+      const work = ["scheduler", "metadata-open", "metadata-read", "page-normalize", "aggregation", "metadata-batch-flush", "preview-build", "database-checkpoint", "candidate-finalize"]
+      const required = ["preflight", "database-create", "traversal", ...work, "index-create", "metadata-write", "database-commit", "database-optimize", "database-close", "publish-rename", "scan-total"]
       for (const phase of required) {
         const matches = events.filter((event) => event.phase === phase && event.generation === 11)
         expect(matches).toHaveLength(1)
         expect(matches[0]!.durationMs).toBeGreaterThanOrEqual(0)
       }
       const timings = Object.fromEntries(events.map((event) => [event.phase, event.durationMs]))
-      const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total" && phase !== "aggregation").reduce((sum, [, duration]) => sum + duration, 0)
+      const leaves = Object.entries(timings).filter(([phase]) => phase !== "scan-total" && !work.includes(phase)).reduce((sum, [, duration]) => sum + duration, 0)
       expect(leaves).toBeLessThanOrEqual(timings["scan-total"]! + 0.1)
     } finally {
       if (previousLegacy === undefined) delete process.env.ORBIS_LEGACY_SCAN

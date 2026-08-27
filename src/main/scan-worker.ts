@@ -1,27 +1,9 @@
 import { parentPort, workerData } from "node:worker_threads"
 import { ProgressiveScanControl, ScanCanceledError, type ScanProgress, type ScanResult } from "./scanner"
-import { refreshPersistentIndex, type ActivePersistentIndex } from './refresh-engine'
+import { refreshPersistentIndex } from './refresh-engine'
 import type { JournalCursor } from './index-manifest'
-import { subscribeScanDiagnostics, type OrbisTimingEvent } from "./diagnostics"
-import { readMetadataCursorDiagnostics, resetMetadataCursorDiagnostics, type FolderSizeEstimate, type MetadataCursorDiagnostics } from "./scan-metadata"
-
-interface WorkerStartMessage {
-  readonly type: "start"
-  readonly generation: number
-  readonly requestId: number
-  readonly target: string
-  readonly partialPath: string
-  readonly publishedPath: string
-  readonly indexDirectory: string
-  readonly startupRoot: boolean
-  readonly initialEstimate?: FolderSizeEstimate
-  readonly active?: ActivePersistentIndex
-}
-interface WorkerCancelMessage { readonly type: "cancel"; readonly generation: number; readonly requestId: number }
-interface WorkerPauseMessage { readonly type: 'pause'; readonly generation: number; readonly requestId: number }
-interface WorkerFocusMessage { readonly type: "focus"; readonly generation: number; readonly requestId: number; readonly id: string }
-interface WorkerResolveMessage { readonly type: "resolve-node"; readonly generation: number; readonly requestId: number; readonly id: string }
-type WorkerMessage = WorkerStartMessage | WorkerCancelMessage | WorkerPauseMessage | WorkerFocusMessage | WorkerResolveMessage
+import { emptyScanCounters, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent, type ScanCounterRecord } from "./diagnostics"
+import type { WorkerMessage, WorkerStartMessage } from './scan-execution-protocol'
 
 if (!parentPort) throw new Error("Orbis scan worker requires a parent port")
 const port = parentPort
@@ -63,22 +45,46 @@ function acceptRequest(message: { readonly generation: number; readonly requestI
 
 async function execute(message: WorkerStartMessage, run: NonNullable<typeof active>): Promise<void> {
   const timings: OrbisTimingEvent[] | undefined = process.env.ORBIS_SCAN_DIAGNOSTICS === "1" ? [] : undefined
-  if (timings) resetMetadataCursorDiagnostics()
-  const unsubscribe = timings ? subscribeScanDiagnostics((event) => { if (event.generation === message.generation) timings.push(event) }) : undefined
+  const counters = timings ? emptyScanCounters() : undefined
+  const unsubscribeTiming = timings ? subscribeScanDiagnostics((event) => { if (event.generation === message.generation) timings.push(event) }) : undefined
+  const unsubscribeCounters = counters ? subscribeScanCounters((event) => {
+    if (event.generation === message.generation) counters[event.counter] += event.value
+  }) : undefined
+  let firstMetadataPage = false
+  let firstMetadataPreview = false
+  let acceptedPages = 0
+  const postResumeMilestone = (milestone: 'preparation-started' | 'first-metadata-page' | 'first-metadata-preview'): void => {
+    if (active === run) port.postMessage({ type: 'resume-milestone', generation: message.generation, requestId: run.lastRequestId, milestone })
+  }
   try {
     const outcome = await refreshPersistentIndex({
       generation: message.generation, target: message.target, partialPath: message.partialPath, publishedPath: message.publishedPath,
-      indexDirectory: message.indexDirectory, startupRoot: message.startupRoot,
+      indexDirectory: message.indexDirectory, startupRoot: message.startupRoot, resumeExpected: message.resumeExpected,
       ...(message.initialEstimate ? { initialEstimate: message.initialEstimate } : {}),
       ...(message.active ? { active: message.active } : {}),
       signal: run.abort.signal, control: run.control,
       ...nativeAddonPath(), ...referenceScan(),
       onCheckpoint: (sequence) => { run.checkpointSequence = sequence; run.checkpointCount += 1 },
+      onResumeMilestone: (milestone) => {
+        if (milestone === 'first-metadata-page') firstMetadataPage = true
+        postResumeMilestone(milestone)
+      },
+      ...(benchmarkPageSignals() ? { onMetadataPageAccepted: () => {
+        acceptedPages += 1
+        if (active === run) port.postMessage({ type: 'benchmark-page', generation: message.generation, requestId: run.lastRequestId, page: acceptedPages })
+      } } : {}),
       onProgress: (progress) => { if (active === run) port.postMessage({ type: "progress", generation: message.generation, requestId: run.lastRequestId, progress }) },
-      onPreview: (preview) => { if (active === run) port.postMessage({ type: "preview", generation: message.generation, requestId: run.lastRequestId, preview }) }
+      onPreview: (preview) => {
+        if (active !== run) return
+        if (firstMetadataPage && !firstMetadataPreview) {
+          firstMetadataPreview = true
+          postResumeMilestone('first-metadata-preview')
+        }
+        port.postMessage({ type: "preview", generation: message.generation, requestId: run.lastRequestId, preview })
+      }
     })
     if (active !== run) return
-    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings)
+    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters)
     if (outcome.kind === 'unchanged') {
       port.postMessage({ type: 'unchanged', generation: message.generation, requestId: run.lastRequestId, journal: outcome.journal, totals: outcome.totals, basePublicationId: outcome.basePublicationId })
     } else {
@@ -89,29 +95,30 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
     }
   } catch (error) {
     if (active !== run) return
-    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings)
+    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters)
     if (error instanceof ScanCanceledError || run.abort.signal.aborted) {
       if (run.pauseRequestId !== undefined) port.postMessage({ type: 'paused', generation: message.generation, requestId: run.pauseRequestId, checkpointSequence: run.checkpointSequence })
       else port.postMessage({ type: "canceled", generation: message.generation, requestId: run.lastRequestId })
     }
     else port.postMessage({ type: "error", generation: message.generation, requestId: run.lastRequestId, error: serializeError(error) })
   } finally {
-    unsubscribe?.()
+    unsubscribeTiming?.()
+    unsubscribeCounters?.()
     if (active === run) { active = undefined; port.close() }
   }
 }
 
-function postDiagnostics(generation: number, requestId: number, checkpointCount: number, timings: readonly OrbisTimingEvent[] | undefined): void {
-  if (timings) port.postMessage({
-    type: "diagnostics", generation, requestId, timings, checkpointCount,
-    counters: readMetadataCursorDiagnostics() satisfies MetadataCursorDiagnostics
-  })
+function postDiagnostics(generation: number, requestId: number, checkpointCount: number, timings: readonly OrbisTimingEvent[] | undefined, counters?: ScanCounterRecord): void {
+  if (timings && counters) port.postMessage({ type: "diagnostics", generation, requestId, timings, checkpointCount, counters })
 }
 function nativeAddonPath(): { readonly nativeAddonPath?: string } {
   const value = workerData && typeof workerData === "object" && "nativeAddonPath" in workerData ? (workerData as { nativeAddonPath?: unknown }).nativeAddonPath : undefined
   return typeof value === "string" && value.length > 0 ? { nativeAddonPath: value } : {}
 }
 function referenceScan(): { readonly referenceScan?: true } { return isReferenceScan() ? { referenceScan: true } : {} }
+function benchmarkPageSignals(): boolean {
+  return Boolean(workerData && typeof workerData === 'object' && 'benchmarkPageSignals' in workerData && (workerData as { benchmarkPageSignals?: unknown }).benchmarkPageSignals === true)
+}
 function isReferenceScan(): boolean {
   return Boolean(workerData && typeof workerData === "object" && "referenceScan" in workerData && (workerData as { referenceScan?: unknown }).referenceScan === true)
 }

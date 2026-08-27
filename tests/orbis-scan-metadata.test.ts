@@ -4,16 +4,38 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from "vitest"
 import {
   BulkExactMetadataSource,
+  decodeNativePage,
   NodeDirectoryMetadataSource,
   loadNativeMetadataAddon,
   loadNativeOrbisAddon,
-  readMetadataCursorDiagnostics,
-  resetMetadataCursorDiagnostics,
   type NativeMetadataAddon,
   type NativeDirectoryCursor,
+  type NativeMetadataPage,
+  type NativeMetadataTree,
   type ScanStats
 } from "../src/main/scan-metadata"
 import type { ScanFileSystem } from "../src/main/legacy-scanner"
+import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters } from '../src/main/diagnostics'
+
+interface PackedEntry { name: string; kind: 0 | 1 | 2 | 3; device?: bigint; inode?: bigint; allocatedBytes?: bigint; linkCount?: bigint; mountPoint?: boolean; errno?: number }
+function packed(entries: readonly PackedEntry[], done = true): NativeMetadataPage {
+  const names = entries.map((entry) => Buffer.from(entry.name))
+  const namesLength = names.reduce((sum, name) => sum + name.length, 0)
+  const payload = Buffer.alloc(16 + entries.length * 48 + namesLength)
+  payload.write('ORB1', 0, 'ascii'); payload.writeUInt16LE(1, 4); payload.writeUInt16LE(48, 6)
+  payload.writeUInt32LE(entries.length, 8); payload.writeUInt32LE(namesLength, 12)
+  let nameOffset = 0
+  entries.forEach((entry, index) => {
+    const offset = 16 + index * 48; const name = names[index]!
+    payload.writeUInt32LE(nameOffset, offset); payload.writeUInt32LE(name.length, offset + 4); payload[offset + 8] = entry.kind
+    payload[offset + 9] = (entry.mountPoint ? 1 : 0) | (entry.device === undefined ? 0 : 2) | (entry.inode === undefined ? 0 : 4) | (entry.linkCount === undefined ? 0 : 8) | (entry.errno === undefined ? 0 : 16)
+    payload.writeInt32LE(entry.errno ?? 0, offset + 12); payload.writeBigUInt64LE(entry.device ?? 0n, offset + 16)
+    payload.writeBigUInt64LE(entry.inode ?? 0n, offset + 24); payload.writeBigUInt64LE(entry.allocatedBytes ?? 0n, offset + 32); payload.writeBigUInt64LE(entry.linkCount ?? 0n, offset + 40)
+    name.copy(payload, 16 + entries.length * 48 + nameOffset); nameOffset += name.length
+  })
+  return { payload, count: entries.length, done, bulkEntries: entries.length, fallbackEntries: 0 }
+}
+function tree(cursor: NativeDirectoryCursor): NativeMetadataTree { return { openDirectory: () => cursor, close: () => undefined } }
 
 function stats(kind: "directory" | "file", blocks: number, inode: number): ScanStats {
   return {
@@ -29,38 +51,41 @@ function stats(kind: "directory" | "file", blocks: number, inode: number): ScanS
 describe("Orbis scan metadata adapters", () => {
   it("maps native bulk pages and preserves native counters", async () => {
     const cursor: NativeDirectoryCursor = {
-      readPage: vi.fn(async () => ({
-        entries: [
-          { name: "folder", kind: "directory", device: "7", inode: "2", allocatedBytes: 512, mountPoint: false, errorCode: null },
-          { name: "unreadable", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 13 }
-        ],
-        done: true,
-        bulkEntries: 2,
-        fallbackEntries: 0
-      })),
+      readPage: vi.fn(async () => packed([
+        { name: 'folder', kind: 2, device: 7n, inode: 2n, allocatedBytes: 512n },
+        { name: 'unreadable', kind: 0, errno: 13 }
+      ])),
       close: vi.fn()
     }
-    const addon: NativeMetadataAddon = { openDirectory: vi.fn(() => cursor) }
-    const fileSystem = minimalFileSystem()
-    resetMetadataCursorDiagnostics()
-    const source = new BulkExactMetadataSource(addon, fileSystem)
-    const page = await (await source.open("/target", "/target")).readPage(32, new AbortController().signal)
+    const addon: NativeMetadataAddon = { openMetadataTree: vi.fn(() => tree(cursor)) }
+    const counters = emptyScanCounters()
+    const unsubscribe = subscribeScanCounters((event) => { counters[event.counter] += event.value })
+    const source = new BulkExactMetadataSource(addon.openMetadataTree('/target'), '/target')
+    const page = await runWithScanDiagnostics(1, async () => (await source.open("/target", "/target")).readPage(32, new AbortController().signal))
+    unsubscribe()
 
     expect(page.bulkEntries).toBe(2)
     expect(page.fallbackEntries).toBe(0)
     expect(page.entries[0]).toMatchObject({ name: "folder", kind: "directory", allocatedBytes: 512 })
     expect(page.entries[1]?.error).toBeInstanceOf(Error)
     expect((page.entries[1]?.error as Error & { code?: string }).code).toBe("EACCES")
-    expect(readMetadataCursorDiagnostics()).toMatchObject({ nativeReadPageCalls: 1, nodeReadPageCalls: 0 })
+    expect(counters).toMatchObject({ nativePageReads: 1, nodePageReads: 0, metadataEntries: 2 })
+  })
+
+  it('rejects malformed packed pages', () => {
+    const page = packed([{ name: 'file', kind: 1, device: 1n, inode: 2n }])
+    expect(() => decodeNativePage({ ...page, payload: page.payload.subarray(0, -1) })).toThrow('bounds')
+    const unsupported = Buffer.from(page.payload); unsupported.writeUInt16LE(2, 4)
+    expect(() => decodeNativePage({ ...page, payload: unsupported })).toThrow('header')
   })
 
   it('passes 256 and 512 entry requests to native cursors and caps larger requests', async () => {
     const requested: number[] = []
     const cursor: NativeDirectoryCursor = {
-      readPage: async (limit) => { requested.push(limit); return { entries: [], done: false } },
+      readPage: async (limit) => { requested.push(limit); return packed([], false) },
       close: () => undefined
     }
-    const source = new BulkExactMetadataSource({ openDirectory: () => cursor }, minimalFileSystem())
+    const source = new BulkExactMetadataSource(tree(cursor), '/target')
     const opened = await source.open('/target', '/target')
     const signal = new AbortController().signal
     await opened.readPage(256, signal)
@@ -112,29 +137,22 @@ describe("Orbis scan metadata adapters", () => {
 
   it('maps bulk errno values to code names', async () => {
     const cursor: NativeDirectoryCursor = {
-      readPage: vi.fn(async () => ({
-        entries: [
-          { name: "missing", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 2 },
-          { name: "denied", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 13 },
-          { name: "unknown", kind: "other", device: "", inode: "", allocatedBytes: 0, mountPoint: false, errorCode: 99 }
-        ],
-        done: true,
-        bulkEntries: 3,
-        fallbackEntries: 0
-      })),
+      readPage: vi.fn(async () => packed([
+        { name: 'missing', kind: 0, errno: 2 }, { name: 'denied', kind: 0, errno: 13 }, { name: 'unknown', kind: 0, errno: 99 }
+      ])),
       close: vi.fn()
     }
-    const source = new BulkExactMetadataSource({ openDirectory: () => cursor }, minimalFileSystem())
+    const source = new BulkExactMetadataSource(tree(cursor), '/target')
     const page = await (await source.open('/target', '/target')).readPage(32, new AbortController().signal)
     const codes = page.entries.map((entry) => (entry.error as Error & { code?: string }).code)
     expect(codes).toEqual(["ENOENT", "EACCES", "99"])
   })
 
   it('clamps bulk page concurrency to the supported range', () => {
-    const addon: NativeMetadataAddon = { openDirectory: () => ({ readPage: async () => ({ entries: [], done: true }), close: () => undefined }) }
-    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 0).pageConcurrency).toBe(1)
-    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 8).pageConcurrency).toBe(8)
-    expect(new BulkExactMetadataSource(addon, minimalFileSystem(), 128).pageConcurrency).toBe(64)
+    const nativeTree = tree({ readPage: async () => packed([]), close: () => undefined })
+    expect(new BulkExactMetadataSource(nativeTree, '/target', 0).pageConcurrency).toBe(1)
+    expect(new BulkExactMetadataSource(nativeTree, '/target', 8).pageConcurrency).toBe(8)
+    expect(new BulkExactMetadataSource(nativeTree, '/target', 128).pageConcurrency).toBe(64)
   })
 
   it('can disable bulk metadata without disabling the FSEvents addon API', async () => {

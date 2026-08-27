@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ConstructionDatabase, type ConstructionPage } from '../src/main/construction-database'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
+import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters } from '../src/main/diagnostics'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -78,6 +79,52 @@ describe('ConstructionDatabase construction lifecycle', () => {
     const afterResume = new DatabaseSync(join(directory, 'partial.sqlite'), { readOnly: true })
     try { expect(afterResume.prepare('SELECT phase, checkpoint_sequence AS sequence FROM scan_run').get()).toEqual({ phase: 'scanning', sequence: 2 }) }
     finally { afterResume.close() }
+  })
+
+  it('restores a singleton surviving hard-link owner before replaying aliases', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-hardlink-recovery-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const sourceId = `n-${createHmac('sha256', Buffer.from(database.nodeIdSeed, 'hex')).update('sources').update('\0').update('file').digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+    database.accept({ kind: 'page', page: page([
+      { kind: 'node', node: { node: { id: 'sources', parentId: 'root', name: 'Z-sources', path: join(directory, 'Z-sources'), kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'Z-sources' } },
+      { kind: 'node', node: { node: { id: 'aliases', parentId: 'root', name: 'A-aliases', path: join(directory, 'A-aliases'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'A-aliases' } }
+    ]) })
+    database.takeWork({ limit: 2, focusTurns: 0 })
+    database.accept({ kind: 'page', page: { ...page([
+      { kind: 'node', node: { node: { id: sourceId, parentId: 'sources', name: 'file', path: join(directory, 'Z-sources', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '50' }, pathKey: 'Z-sources/file', linkCount: 2 } }
+    ], true, 0, 'sources'), depth: 1 } })
+    database.checkpoint({ reason: 'scheduled' })
+    database.abort()
+
+    const resumed = ConstructionDatabase.openResumable(path)
+    try {
+      const recovery = resumed.recoverIncompleteDirectories()
+      expect(recovery.reset).toBeGreaterThan(0)
+      expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: sourceId, pathKey: 'Z-sources/file' })
+    } finally { resumed.abort() }
+  })
+
+  it('counts durable checkpoints without treating terminal commit as another checkpoint', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-checkpoint-counter-'))
+    cleanup.push(directory)
+    const counters = emptyScanCounters()
+    const sequences: number[] = []
+    const unsubscribe = subscribeScanCounters((event) => { if (event.generation === 31) counters[event.counter] += event.value })
+    try {
+      runWithScanDiagnostics(31, () => {
+        const database = ConstructionDatabase.create(join(directory, 'partial.sqlite'), {
+          ...options(), onCheckpoint: (_reason, sequence) => sequences.push(sequence)
+        })
+        database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+        database.checkpoint({ reason: 'startup' })
+        database.complete()
+      })
+    } finally { unsubscribe() }
+    expect(sequences).toEqual([1])
+    expect(counters.databaseCheckpoints).toBe(sequences.length)
   })
 
   it('migrates a legacy traversing phase into the explicit scanning phase on resume', async () => {

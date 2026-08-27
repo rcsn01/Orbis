@@ -7,7 +7,7 @@ import type { FolderSizeEstimate } from "./scan-metadata"
 import { NodeReadModel, toSummary } from "./index-store"
 import type { ChartDataSource } from "./index-store"
 import type { DatabaseNode, InsertNode, ScanDatabaseMeta } from "./database"
-import { measureScan } from "./diagnostics"
+import { createScanTimingAccumulator, measureScan, measureScanWork, recordScanCounter } from "./diagnostics"
 import {
   EXCLUSION_POLICY_VERSION, HARD_LINK_ORDERING_VERSION, PERSISTENT_ACCOUNTING_VERSION,
   PERSISTENT_INDEX_SCHEMA_VERSION
@@ -30,6 +30,15 @@ export interface ConstructionWorkBatch {
   readonly work: readonly DirectoryTask[]
   readonly focusTurns: number
   readonly done: boolean
+}
+
+export interface ConstructionRecoveryReport {
+  readonly retained: number
+  readonly reset: number
+  readonly deletedNodes: number
+  readonly affectedHardlinkIdentities: number
+  readonly repairedAncestors: number
+  readonly repairedSchedulerRows: number
 }
 
 export type ConstructionErrorCode =
@@ -172,7 +181,7 @@ interface PendingFileNode {
   readonly depth: number
 }
 
-interface PendingFileAlias {
+interface PendingHardLinkPath {
   readonly parentId: string
   readonly name: string
   readonly pathKey: string
@@ -191,7 +200,7 @@ interface MetadataBatch {
   readonly directChildDeltas: Map<string, number>
   readonly observationDeltas: Map<string, ObservationDelta>
   readonly fileNodes: Map<string, PendingFileNode>
-  readonly fileAliases: PendingFileAlias[]
+  readonly hardlinkPaths: PendingHardLinkPath[]
   readonly hardLinkOwners: Map<string, PendingHardLinkOwner>
 }
 
@@ -203,6 +212,7 @@ export interface ProgressiveConstructionOptions {
   readonly journalBaseline: string
   readonly candidatePath?: string
   readonly clock?: () => number
+  readonly onCheckpoint?: (reason: ConstructionCheckpointReason, sequence: number) => void
 }
 
 export interface ProgressiveSemanticTotals {
@@ -224,6 +234,7 @@ export class ConstructionDatabase implements ChartDataSource {
   readonly #candidatePath: string | undefined
   readonly #clock: () => number
   readonly #resumable: boolean
+  readonly #onCheckpoint: ((reason: ConstructionCheckpointReason, sequence: number) => void) | undefined
   readonly #database: DatabaseSync
   readonly #insertNode: StatementSync
   readonly #insertFileNodeBatch: StatementSync
@@ -233,8 +244,8 @@ export class ConstructionDatabase implements ChartDataSource {
   readonly #incrementEnqueue: StatementSync
   readonly #incrementDirectChildren: StatementSync
   readonly #observeSkipped: StatementSync
-  readonly #insertFileAlias: StatementSync
-  readonly #insertFileAliasBatch: StatementSync
+  readonly #insertHardLinkPath: StatementSync
+  readonly #insertHardLinkPathBatch: StatementSync
   readonly #getHardLinkOwner: StatementSync
   readonly #setHardLinkOwner: StatementSync
   readonly #setHardLinkOwnerBatch: StatementSync
@@ -249,6 +260,8 @@ export class ConstructionDatabase implements ChartDataSource {
   readonly #deleteEstimateStatement: StatementSync
   readonly #taskIsFocused: StatementSync
   readonly #parentIdStatement: StatementSync
+  readonly #selectReadyFocused: StatementSync
+  readonly #selectReadyNormal: StatementSync
   readonly #readModel: NodeReadModel
   readonly #estimateRootNames = new Set<string>()
   // The metadata batch is a long-lived accumulator: it survives across
@@ -257,7 +270,7 @@ export class ConstructionDatabase implements ChartDataSource {
   // never batched, so scheduling stays immediate.
   #metadataBatch: MetadataBatch = {
     ancestorDeltas: new Map(), directChildDeltas: new Map(), observationDeltas: new Map(),
-    fileNodes: new Map(), fileAliases: [], hardLinkOwners: new Map()
+    fileNodes: new Map(), hardlinkPaths: [], hardLinkOwners: new Map()
   }
   #inMetadataOperation = false
   #consumedEstimateRoots = new Set<string>()
@@ -270,19 +283,21 @@ export class ConstructionDatabase implements ChartDataSource {
   #state: State = "building"
   #rootNodeId: string | undefined
   readonly #leasedTaskIds: string[] = []
+  #pendingSubtrees = 0
 
   static create(path: string, options: ProgressiveConstructionOptions): ConstructionDatabase {
     return new ConstructionDatabase(path, options, false)
   }
 
-  static openResumable(path: string, options?: Pick<ProgressiveConstructionOptions, "candidatePath" | "clock">): ConstructionDatabase {
+  static openResumable(path: string, options?: Pick<ProgressiveConstructionOptions, "candidatePath" | "clock" | "onCheckpoint">): ConstructionDatabase {
     return new ConstructionDatabase(path, options, true)
   }
 
-  constructor(path: string, options?: ProgressiveConstructionOptions | Pick<ProgressiveConstructionOptions, "candidatePath" | "clock">, openExisting = false) {
+  constructor(path: string, options?: ProgressiveConstructionOptions | Pick<ProgressiveConstructionOptions, "candidatePath" | "clock" | "onCheckpoint">, openExisting = false) {
     this.#path = path
     this.#candidatePath = options?.candidatePath
     this.#clock = options?.clock ?? Date.now
+    this.#onCheckpoint = options?.onCheckpoint
     this.#lastBatchFlushAt = this.#clock()
     this.#resumable = openExisting || Boolean(options && 'scanId' in options)
     this.#database = new DatabaseSync(path)
@@ -316,9 +331,13 @@ export class ConstructionDatabase implements ChartDataSource {
           enqueue_order INTEGER NOT NULL,
           focused INTEGER NOT NULL DEFAULT 0,
           status TEXT NOT NULL CHECK (status IN ('queued', 'scanning', 'complete', 'unreadable')),
-          entries_read INTEGER NOT NULL DEFAULT 0
+          entries_read INTEGER NOT NULL DEFAULT 0,
+          ready INTEGER NOT NULL CHECK (ready IN (0,1)),
+          pending_children INTEGER NOT NULL DEFAULT 0 CHECK (pending_children >= 0),
+          subtree_complete INTEGER NOT NULL DEFAULT 0 CHECK (subtree_complete IN (0,1)),
+          shallow_band INTEGER NOT NULL CHECK (shallow_band IN (0,1))
         );
-        CREATE INDEX tasks_schedule ON directory_tasks (focused DESC, status, depth, enqueue_order);
+        CREATE INDEX tasks_ready_schedule ON directory_tasks (ready, focused, status, shallow_band, depth, enqueue_order);
         CREATE TABLE hardlink_owners (
           device TEXT NOT NULL,
           inode TEXT NOT NULL,
@@ -326,7 +345,7 @@ export class ConstructionDatabase implements ChartDataSource {
           path_key TEXT NOT NULL,
           PRIMARY KEY (device, inode)
         );
-        CREATE TABLE file_aliases (
+        CREATE TABLE hardlink_paths (
           parent_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
           name TEXT NOT NULL,
           path_key TEXT PRIMARY KEY,
@@ -335,12 +354,12 @@ export class ConstructionDatabase implements ChartDataSource {
           allocated_bytes INTEGER NOT NULL CHECK (allocated_bytes >= 0),
           UNIQUE (parent_id, name)
         );
-        CREATE INDEX file_aliases_parent ON file_aliases (parent_id);
-        CREATE INDEX file_aliases_identity_path ON file_aliases (device, inode, path_key);
+        CREATE INDEX hardlink_paths_parent ON hardlink_paths (parent_id);
+        CREATE INDEX hardlink_paths_identity_path ON hardlink_paths (device, inode, path_key);
         CREATE TABLE hardlink_groups (
           device TEXT NOT NULL,
           inode TEXT NOT NULL,
-          owner_path_key TEXT NOT NULL REFERENCES file_aliases(path_key),
+          owner_path_key TEXT NOT NULL REFERENCES hardlink_paths(path_key),
           node_id TEXT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
           allocated_bytes INTEGER NOT NULL CHECK (allocated_bytes >= 0),
           PRIMARY KEY (device, inode)
@@ -422,8 +441,8 @@ export class ConstructionDatabase implements ChartDataSource {
         FROM json_each(?)
       `)
       this.#insertTask = this.#database.prepare(`
-        INSERT INTO directory_tasks (node_id, path, depth, enqueue_order, focused, status)
-        VALUES (?, ?, ?, (SELECT value FROM scan_state WHERE key = 'enqueue'), ?, 'queued')
+        INSERT INTO directory_tasks (node_id, path, depth, enqueue_order, focused, status, ready, shallow_band)
+        VALUES (?, ?, ?, (SELECT value FROM scan_state WHERE key = 'enqueue'), ?, 'queued', ?, ?)
       `)
       this.#insertMetadata = this.#database.prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
       this.#insertDirectoryObservation = this.#database.prepare("INSERT INTO directory_observations (node_id, enumeration_status) VALUES (?, ?)")
@@ -435,11 +454,11 @@ export class ConstructionDatabase implements ChartDataSource {
           direct_symlink_count = direct_symlink_count + ?, direct_nested_mount_count = direct_nested_mount_count + ?,
           direct_duplicate_count = direct_duplicate_count + ? WHERE node_id = ?
       `)
-      this.#insertFileAlias = this.#database.prepare(`
-        INSERT INTO file_aliases (parent_id, name, path_key, device, inode, allocated_bytes) VALUES (?, ?, ?, ?, ?, ?)
+      this.#insertHardLinkPath = this.#database.prepare(`
+        INSERT INTO hardlink_paths (parent_id, name, path_key, device, inode, allocated_bytes) VALUES (?, ?, ?, ?, ?, ?)
       `)
-      this.#insertFileAliasBatch = this.#database.prepare(`
-        INSERT INTO file_aliases (parent_id, name, path_key, device, inode, allocated_bytes)
+      this.#insertHardLinkPathBatch = this.#database.prepare(`
+        INSERT INTO hardlink_paths (parent_id, name, path_key, device, inode, allocated_bytes)
         SELECT json_extract(value, '$.parentId'), json_extract(value, '$.name'), json_extract(value, '$.pathKey'),
           json_extract(value, '$.device'), json_extract(value, '$.inode'), json_extract(value, '$.allocatedBytes')
         FROM json_each(?)
@@ -484,6 +503,12 @@ export class ConstructionDatabase implements ChartDataSource {
       this.#deleteEstimateStatement = this.#database.prepare("DELETE FROM size_estimates WHERE node_id = ?")
       this.#taskIsFocused = this.#database.prepare("SELECT focused FROM directory_tasks WHERE node_id = ?")
       this.#parentIdStatement = this.#database.prepare("SELECT parent_id AS parentId FROM nodes WHERE id = ?")
+      const readySelect = `SELECT node_id AS id, path, depth, focused, entries_read AS entriesRead
+        FROM directory_tasks WHERE ready = 1 AND focused = ? AND status IN ('queued', 'scanning')
+        ORDER BY shallow_band, depth, enqueue_order LIMIT ?`
+      this.#selectReadyFocused = this.#database.prepare(readySelect)
+      this.#selectReadyNormal = this.#database.prepare(readySelect)
+      this.#pendingSubtrees = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks WHERE subtree_complete = 0').get() as { count: number }).count)
       const estimateRoots = this.#database.prepare("SELECT name FROM estimate_roots").all() as unknown as Array<{ name: string }>
       for (const estimate of estimateRoots) this.#estimateRootNames.add(estimate.name)
       this.#database.exec("BEGIN")
@@ -584,7 +609,10 @@ export class ConstructionDatabase implements ChartDataSource {
 
   #queue(id: string, path: string, depth: number, focused: boolean): void {
     this.#incrementEnqueue.run()
-    this.#insertTask.run(id, path, depth, focused ? 1 : 0)
+    const parentId = this.#parentId(id)
+    this.#insertTask.run(id, path, depth, focused ? 1 : 0, parentId ? 0 : 1, depth <= 6 ? 0 : 1)
+    if (parentId) this.#database.prepare('UPDATE directory_tasks SET pending_children = pending_children + 1 WHERE node_id = ?').run(parentId)
+    this.#pendingSubtrees += 1
   }
 
   takeWork(request: ConstructionWorkRequest): ConstructionWorkBatch {
@@ -592,52 +620,24 @@ export class ConstructionDatabase implements ChartDataSource {
     if (this.#leasedTaskIds.length > 0) throw new ConstructionError("illegal-transition", "Construction work is already leased")
     const limit = Math.max(1, Math.floor(request.limit))
     let focusTurns = Math.max(0, Math.floor(request.focusTurns))
-    const reserved = new Set<string>()
+    type ReadyRow = { id: string; path: string; depth: number; focused: number; entriesRead: number }
+    const focused = this.#selectReadyFocused.all(1, limit) as unknown as ReadyRow[]
+    const normal = this.#selectReadyNormal.all(0, limit) as unknown as ReadyRow[]
+    recordScanCounter('schedulerSelects', 2)
+    let focusedIndex = 0
+    let normalIndex = 0
     const work: DirectoryTask[] = []
-    while (work.length < limit) {
-      const focusedAvailable = this.hasPendingTasks(true)
-      const normalAvailable = this.hasPendingTasks(false)
-      const takeFocused = focusedAvailable && (focusTurns < 3 || !normalAvailable)
-      let task = this.nextTask(takeFocused, reserved)
-      if (!task) task = this.nextTask(!takeFocused, reserved)
-      if (!task) break
-      reserved.add(task.id)
-      work.push(task)
-      if (task.focused) focusTurns += 1
+    while (work.length < limit && (focusedIndex < focused.length || normalIndex < normal.length)) {
+      const takeFocused = focusedIndex < focused.length && (focusTurns < 3 || normalIndex >= normal.length)
+      const row = takeFocused ? focused[focusedIndex++]! : normal[normalIndex++]!
+      work.push({ id: row.id, path: row.path, depth: Number(row.depth), focused: Boolean(row.focused), entriesRead: Number(row.entriesRead) })
+      if (row.focused) focusTurns += 1
       else focusTurns = 0
-      if (task.focused && focusTurns >= 3 && this.hasPendingTasks(false)) focusTurns = 3
+      if (row.focused && focusTurns >= 3 && normalIndex < normal.length) focusTurns = 3
     }
     this.#leasedTaskIds.push(...work.map((task) => task.id))
-    return { work, focusTurns, done: work.length === 0 && !this.hasPendingTasks() }
-  }
-
-  nextTask(focused: boolean, excludedIds: ReadonlySet<string> = new Set()): DirectoryTask | undefined {
-    this.#assertBuilding()
-    const exclusions = [...excludedIds]
-    const excludedClause = exclusions.length > 0 ? `AND task.node_id NOT IN (${exclusions.map(() => "?").join(",")})` : ""
-    const row = this.#database.prepare(`
-      SELECT task.node_id AS id, task.path, task.depth, task.focused, task.entries_read AS entriesRead
-      FROM directory_tasks task
-      WHERE task.focused = ? AND task.status IN ('queued', 'scanning')
-        ${excludedClause}
-        AND NOT EXISTS (
-          WITH RECURSIVE ancestors(id, parent_id, enumeration_complete) AS (
-            SELECT parent.id, parent.parent_id, parent.enumeration_complete
-            FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE child.id = task.node_id
-            UNION ALL SELECT parent.id, parent.parent_id, parent.enumeration_complete
-            FROM nodes parent JOIN ancestors child ON parent.id = child.parent_id
-          ) SELECT 1 FROM ancestors WHERE enumeration_complete = 0
-        )
-      ORDER BY CASE WHEN task.depth <= 6 THEN 0 ELSE 1 END, task.depth, task.enqueue_order
-      LIMIT 1
-    `).get(focused ? 1 : 0, ...exclusions) as unknown as { id: string; path: string; depth: number; focused: number; entriesRead: number } | undefined
-    return row ? { id: row.id, path: row.path, depth: Number(row.depth), focused: Boolean(row.focused), entriesRead: Number(row.entriesRead) } : undefined
-  }
-
-  hasPendingTasks(focused?: boolean): boolean {
-    const predicate = focused === undefined ? "status IN ('queued', 'scanning')" : "focused = ? AND status IN ('queued', 'scanning')"
-    const row = this.#database.prepare(`SELECT 1 AS found FROM directory_tasks WHERE ${predicate} LIMIT 1`).get(...(focused === undefined ? [] : [focused ? 1 : 0])) as { found?: number } | undefined
-    return row?.found === 1
+    if (work.length === 0 && this.#pendingSubtrees > 0) throw new ConstructionError('pending-work', 'Construction has pending subtrees but no ready work')
+    return { work, focusTurns, done: work.length === 0 && this.#pendingSubtrees === 0 }
   }
 
   startTask(id: string): void {
@@ -722,8 +722,8 @@ export class ConstructionDatabase implements ChartDataSource {
 
     const { node, pathKey, linkCount } = entry.node
     const bytes = safeBytes(node.ownBytes)
-    if (node.kind === "file" && node.parentId) this.insertFileAlias(node.parentId, node.name, pathKey, node.device, node.inode, bytes)
     const needsHardLinkOwnership = node.kind === "file" && node.device !== "" && node.inode !== "" && linkCount !== 1
+    if (needsHardLinkOwnership && node.parentId) this.insertHardLinkPath(node.parentId, node.name, pathKey, node.device, node.inode, bytes)
     let replacingOwner = false
     if (needsHardLinkOwnership) {
       const owner = this.getHardLinkOwner(node.device, node.inode)
@@ -763,7 +763,7 @@ export class ConstructionDatabase implements ChartDataSource {
     // entries the task queue never counted.
     const snapshot = {
       fileNodes: new Map(batch.fileNodes),
-      fileAliases: batch.fileAliases.slice(),
+      hardlinkPaths: batch.hardlinkPaths.slice(),
       hardLinkOwners: new Map(batch.hardLinkOwners),
       ancestorDeltas: new Map([...batch.ancestorDeltas].map(([key, delta]) => [key, { ...delta }])),
       directChildDeltas: new Map(batch.directChildDeltas),
@@ -789,7 +789,7 @@ export class ConstructionDatabase implements ChartDataSource {
 
   #restoreBatchSnapshot(batch: MetadataBatch, snapshot: {
     readonly fileNodes: Map<string, PendingFileNode>
-    readonly fileAliases: PendingFileAlias[]
+    readonly hardlinkPaths: PendingHardLinkPath[]
     readonly hardLinkOwners: Map<string, PendingHardLinkOwner>
     readonly ancestorDeltas: Map<string, AncestorDelta>
     readonly directChildDeltas: Map<string, number>
@@ -799,8 +799,8 @@ export class ConstructionDatabase implements ChartDataSource {
   }): void {
     batch.fileNodes.clear()
     for (const [key, node] of snapshot.fileNodes) batch.fileNodes.set(key, node)
-    batch.fileAliases.length = 0
-    batch.fileAliases.push(...snapshot.fileAliases)
+    batch.hardlinkPaths.length = 0
+    batch.hardlinkPaths.push(...snapshot.hardlinkPaths)
     batch.hardLinkOwners.clear()
     for (const [key, owner] of snapshot.hardLinkOwners) batch.hardLinkOwners.set(key, owner)
     batch.ancestorDeltas.clear()
@@ -822,8 +822,12 @@ export class ConstructionDatabase implements ChartDataSource {
   }
 
   #flushMetadataBatch(batch: MetadataBatch): void {
+    const rows = batch.fileNodes.size + batch.hardlinkPaths.length + batch.hardLinkOwners.size
+      + batch.ancestorDeltas.size + batch.directChildDeltas.size + batch.observationDeltas.size
+    if (rows === 0) return
+    measureScanWork('metadata-batch-flush', () => {
     if (batch.fileNodes.size > 0) this.#insertFileNodeBatch.run(JSON.stringify([...batch.fileNodes.values()]))
-    if (batch.fileAliases.length > 0) this.#insertFileAliasBatch.run(JSON.stringify(batch.fileAliases))
+    if (batch.hardlinkPaths.length > 0) this.#insertHardLinkPathBatch.run(JSON.stringify(batch.hardlinkPaths))
     if (batch.hardLinkOwners.size > 0) this.#setHardLinkOwnerBatch.run(JSON.stringify([...batch.hardLinkOwners.values()]))
     for (const [nodeId, delta] of batch.ancestorDeltas) {
       if (delta.bytes === 0 && delta.descendants === 0 && delta.unreadable === 0) continue
@@ -837,16 +841,24 @@ export class ConstructionDatabase implements ChartDataSource {
       this.#observeSkipped.run(delta.skipped, delta.unreadable, delta.disappearing, delta.symlinks, delta.nestedMounts, delta.duplicates, id)
     }
     batch.fileNodes.clear()
-    batch.fileAliases.length = 0
+    batch.hardlinkPaths.length = 0
     batch.hardLinkOwners.clear()
     batch.ancestorDeltas.clear()
     batch.directChildDeltas.clear()
     batch.observationDeltas.clear()
     this.#lastBatchFlushAt = this.#clock()
+    })
+    recordScanCounter('metadataBatchFlushes')
+    recordScanCounter('metadataRowsFlushed', rows)
   }
 
   #flushPendingMetadataBatch(): void {
     this.#flushMetadataBatch(this.#metadataBatch)
+  }
+
+  preparePreviewReadModel(): void {
+    this.#assertBuilding()
+    this.#flushPendingMetadataBatch()
   }
 
   #applyDirectChildDelta(parentId: string, delta: number): void {
@@ -871,7 +883,9 @@ export class ConstructionDatabase implements ChartDataSource {
     this.#database.prepare("UPDATE nodes SET enumeration_complete = 1 WHERE id = ?").run(id)
     this.#database.prepare("UPDATE directory_tasks SET status = 'complete' WHERE node_id = ?").run(id)
     this.#database.prepare("UPDATE directory_observations SET enumeration_status = 'complete' WHERE node_id = ?").run(id)
-    this.#completeReady(id)
+    this.#database.prepare(`UPDATE directory_tasks SET ready = 1 WHERE node_id IN
+      (SELECT id FROM nodes WHERE parent_id = ?) AND status IN ('queued', 'scanning')`).run(id)
+    this.#settleReadyTasks(id)
   }
 
   markUnreadable(id: string, disappearing = false): void {
@@ -880,7 +894,7 @@ export class ConstructionDatabase implements ChartDataSource {
     this.#database.prepare(`
       UPDATE directory_observations SET enumeration_status = 'unreadable', direct_skipped_count = direct_skipped_count + 1,
         direct_unreadable_count = direct_unreadable_count + ?, direct_disappearing_count = direct_disappearing_count + ? WHERE node_id = ?
-    `).run(disappearing ? 0 : 1, disappearing ? 1 : 0, id)
+    `).run(1, disappearing ? 1 : 0, id)
     this.#deleteEstimate(id)
     // The unreadable node never completes, so push its accumulated state to
     // the parent now: its own unreadable flag counts on itself and every
@@ -890,8 +904,9 @@ export class ConstructionDatabase implements ChartDataSource {
     // completion walk reaches this node.
     this.#applyNodeDeltaStatement.run(0, 0, 1, id)
     this.#propagateToParent(id)
-    const parent = this.#parentId(id)
-    if (parent) this.#completeReady(parent)
+    this.#database.prepare(`UPDATE directory_tasks SET ready = 1 WHERE node_id IN
+      (SELECT id FROM nodes WHERE parent_id = ?) AND status IN ('queued', 'scanning')`).run(id)
+    this.#settleReadyTasks(id)
   }
 
   observeSkipped(id: string, observation: { readonly unreadable?: boolean; readonly disappearing?: boolean; readonly symlink?: boolean; readonly nestedMount?: boolean; readonly duplicate?: boolean } = {}): void {
@@ -915,37 +930,36 @@ export class ConstructionDatabase implements ChartDataSource {
     batch.observationDeltas.set(id, current)
   }
 
-  insertFileAlias(parentId: string, name: string, pathKey: string, device: string, inode: string, allocatedBytes: number): void {
+  insertHardLinkPath(parentId: string, name: string, pathKey: string, device: string, inode: string, allocatedBytes: number): void {
+    recordScanCounter('hardlinkPathRows')
     const bytes = safeBytes(allocatedBytes)
     const batch = this.#metadataBatch
-    if (batch) batch.fileAliases.push({ parentId, name, pathKey, device, inode, allocatedBytes: bytes })
-    else this.#insertFileAlias.run(parentId, name, pathKey, device, inode, bytes)
+    if (batch) batch.hardlinkPaths.push({ parentId, name, pathKey, device, inode, allocatedBytes: bytes })
+    else this.#insertHardLinkPath.run(parentId, name, pathKey, device, inode, bytes)
   }
 
-  #completeReady(startId: string): void {
+  #settleReadyTasks(startId: string): void {
     let id: string | null = startId
     while (id) {
-      const row = this.#database.prepare(`
-        WITH RECURSIVE subtree(id) AS (
-          SELECT id FROM nodes WHERE id = ?
-          UNION ALL SELECT child.id FROM nodes child JOIN subtree parent ON child.parent_id = parent.id WHERE child.kind = 'directory'
-        )
-        SELECT nodes.enumeration_complete AS enumerationComplete, nodes.scan_state AS scanState,
-          EXISTS(SELECT 1 FROM directory_tasks task JOIN subtree ON subtree.id = task.node_id WHERE task.status IN ('queued', 'scanning')) AS pending
-        FROM nodes WHERE nodes.id = ?
-      `).get(id, id) as unknown as { enumerationComplete: number; scanState: string; pending: number } | undefined
-      if (!row || !row.enumerationComplete || row.pending) break
+      const row = this.#database.prepare(`SELECT task.pending_children AS pendingChildren,
+        task.subtree_complete AS subtreeComplete, task.status, nodes.scan_state AS scanState
+        FROM directory_tasks task JOIN nodes ON nodes.id = task.node_id WHERE task.node_id = ?`).get(id) as unknown as
+        { pendingChildren: number; subtreeComplete: number; status: string; scanState: string } | undefined
+      if (!row || row.subtreeComplete || row.pendingChildren !== 0 || row.status !== 'complete' && row.status !== 'unreadable') break
       this.#deleteEstimate(id)
-      if (row.scanState === "unreadable") {
-        // The unreadable node never transitions, but its subtree may finish
-        // after it was marked (children queued before the failure). Push the
-        // delta accumulated since the last propagation to the parent.
-        this.#propagateToParent(id)
-      } else if (row.scanState !== "complete") {
+      if (row.scanState === 'unreadable') this.#propagateToParent(id)
+      else if (row.scanState !== 'complete') {
         this.#database.prepare("UPDATE nodes SET scan_state = 'complete' WHERE id = ?").run(id)
         this.#propagateToParent(id)
       }
-      id = this.#parentId(id)
+      this.#database.prepare('UPDATE directory_tasks SET subtree_complete = 1, ready = 0 WHERE node_id = ?').run(id)
+      recordScanCounter('completionTransitions')
+      this.#pendingSubtrees -= 1
+      const parent = this.#parentId(id)
+      if (!parent) break
+      const changed = this.#database.prepare('UPDATE directory_tasks SET pending_children = pending_children - 1 WHERE node_id = ? AND pending_children > 0').run(parent)
+      if (Number(changed.changes) !== 1) throw new ConstructionError('pending-work', `Invalid pending child count for ${parent}`)
+      id = parent
     }
   }
 
@@ -1073,9 +1087,12 @@ export class ConstructionDatabase implements ChartDataSource {
     this.#database.prepare(`UPDATE scan_run SET checkpoint_sequence = checkpoint_sequence + 1,
       active_elapsed_ms = active_elapsed_ms + ?, checkpointed_at = ? WHERE singleton = 1`)
       .run(Math.max(0, Math.floor(normalized.activeElapsedDeltaMs ?? 0)), new Date(this.#clock()).toISOString())
-    measureScan('database-checkpoint', () => this.#database.exec('COMMIT'))
+    measureScanWork('database-checkpoint', () => this.#database.exec('COMMIT'))
+    recordScanCounter('databaseCheckpoints')
     this.#database.exec('BEGIN')
-    return this.checkpointSequence
+    const sequence = this.checkpointSequence
+    this.#onCheckpoint?.(normalized.reason ?? 'scheduled', sequence)
+    return sequence
   }
 
   finish(command: ConstructionFinishCommand): ConstructionFinishResult {
@@ -1179,33 +1196,56 @@ export class ConstructionDatabase implements ChartDataSource {
     }
   }
 
-  recoverIncompleteDirectories(): { readonly retained: number; readonly reset: number } {
+  recoverIncompleteDirectories(): ConstructionRecoveryReport {
     this.#assertBuilding()
-    this.#database.exec(`
-      CREATE TEMP TABLE recovery_roots (id TEXT PRIMARY KEY);
-      INSERT INTO recovery_roots SELECT task.node_id FROM directory_tasks task
-      WHERE task.status IN ('queued', 'scanning') AND NOT EXISTS (
-        WITH RECURSIVE ancestors(id, parent_id) AS (
-          SELECT parent.id, parent.parent_id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE child.id = task.node_id
-          UNION ALL SELECT parent.id, parent.parent_id FROM nodes parent JOIN ancestors child ON parent.id = child.parent_id
-        ) SELECT 1 FROM ancestors JOIN directory_tasks ancestor_task ON ancestor_task.node_id = ancestors.id
-          WHERE ancestor_task.status IN ('queued', 'scanning')
-      );
-      DELETE FROM file_aliases WHERE parent_id IN (SELECT id FROM recovery_roots);
-      DELETE FROM nodes WHERE parent_id IN (SELECT id FROM recovery_roots);
-      DELETE FROM hardlink_owners;
-      UPDATE nodes SET size_bytes = own_bytes, direct_children = 0, descendant_count = 0,
-        unreadable_count = own_unreadable, scan_state = 'queued', enumeration_complete = 0 WHERE id IN (SELECT id FROM recovery_roots);
-      UPDATE directory_tasks SET status = 'queued', entries_read = 0 WHERE node_id IN (SELECT id FROM recovery_roots);
-      UPDATE directory_observations SET direct_skipped_count = 0, direct_unreadable_count = 0,
-        direct_disappearing_count = 0, direct_symlink_count = 0, direct_nested_mount_count = 0,
-        direct_duplicate_count = 0, enumeration_status = 'queued' WHERE node_id IN (SELECT id FROM recovery_roots);
-    `)
-    this.#rebuildConstructionState()
-    const counts = this.#database.prepare(`SELECT (SELECT COUNT(*) FROM directory_tasks WHERE status IN ('complete', 'unreadable')) AS retained,
-      (SELECT COUNT(*) FROM recovery_roots) AS reset`).get() as { retained: number; reset: number }
-    this.#database.exec('DROP TABLE recovery_roots')
-    return { retained: Number(counts.retained), reset: Number(counts.reset) }
+    const schedulerTiming = createScanTimingAccumulator('resume-scheduler-repair')
+    try {
+      this.#database.exec(`
+        CREATE TEMP TABLE recovery_roots (id TEXT PRIMARY KEY);
+        INSERT INTO recovery_roots SELECT task.node_id FROM directory_tasks task
+        WHERE task.status IN ('queued', 'scanning') AND NOT EXISTS (
+          WITH RECURSIVE ancestors(id, parent_id) AS (
+            SELECT parent.id, parent.parent_id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE child.id = task.node_id
+            UNION ALL SELECT parent.id, parent.parent_id FROM nodes parent JOIN ancestors child ON parent.id = child.parent_id
+          ) SELECT 1 FROM ancestors JOIN directory_tasks ancestor_task ON ancestor_task.node_id = ancestors.id
+            WHERE ancestor_task.status IN ('queued', 'scanning')
+        );
+      `)
+      const deletedNodes = Number((this.#database.prepare(`WITH RECURSIVE reset_nodes(id) AS (
+        SELECT nodes.id FROM nodes JOIN recovery_roots ON nodes.parent_id = recovery_roots.id
+        UNION ALL SELECT nodes.id FROM nodes JOIN reset_nodes ON nodes.parent_id = reset_nodes.id
+      ) SELECT COUNT(*) AS count FROM reset_nodes`).get() as { count: number }).count)
+      this.#database.exec(`
+        DELETE FROM hardlink_paths WHERE parent_id IN (SELECT id FROM recovery_roots);
+        DELETE FROM nodes WHERE parent_id IN (SELECT id FROM recovery_roots);
+        DELETE FROM hardlink_owners;
+        UPDATE nodes SET size_bytes = own_bytes, direct_children = 0, descendant_count = 0,
+          unreadable_count = own_unreadable, scan_state = 'queued', enumeration_complete = 0 WHERE id IN (SELECT id FROM recovery_roots);
+        UPDATE directory_tasks SET status = 'queued', entries_read = 0 WHERE node_id IN (SELECT id FROM recovery_roots);
+        UPDATE directory_observations SET direct_skipped_count = 0, direct_unreadable_count = 0,
+          direct_disappearing_count = 0, direct_symlink_count = 0, direct_nested_mount_count = 0,
+          direct_duplicate_count = 0, enumeration_status = 'queued' WHERE node_id IN (SELECT id FROM recovery_roots);
+      `)
+      const rebuilt = this.#rebuildConstructionState()
+      const repairedSchedulerRows = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks').get() as { count: number }).count)
+      schedulerTiming.measure(() => this.#database.exec(`
+        UPDATE directory_tasks SET subtree_complete = CASE WHEN node_id IN
+          (SELECT id FROM nodes WHERE scan_state IN ('complete', 'unreadable')) THEN 1 ELSE 0 END;
+        UPDATE directory_tasks SET pending_children = (SELECT COUNT(*) FROM nodes child JOIN directory_tasks child_task ON child_task.node_id = child.id
+          WHERE child.parent_id = directory_tasks.node_id AND child_task.subtree_complete = 0);
+        UPDATE directory_tasks SET ready = CASE WHEN subtree_complete = 1 THEN 0 WHEN node_id IN (SELECT id FROM nodes WHERE parent_id IS NULL) THEN 1
+          WHEN node_id IN (SELECT child.id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE parent.enumeration_complete = 1) THEN 1 ELSE 0 END;
+      `))
+      this.#pendingSubtrees = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks WHERE subtree_complete = 0').get() as { count: number }).count)
+      const counts = this.#database.prepare(`SELECT (SELECT COUNT(*) FROM directory_tasks WHERE status IN ('complete', 'unreadable')) AS retained,
+        (SELECT COUNT(*) FROM recovery_roots) AS reset`).get() as { retained: number; reset: number }
+      this.#database.exec('DROP TABLE recovery_roots')
+      return {
+        retained: Number(counts.retained), reset: Number(counts.reset), deletedNodes,
+        affectedHardlinkIdentities: rebuilt.affectedHardlinkIdentities,
+        repairedAncestors: rebuilt.repairedAncestors, repairedSchedulerRows
+      }
+    } finally { schedulerTiming.publish() }
   }
 
   bumpRevision(): number {
@@ -1370,7 +1410,7 @@ export class ConstructionDatabase implements ChartDataSource {
     this.#state = "committed"
     try {
       this.#database.exec('PRAGMA synchronous=FULL')
-      measureScan("database-checkpoint", () => this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)"))
+      measureScanWork("database-checkpoint", () => this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)"))
       measureScan("database-optimize", () => this.#database.exec("PRAGMA optimize"))
     }
     finally { this.#close() }
@@ -1387,74 +1427,84 @@ export class ConstructionDatabase implements ChartDataSource {
     try { this.#close() } catch { /* Preserve scan error. */ }
   }
 
-  #rebuildConstructionState(): void {
-    this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = MAX(0, direct_skipped_count - direct_duplicate_count),
-      direct_duplicate_count = 0`).run()
-    const aliases = this.#database.prepare(`SELECT parent_id AS parentId, name, path_key AS pathKey, device, inode,
-      allocated_bytes AS allocatedBytes FROM file_aliases`).all() as unknown as Array<{ parentId: string; name: string; pathKey: string; device: string; inode: string; allocatedBytes: number }>
-    const groups = new Map<string, typeof aliases>()
-    for (const alias of aliases) {
-      if (alias.device === '' || alias.inode === '') continue
-      const key = `${alias.device}\0${alias.inode}`
-      const group = groups.get(key) ?? []
-      group.push(alias)
-      groups.set(key, group)
-    }
-    const seed = Buffer.from(this.nodeIdSeed, 'hex')
-    const existingNodes = this.#database.prepare("SELECT id, device, inode FROM nodes WHERE kind = 'file'")
-    const deleteNode = this.#database.prepare('DELETE FROM nodes WHERE id = ?')
-    const parentNode = this.#database.prepare('SELECT path, depth FROM nodes WHERE id = ?')
-    const bumpDuplicate = this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
-      direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`)
-    // The canonical node for a unique file already carries the deterministic
-    // id, so the per-group delete+insert is a no-op for the common case.
-    // Resolve identities in memory instead of issuing an indexed query per
-    // group: on large saved scans the per-group statements dominate resume
-    // (measured ~2 min for 276k groups) while the map pass is milliseconds.
-    const fileNodes = new Map<string, string[]>()
-    for (const row of existingNodes.all() as unknown as Array<{ id: string; device: string; inode: string }>) {
-      const key = `${row.device}\0${row.inode}`
-      const ids = fileNodes.get(key) ?? []
-      ids.push(row.id)
-      fileNodes.set(key, ids)
-    }
-    for (const group of groups.values()) {
-      group.sort((left, right) => Buffer.compare(Buffer.from(left.pathKey, 'utf8'), Buffer.from(right.pathKey, 'utf8')))
-      const owner = group[0]!
-      const id = `n-${createHmac('sha256', seed).update(owner.parentId).update('\0').update(owner.name).digest('hex').slice(0, 32)}`
-      const existing = fileNodes.get(`${owner.device}\0${owner.inode}`) ?? []
-      if (group.length === 1 && existing.length === 1 && existing[0] === id) continue
-      for (const rowId of existing) deleteNode.run(rowId)
-      const parent = parentNode.get(owner.parentId) as { path?: string; depth?: number } | undefined
-      if (!parent?.path) continue
-      this.#insertNode.run(id, owner.parentId, owner.name, join(parent.path, owner.name), 'file', owner.allocatedBytes, owner.allocatedBytes, owner.device, owner.inode, 'complete', 1, Number(parent.depth ?? 0) + 1)
-      this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
-      for (const duplicate of group.slice(1)) bumpDuplicate.run(duplicate.parentId)
-    }
-    this.#database.exec(`
-      UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
-      UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
-      WITH RECURSIVE closure(ancestor, descendant) AS (
-        SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
-        UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
-      ), totals AS (
-        SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
-        FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
-      ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
-        descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
-        unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
-    `)
-    // The recompute above bakes every unreadable node's accumulated state
-    // into its ancestors, so record it as already propagated: a completion
-    // walk that later reaches the node must push only the delta re-scanned
-    // after the resume.
-    this.#propagatedToParent.clear()
-    for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
-      this.#propagatedToParent.set(row.id, {
-        bytes: Number(row.sizeBytes) - Number(row.ownBytes),
-        descendants: Number(row.descendantCount),
-        unreadable: Number(row.unreadableCount)
+  #rebuildConstructionState(): { readonly affectedHardlinkIdentities: number; readonly repairedAncestors: number } {
+    const hardlinks = createScanTimingAccumulator('resume-hardlink-repair')
+    const aggregates = createScanTimingAccumulator('resume-aggregate-repair')
+    let affectedHardlinkIdentities = 0
+    let repairedAncestors = 0
+    try {
+      hardlinks.measure(() => {
+        this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = MAX(0, direct_skipped_count - direct_duplicate_count),
+          direct_duplicate_count = 0`).run()
+        const aliases = this.#database.prepare(`SELECT parent_id AS parentId, name, path_key AS pathKey, device, inode,
+          allocated_bytes AS allocatedBytes FROM hardlink_paths`).all() as unknown as Array<{ parentId: string; name: string; pathKey: string; device: string; inode: string; allocatedBytes: number }>
+        const groups = new Map<string, typeof aliases>()
+        for (const alias of aliases) {
+          if (alias.device === '' || alias.inode === '') continue
+          const key = `${alias.device}\0${alias.inode}`
+          const group = groups.get(key) ?? []
+          group.push(alias)
+          groups.set(key, group)
+        }
+        affectedHardlinkIdentities = groups.size
+        const seed = Buffer.from(this.nodeIdSeed, 'hex')
+        const existingNodes = this.#database.prepare("SELECT id, device, inode FROM nodes WHERE kind = 'file'")
+        const deleteNode = this.#database.prepare('DELETE FROM nodes WHERE id = ?')
+        const parentNode = this.#database.prepare('SELECT path, depth FROM nodes WHERE id = ?')
+        const bumpDuplicate = this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
+          direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`)
+        const fileNodes = new Map<string, string[]>()
+        for (const row of existingNodes.all() as unknown as Array<{ id: string; device: string; inode: string }>) {
+          const key = `${row.device}\0${row.inode}`
+          const ids = fileNodes.get(key) ?? []
+          ids.push(row.id)
+          fileNodes.set(key, ids)
+        }
+        for (const group of groups.values()) {
+          group.sort((left, right) => Buffer.compare(Buffer.from(left.pathKey, 'utf8'), Buffer.from(right.pathKey, 'utf8')))
+          const owner = group[0]!
+          const id = `n-${createHmac('sha256', seed).update(owner.parentId).update('\0').update(owner.name).digest('hex').slice(0, 32)}`
+          const existing = fileNodes.get(`${owner.device}\0${owner.inode}`) ?? []
+          if (group.length === 1 && existing.length === 1 && existing[0] === id) {
+            this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
+            continue
+          }
+          for (const rowId of existing) deleteNode.run(rowId)
+          const parent = parentNode.get(owner.parentId) as { path?: string; depth?: number } | undefined
+          if (!parent?.path) continue
+          this.#insertNode.run(id, owner.parentId, owner.name, join(parent.path, owner.name), 'file', owner.allocatedBytes, owner.allocatedBytes, owner.device, owner.inode, 'complete', 1, Number(parent.depth ?? 0) + 1)
+          this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
+          for (const duplicate of group.slice(1)) bumpDuplicate.run(duplicate.parentId)
+        }
       })
+      aggregates.measure(() => {
+        repairedAncestors = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'directory'").get() as { count: number }).count)
+        this.#database.exec(`
+          UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
+          UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
+          WITH RECURSIVE closure(ancestor, descendant) AS (
+            SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
+            UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
+          ), totals AS (
+            SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
+            FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
+          ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
+            descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
+            unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
+        `)
+        this.#propagatedToParent.clear()
+        for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
+          this.#propagatedToParent.set(row.id, {
+            bytes: Number(row.sizeBytes) - Number(row.ownBytes),
+            descendants: Number(row.descendantCount),
+            unreadable: Number(row.unreadableCount)
+          })
+        }
+      })
+      return { affectedHardlinkIdentities, repairedAncestors }
+    } finally {
+      hardlinks.publish()
+      aggregates.publish()
     }
   }
 
@@ -1488,33 +1538,37 @@ export class ConstructionDatabase implements ChartDataSource {
 function migrateConstructionSchema(database: DatabaseSync): void {
   const row = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scan_run'").get() as { sql?: string } | undefined
   const schema = row?.sql ?? ''
-  if (schema.includes("'scanning'") && schema.includes("'paused'")) return
   if (!schema.includes("'traversing'") && !schema.includes("'scanning'")) throw new Error('Unsupported construction database schema')
   database.exec('BEGIN IMMEDIATE')
   try {
-    database.exec(`
+    if (!schema.includes("'paused'")) database.exec(`
       ALTER TABLE scan_run RENAME TO scan_run_legacy;
       CREATE TABLE scan_run (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        scan_id TEXT NOT NULL UNIQUE,
-        node_id_seed TEXT NOT NULL,
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1), scan_id TEXT NOT NULL UNIQUE, node_id_seed TEXT NOT NULL,
         phase TEXT NOT NULL CHECK (phase IN ('scanning', 'paused', 'awaiting-reconciliation', 'finalizing')),
-        checkpoint_sequence INTEGER NOT NULL DEFAULT 0,
-        active_elapsed_ms INTEGER NOT NULL DEFAULT 0,
-        journal_device TEXT NOT NULL,
-        journal_uuid TEXT NOT NULL,
-        journal_baseline TEXT NOT NULL,
-        drained_through TEXT NOT NULL,
-        checkpointed_at TEXT NOT NULL
+        checkpoint_sequence INTEGER NOT NULL DEFAULT 0, active_elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        journal_device TEXT NOT NULL, journal_uuid TEXT NOT NULL, journal_baseline TEXT NOT NULL,
+        drained_through TEXT NOT NULL, checkpointed_at TEXT NOT NULL
       );
-      INSERT INTO scan_run (singleton, scan_id, node_id_seed, phase, checkpoint_sequence, active_elapsed_ms,
-        journal_device, journal_uuid, journal_baseline, drained_through, checkpointed_at)
-        SELECT singleton, scan_id, node_id_seed,
-          CASE phase WHEN 'traversing' THEN 'scanning' ELSE phase END,
-          checkpoint_sequence, active_elapsed_ms, journal_device, journal_uuid, journal_baseline,
-          drained_through, checkpointed_at
-        FROM scan_run_legacy;
+      INSERT INTO scan_run SELECT singleton, scan_id, node_id_seed, CASE phase WHEN 'traversing' THEN 'scanning' ELSE phase END,
+        checkpoint_sequence, active_elapsed_ms, journal_device, journal_uuid, journal_baseline, drained_through, checkpointed_at FROM scan_run_legacy;
       DROP TABLE scan_run_legacy;
+    `)
+    const taskColumns = new Set((database.prepare('PRAGMA table_info(directory_tasks)').all() as unknown as Array<{ name: string }>).map((column) => column.name))
+    if (!taskColumns.has('ready')) database.exec('ALTER TABLE directory_tasks ADD COLUMN ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0,1))')
+    if (!taskColumns.has('pending_children')) database.exec('ALTER TABLE directory_tasks ADD COLUMN pending_children INTEGER NOT NULL DEFAULT 0 CHECK (pending_children >= 0)')
+    if (!taskColumns.has('subtree_complete')) database.exec('ALTER TABLE directory_tasks ADD COLUMN subtree_complete INTEGER NOT NULL DEFAULT 0 CHECK (subtree_complete IN (0,1))')
+    if (!taskColumns.has('shallow_band')) database.exec('ALTER TABLE directory_tasks ADD COLUMN shallow_band INTEGER NOT NULL DEFAULT 0 CHECK (shallow_band IN (0,1))')
+    database.exec(`
+      UPDATE directory_tasks SET shallow_band = CASE WHEN depth <= 6 THEN 0 ELSE 1 END;
+      UPDATE directory_tasks SET subtree_complete = CASE WHEN node_id IN
+        (SELECT id FROM nodes WHERE scan_state IN ('complete', 'unreadable')) THEN 1 ELSE 0 END;
+      UPDATE directory_tasks SET pending_children = (SELECT COUNT(*) FROM nodes child JOIN directory_tasks child_task ON child_task.node_id = child.id
+        WHERE child.parent_id = directory_tasks.node_id AND child_task.subtree_complete = 0);
+      UPDATE directory_tasks SET ready = CASE WHEN subtree_complete = 1 THEN 0 WHEN node_id IN (SELECT id FROM nodes WHERE parent_id IS NULL) THEN 1
+        WHEN node_id IN (SELECT child.id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE parent.enumeration_complete = 1) THEN 1 ELSE 0 END;
+      DROP INDEX IF EXISTS tasks_schedule;
+      CREATE INDEX IF NOT EXISTS tasks_ready_schedule ON directory_tasks (ready, focused, status, shallow_band, depth, enqueue_order);
       COMMIT;
     `)
   } catch (error) {
@@ -1561,7 +1615,7 @@ function finalizeConstructionSchema(database: DatabaseSync): void {
     CREATE INDEX nodes_parent_size ON nodes (parent_id, size_bytes DESC, name COLLATE NOCASE ASC, id ASC);
     INSERT INTO hardlink_groups (device, inode, owner_path_key, node_id, allocated_bytes)
       SELECT nodes.device, nodes.inode, aliases.path_key, nodes.id, nodes.own_bytes
-      FROM nodes JOIN file_aliases aliases
+      FROM nodes JOIN hardlink_paths aliases
         ON aliases.parent_id = nodes.parent_id AND aliases.name = nodes.name
           AND aliases.device = nodes.device AND aliases.inode = nodes.inode
       WHERE nodes.kind = 'file' AND nodes.device <> '' AND nodes.inode <> '';

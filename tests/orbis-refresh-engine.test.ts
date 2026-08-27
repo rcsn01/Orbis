@@ -9,6 +9,7 @@ import type { IndexManifest } from '../src/main/index-manifest'
 import { createResumeJournalDrain, refreshPersistentIndex, type RefreshRequest } from '../src/main/refresh-engine'
 import { scanFilesystem } from '../src/main/scanner'
 import { FullScanResumeStore, type FullScanResumeDescriptor } from '../src/main/full-scan-resume'
+import { subscribeScanDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -197,7 +198,7 @@ describe('Orbis refresh engine', () => {
     await expect(access(publishedPath)).rejects.toThrow()
   })
 
-  it('keeps the resumable candidate when the post-scan window cannot close', async () => {
+  it('discards retry candidates when the post-scan window cannot close', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-window-busy-'))
     cleanup.push(directory)
     const target = join(directory, 'target')
@@ -221,11 +222,9 @@ describe('Orbis refresh engine', () => {
       generation: 1, target, indexDirectory: indexes, partialPath: join(indexes, `index-${id}.partial.sqlite`),
       publishedPath: join(indexes, `index-${id}.sqlite`), changeJournal: journal
     })).rejects.toThrow('Unable to close the full-scan FSEvents window: too-many-dirty-scopes')
-    // The exhausted window preserves the checkpointed candidate so the
-    // controller can offer a resume once the window settles.
     const saved = await new FullScanResumeStore(indexes).load(target)
-    expect(saved.kind === 'construction' || saved.kind === 'candidate').toBe(true)
-    await expect(access(join(indexes, `index-${id}.sqlite`))).resolves.toBeUndefined()
+    expect(saved.kind).toBe('none')
+    await expect(access(join(indexes, `index-${id}.sqlite`))).rejects.toThrow()
   })
 
   it('publishes a full scan despite an odd rename count in the final drain', async () => {
@@ -288,10 +287,7 @@ describe('Orbis refresh engine', () => {
       generation: 1, target, indexDirectory: indexes, partialPath: join(indexes, `index-${id}.partial.sqlite`),
       publishedPath: join(indexes, `index-${id}.sqlite`), changeJournal: journal
     })).rejects.toThrow('Unable to close the full-scan FSEvents window: kernel-dropped')
-    // 8 reads expected: 3 resumable attempts × 2 drain calls (checkpoint drain
-    // plus the failure-path re-drain) + 2 post-scan reads; bound with slack for
-    // incidental extra checkpoints. The unbounded pre-fix loop would never stop.
-    expect(reads).toBeLessThanOrEqual(10)
+    expect(reads).toBe(4)
   })
 
   it('advances only the manifest cursor when no target events exist', async () => {
@@ -354,10 +350,19 @@ describe('Orbis refresh engine', () => {
         ? { throughEventId: '10', events: [], requiresFullScan: true, reason: 'event-limit' }
         : { throughEventId: '11', events: [], requiresFullScan: false }
     }
-    const outcome = await refreshPersistentIndex({
-      generation: 2, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal2
-    })
+    const resumeEvents: OrbisTimingEvent[] = []
+    const unsubscribe = subscribeScanDiagnostics((event) => { if (event.generation === 2) resumeEvents.push(event) })
+    let outcome: Awaited<ReturnType<typeof refreshPersistentIndex>>
+    try {
+      outcome = await refreshPersistentIndex({
+        generation: 2, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal2,
+        resumeExpected: true
+      })
+    } finally { unsubscribe() }
     expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'w-journal', eventId: '11' } })
+    for (const phase of ['resume-load-total', 'resume-history-validation', 'resume-database-open', 'resume-incomplete-recovery', 'resume-semantic-totals', 'resume-checkpoint', 'resume-first-metadata-page']) {
+      expect(resumeEvents.filter((event) => event.phase === phase), phase).toHaveLength(1)
+    }
     // The resumed scan continued the same partial (renamed on publication)
     // instead of discarding it and re-scanning from an empty database.
     expect((await lstat(publishedPath)).ino).toBe(partialInode)
@@ -528,7 +533,7 @@ function manifestFor(path: string, journal: IndexManifest['journal']): IndexMani
     const values = Object.fromEntries((database.prepare('SELECT key, value FROM metadata').all() as unknown as Array<{ key: string; value: string }>).map((row) => [row.key, row.value]))
     return {
       version: 1, publicationId: '00000000-0000-4000-8000-000000000001', indexFile: 'index-00000000-0000-4000-8000-000000000001.sqlite',
-      target: values.target!, targetDevice: values.targetDevice!, targetInode: values.targetInode!, schemaVersion: 2,
+      target: values.target!, targetDevice: values.targetDevice!, targetInode: values.targetInode!, schemaVersion: 3,
       indexRevision: Number(values.indexRevision), journal
     }
   } finally { database.close() }

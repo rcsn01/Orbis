@@ -1,7 +1,8 @@
 import { createRequire } from "node:module"
-import { normalize, relative, resolve, sep } from "node:path"
+import { isAbsolute, normalize, relative, resolve, sep } from "node:path"
 import type { ScanFileSystem, ScanStats } from "./legacy-scanner"
 import { createOrderedConcurrentMapper, type OrderedConcurrentMapper } from "./ordered-concurrent-map"
+import { recordScanCounter } from './diagnostics'
 
 export interface FolderEstimateItem {
   readonly name: string
@@ -45,19 +46,9 @@ export interface DirectoryMetadataSource {
   close?(): Promise<void>
 }
 
-export interface NativeMetadataEntry {
-  readonly name: string
-  readonly kind: DirectoryMetadataKind | string
-  readonly device: string
-  readonly inode: string
-  readonly allocatedBytes: number
-  readonly linkCount?: number
-  readonly mountPoint: boolean
-  readonly errorCode?: number | null
-}
-
 export interface NativeMetadataPage {
-  readonly entries: readonly NativeMetadataEntry[]
+  readonly payload: Buffer
+  readonly count: number
   readonly done: boolean
   readonly bulkEntries?: number
   readonly fallbackEntries?: number
@@ -68,24 +59,13 @@ export interface NativeDirectoryCursor {
   close(): void
 }
 
+export interface NativeMetadataTree {
+  openDirectory(relativePath: string): NativeDirectoryCursor
+  close(): void
+}
+
 export interface NativeMetadataAddon {
-  openDirectory(path: string): NativeDirectoryCursor
-}
-
-export interface MetadataCursorDiagnostics {
-  readonly nativeReadPageCalls: number
-  readonly nodeReadPageCalls: number
-}
-
-const metadataCursorDiagnostics = { nativeReadPageCalls: 0, nodeReadPageCalls: 0 }
-
-export function resetMetadataCursorDiagnostics(): void {
-  metadataCursorDiagnostics.nativeReadPageCalls = 0
-  metadataCursorDiagnostics.nodeReadPageCalls = 0
-}
-
-export function readMetadataCursorDiagnostics(): MetadataCursorDiagnostics {
-  return { ...metadataCursorDiagnostics }
+  openMetadataTree(target: string): NativeMetadataTree
 }
 
 export type NativeOrbisAddon = Partial<NativeMetadataAddon> & Record<string, unknown>
@@ -124,7 +104,7 @@ class NodeDirectoryMetadataCursor implements DirectoryMetadataCursor {
 
   async readPage(limit: number, signal: AbortSignal): Promise<DirectoryMetadataPage> {
     if (this.#closed || this.#done) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
-    metadataCursorDiagnostics.nodeReadPageCalls += 1
+    recordScanCounter('nodePageReads')
     const names: string[] = []
     const size = clampPageLimit(limit)
     for (let index = 0; index < size; index += 1) {
@@ -149,6 +129,7 @@ class NodeDirectoryMetadataCursor implements DirectoryMetadataCursor {
       }
     })
     for await (const entry of metadata) entries.push(entry)
+    recordScanCounter('metadataEntries', entries.length)
     return { entries, done: this.#done && entries.length === names.length, bulkEntries: 0, fallbackEntries: entries.length }
   }
 
@@ -160,21 +141,19 @@ class NodeDirectoryMetadataCursor implements DirectoryMetadataCursor {
 }
 
 export class BulkExactMetadataSource implements DirectoryMetadataSource {
-  readonly #addon: NativeMetadataAddon
-  readonly #fileSystem: ScanFileSystem
   readonly pageConcurrency: number
 
-  constructor(addon: NativeMetadataAddon, fileSystem: ScanFileSystem, metadataConcurrency = 4) {
-    this.#addon = addon
-    this.#fileSystem = fileSystem
+  constructor(private readonly tree: NativeMetadataTree, private readonly target: string, metadataConcurrency = 4) {
     this.pageConcurrency = Math.max(1, Math.min(64, Math.floor(metadataConcurrency)))
   }
 
-  async open(path: string, targetRealpath: string): Promise<DirectoryMetadataCursor> {
-    const openedRealpath = await this.#fileSystem.realpath(path)
-    if (!isWithin(openedRealpath, targetRealpath)) throw new Error("Directory escaped the scan target")
-    return new NativeDirectoryMetadataCursor(this.#addon.openDirectory(path))
+  async open(path: string, _targetRealpath: string): Promise<DirectoryMetadataCursor> {
+    const relativePath = relative(this.target, normalize(resolve(path)))
+    if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) throw new Error("Directory escaped the scan target")
+    return new NativeDirectoryMetadataCursor(this.tree.openDirectory(relativePath))
   }
+
+  async close(): Promise<void> { this.tree.close() }
 }
 
 class NativeDirectoryMetadataCursor implements DirectoryMetadataCursor {
@@ -185,10 +164,13 @@ class NativeDirectoryMetadataCursor implements DirectoryMetadataCursor {
   async readPage(limit: number, signal: AbortSignal): Promise<DirectoryMetadataPage> {
     throwIfAborted(signal)
     if (this.#closed) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
-    metadataCursorDiagnostics.nativeReadPageCalls += 1
+    recordScanCounter('nativePageReads')
     const page = await this.cursor.readPage(clampPageLimit(limit))
     throwIfAborted(signal)
-    return nativePage(page)
+    recordScanCounter('nativePayloadBytes', page.payload.byteLength)
+    const decoded = decodeNativePage(page)
+    recordScanCounter('metadataEntries', decoded.entries.length)
+    return decoded
   }
 
   async close(): Promise<void> {
@@ -198,33 +180,58 @@ class NativeDirectoryMetadataCursor implements DirectoryMetadataCursor {
   }
 }
 
-function nativePage(page: NativeMetadataPage): DirectoryMetadataPage {
-  return {
-    entries: page.entries.map((entry) => ({
-      name: entry.name,
-      kind: normalizeKind(entry.kind),
-      device: String(entry.device ?? ""),
-      inode: String(entry.inode ?? ""),
-      allocatedBytes: finiteBytes(entry.allocatedBytes),
-      ...(entry.linkCount === undefined ? {} : { linkCount: finiteCount(entry.linkCount) }),
-      mountPoint: Boolean(entry.mountPoint),
-      ...(entry.errorCode == null ? {} : { error: nativeError(entry.errorCode) })
-    })),
-    done: Boolean(page.done),
-    bulkEntries: finiteCount(page.bulkEntries ?? page.entries.length),
-    fallbackEntries: finiteCount(page.fallbackEntries ?? 0)
+export function decodeNativePage(page: NativeMetadataPage): DirectoryMetadataPage {
+  const payload = Buffer.from(page.payload)
+  if (payload.length < 16 || payload.toString('ascii', 0, 4) !== 'ORB1' || payload.readUInt16LE(4) !== 1 || payload.readUInt16LE(6) !== 48) throw new Error('Malformed native metadata page header')
+  const count = payload.readUInt32LE(8)
+  const namesLength = payload.readUInt32LE(12)
+  const bulkEntries = finiteCount(page.bulkEntries ?? count)
+  const fallbackEntries = finiteCount(page.fallbackEntries ?? 0)
+  if (count !== finiteCount(page.count) || bulkEntries + fallbackEntries !== count || 16 + count * 48 + namesLength !== payload.length) throw new Error('Malformed native metadata page bounds')
+  const namesStart = 16 + count * 48
+  const entries: DirectoryMetadataEntry[] = []
+  const nameRanges: Array<readonly [number, number]> = []
+  for (let index = 0; index < count; index += 1) {
+    const offset = 16 + index * 48
+    const nameOffset = payload.readUInt32LE(offset)
+    const nameLength = payload.readUInt32LE(offset + 4)
+    if (nameLength === 0 || nameOffset + nameLength > namesLength) throw new Error('Malformed native metadata name range')
+    nameRanges.push([nameOffset, nameOffset + nameLength])
+    const kindValue = payload[offset + 8]!
+    const flags = payload[offset + 9]!
+    if (kindValue > 3 || flags & ~0x1f || payload.readUInt16LE(offset + 10) !== 0) throw new Error('Malformed native metadata record')
+    const errno = payload.readInt32LE(offset + 12)
+    const u64 = (at: number): bigint => payload.readBigUInt64LE(offset + at)
+    const name = payload.toString('utf8', namesStart + nameOffset, namesStart + nameOffset + nameLength)
+    if (name === '.' || name === '..' || name.includes('/') || name.includes('\u0000')) throw new Error('Malformed native metadata name')
+    const entry: DirectoryMetadataEntry = {
+      name,
+      kind: kindValue === 1 ? 'file' : kindValue === 2 ? 'directory' : kindValue === 3 ? 'symlink' : 'other',
+      device: flags & 2 ? u64(16).toString(10) : '', inode: flags & 4 ? u64(24).toString(10) : '',
+      allocatedBytes: finiteBytes(u64(32)), ...(flags & 8 ? { linkCount: finiteCount(u64(40)) } : {}),
+      mountPoint: Boolean(flags & 1), ...(flags & 16 ? { error: nativeError(errno) } : {})
+    }
+    entries.push(entry)
   }
+  nameRanges.sort((left, right) => left[0] - right[0])
+  let covered = 0
+  for (const [start, end] of nameRanges) {
+    if (start !== covered) throw new Error('Malformed native metadata name layout')
+    covered = end
+  }
+  if (covered !== namesLength) throw new Error('Malformed native metadata name layout')
+  return { entries, done: Boolean(page.done), bulkEntries, fallbackEntries }
 }
 
-export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, fileSystem: ScanFileSystem, metadataConcurrency: number): DirectoryMetadataSource | undefined {
+export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, _fileSystem: ScanFileSystem, metadataConcurrency: number, target: string): DirectoryMetadataSource | undefined {
   if (!addon || process.env.ORBIS_DISABLE_BULK_METADATA === "1") return undefined
-  return new BulkExactMetadataSource(addon, fileSystem, metadataConcurrency)
+  return new BulkExactMetadataSource(addon.openMetadataTree(target), target, metadataConcurrency)
 }
 
 export async function loadNativeMetadataAddon(path: string | undefined): Promise<NativeMetadataAddon | undefined> {
   if (process.env.ORBIS_DISABLE_BULK_METADATA === "1") return undefined
   const addon = await loadNativeOrbisAddon(path)
-  return addon && typeof addon.openDirectory === "function" ? addon as NativeMetadataAddon : undefined
+  return addon && typeof addon.openMetadataTree === "function" ? addon as NativeMetadataAddon : undefined
 }
 
 export async function loadNativeOrbisAddon(path: string | undefined): Promise<NativeOrbisAddon | undefined> {
@@ -265,7 +272,6 @@ function fromStats(name: string, stats: ScanStats): DirectoryMetadataEntry {
 }
 
 function clampPageLimit(value: number): number { return Math.max(1, Math.min(1_024, Math.floor(value))) }
-function normalizeKind(value: string): DirectoryMetadataKind { return value === "directory" || value === "file" || value === "symlink" ? value : "other" }
 const errnoCodeNames: Readonly<Record<number, string>> = {
   1: "EPERM",
   2: "ENOENT",

@@ -2,7 +2,7 @@ import { link, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-export type ScanFixtureName = 'wide' | 'deep' | 'tiny' | 'mixed' | 'semantics'
+export type ScanFixtureName = 'wide' | 'deep' | 'tiny' | 'mixed' | 'semantics' | 'directories' | 'hardlinks'
 export type ScanFixtureProfile = 'quick' | 'baseline'
 
 export interface ScanFixtureManifest {
@@ -36,7 +36,11 @@ export async function createScanFixture(name: ScanFixtureName, profile: ScanFixt
           ? await createTiny(root, profile)
           : name === 'mixed'
             ? await createMixed(root, profile)
-            : await createSemantics(root, profile)
+            : name === 'semantics'
+              ? await createSemantics(root, profile)
+              : name === 'directories'
+                ? await createDirectories(root, profile)
+                : await createHardlinks(root, profile)
     return { directory, root, manifest, cleanup: () => rm(directory, { recursive: true, force: true }) }
   } catch (error) {
     await rm(directory, { recursive: true, force: true })
@@ -95,6 +99,37 @@ async function createMixed(root: string, profile: ScanFixtureProfile): Promise<S
   }
   const files = directoryCount * filesPerDirectory
   return manifest('mixed', profile, files, directoryCount + 1, 0, 0, bytesWritten)
+}
+
+async function createDirectories(root: string, profile: ScanFixtureProfile): Promise<ScanFixtureManifest> {
+  const branches = profile === 'quick' ? 10 : 100
+  const children = profile === 'quick' ? 20 : 100
+  for (let branch = 0; branch < branches; branch += 1) {
+    const parent = join(root, `branch-${padded(branch, 3)}`)
+    await mkdir(parent)
+    await Promise.all(Array.from({ length: children }, (_, child) => mkdir(join(parent, `empty-${padded(child, 3)}`))))
+  }
+  return manifest('directories', profile, 0, 1 + branches + branches * children, 0, 0, 0)
+}
+
+async function createHardlinks(root: string, profile: ScanFixtureProfile): Promise<ScanFixtureManifest> {
+  const identities = profile === 'quick' ? 10 : 100
+  const pathsPerIdentity = profile === 'quick' ? 20 : 100
+  const sources = join(root, 'Z-sources')
+  const owners = join(root, 'A-owners')
+  await mkdir(sources)
+  await mkdir(owners)
+  let bytesWritten = 0
+  for (let identity = 0; identity < identities; identity += 1) {
+    const payload = Buffer.alloc(128 + identity, identity % 251)
+    const source = join(sources, `source-${padded(identity, 3)}.dat`)
+    await writeFile(source, payload)
+    bytesWritten += payload.length
+    const identityDirectory = join(owners, `identity-${padded(identity, 3)}`)
+    await mkdir(identityDirectory)
+    await Promise.all(Array.from({ length: pathsPerIdentity - 1 }, (_, alias) => link(source, join(identityDirectory, `alias-${padded(alias, 3)}.dat`))))
+  }
+  return manifest('hardlinks', profile, identities, 3 + identities, 0, identities * (pathsPerIdentity - 1), bytesWritten)
 }
 
 async function createSemantics(root: string, profile: ScanFixtureProfile): Promise<ScanFixtureManifest> {

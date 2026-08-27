@@ -11,6 +11,27 @@ const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
 
 describe('progressive Orbis scanner', () => {
+  it('publishes the root preview before scan progress so the scanning sunburst is available immediately', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-initial-preview-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    await mkdir(root, { recursive: true })
+    await writeFile(join(root, 'file.dat'), Buffer.alloc(512))
+    const events: string[] = []
+    const previews: ProgressivePreview[] = []
+
+    await scanFilesystem({
+      generation: 6, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'), indexDirectory: indexes,
+      onProgress: () => events.push('progress'),
+      onPreview: (preview) => { events.push('preview'); previews.push(preview) }
+    })
+
+    expect(events[0]).toBe('preview')
+    expect(previews[0]).toMatchObject({ focus: { name: 'root', scanState: 'queued' } })
+    expect(previews.some((preview) => preview.largestItems.some((item) => item.name === 'file.dat'))).toBe(true)
+  })
+
   it('publishes bounded previews and an exact terminal index', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-progressive-'))
     cleanup.push(directory)
@@ -51,14 +72,14 @@ describe('progressive Orbis scanner', () => {
       expect(rootRow.size).toBe(result.scannedBytes)
       expect(count.count).toBe(result.totals.scannedItems)
       for (const table of ['directory_tasks', 'hardlink_owners', 'scan_state', 'size_estimates', 'estimate_roots']) expect(() => database.prepare(`SELECT * FROM ${table}`).all()).toThrow()
-      for (const table of ['file_aliases', 'hardlink_groups', 'directory_observations']) expect(() => database.prepare(`SELECT * FROM ${table}`).all()).not.toThrow()
+      for (const table of ['hardlink_paths', 'hardlink_groups', 'directory_observations']) expect(() => database.prepare(`SELECT * FROM ${table}`).all()).not.toThrow()
       const observationCount = database.prepare('SELECT COUNT(*) AS count FROM directory_observations').get() as { count: number }
       const directoryCount = database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'directory'").get() as { count: number }
-      const fileCount = database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'file'").get() as { count: number }
       const hardLinkGroupCount = database.prepare('SELECT COUNT(*) AS count FROM hardlink_groups').get() as { count: number }
       expect(observationCount.count).toBe(directoryCount.count)
-      expect(hardLinkGroupCount.count).toBe(fileCount.count)
-      expect(database.prepare("SELECT value FROM metadata WHERE key = 'schemaVersion'").get()).toEqual({ value: '2' })
+      expect(hardLinkGroupCount.count).toBe(0)
+      expect(database.prepare('SELECT COUNT(*) AS count FROM hardlink_paths').get()).toEqual({ count: 0 })
+      expect(database.prepare("SELECT value FROM metadata WHERE key = 'schemaVersion'").get()).toEqual({ value: '3' })
     } finally { database.close() }
   })
 
@@ -153,8 +174,8 @@ describe('progressive Orbis scanner', () => {
       database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
       database.applyMetadataBatch(() => {
         database.insertChild({ id: 'file', parentId: 'root', name: 'file', path: join(directory, 'file'), kind: 'file', ownBytes: 512, device: '1', inode: '2' }, 1, false)
-        database.insertFileAlias('root', 'file', 'file', '1', '2', 512)
-        database.insertFileAlias('root', 'file-copy', 'file', '1', '2', 512)
+        database.insertHardLinkPath('root', 'file', 'file', '1', '2', 512)
+        database.insertHardLinkPath('root', 'file-copy', 'file', '1', '2', 512)
         database.setHardLinkOwner('1', '2', 'file', 'file')
       })
       // The duplicate path_key is only written when the deferred flush runs;
@@ -205,7 +226,7 @@ describe('progressive Orbis scanner', () => {
     const database = new DatabaseSync(result.publishedPath, { readOnly: true })
     try {
       const rows = database.prepare("SELECT path FROM nodes WHERE name = 'shared.dat'").all() as unknown as Array<{ path: string }>
-      const aliases = database.prepare("SELECT path_key AS pathKey FROM file_aliases ORDER BY path_key").all() as unknown as Array<{ pathKey: string }>
+      const aliases = database.prepare("SELECT path_key AS pathKey FROM hardlink_paths ORDER BY path_key").all() as unknown as Array<{ pathKey: string }>
       const groups = database.prepare("SELECT owner_path_key AS ownerPathKey, allocated_bytes AS allocatedBytes FROM hardlink_groups").all() as unknown as Array<{ ownerPathKey: string; allocatedBytes: number }>
       expect(rows.map((row) => row.path)).toEqual([canonical])
       expect(aliases.map((row) => row.pathKey)).toEqual(['a/nested/shared.dat', 'z/shared.dat'])
@@ -251,7 +272,7 @@ describe('progressive Orbis scanner', () => {
     const database = new DatabaseSync(result.publishedPath, { readOnly: true })
     try {
       expect(database.prepare("SELECT path FROM nodes WHERE kind = 'file'").all()).toEqual([{ path: lexicalOwner }])
-      expect(database.prepare('SELECT path_key AS pathKey FROM file_aliases ORDER BY path_key').all()).toEqual([{ pathKey: 'a.dat' }, { pathKey: 'z.dat' }])
+      expect(database.prepare('SELECT path_key AS pathKey FROM hardlink_paths ORDER BY path_key').all()).toEqual([{ pathKey: 'a.dat' }, { pathKey: 'z.dat' }])
       expect(database.prepare('SELECT owner_path_key AS ownerPathKey FROM hardlink_groups').all()).toEqual([{ ownerPathKey: 'a.dat' }])
     } finally { database.close() }
   })
@@ -441,7 +462,7 @@ describe('progressive Orbis scanner', () => {
       indexDirectory: indexes, directoryMetadataSource: source, metadataBatchSize: 256,
       onPreview: () => events.push('preview')
     })
-    expect(events.slice(0, 3)).toEqual(['read:32', 'preview', 'read:256'])
+    expect(events.slice(0, 4)).toEqual(['preview', 'read:32', 'preview', 'read:256'])
     expect(events.filter((event) => event.startsWith('read:'))).toEqual(['read:32', 'read:256', 'read:256'])
     expect(result.totals.scannedItems).toBe(401)
   })
@@ -460,7 +481,7 @@ describe('progressive Orbis scanner', () => {
     const previews: ProgressivePreview[] = []
     await scanFilesystem({
       generation: 3, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'), indexDirectory: indexes,
-      fileSystem, onPreview: (preview) => { if (previews.length === 0) expect(opened).toEqual([root]); previews.push(preview) }
+      fileSystem, onPreview: (preview) => { if (previews.length === 1) expect(opened).toEqual([root]); previews.push(preview) }
     })
     expect(previews.length).toBeGreaterThan(0)
     expect(opened.some((path) => path === join(root, 'child-a'))).toBe(true)
@@ -486,8 +507,8 @@ describe('progressive Orbis scanner', () => {
       generation: 8, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'), indexDirectory: indexes,
       fileSystem, onPreview: (preview) => previews.push(preview)
     })
-    expect(previews[0]?.focus.directChildren).toBe(0)
-    expect(previews[0]?.focus.scanState).toBe('scanning')
+    expect(previews[0]?.focus).toMatchObject({ directChildren: 0, scanState: 'queued' })
+    expect(previews.some((preview) => preview.focus.scanState === 'scanning')).toBe(true)
   })
 
   it('updates provisional sizes and revisions as later root pages finish', async () => {

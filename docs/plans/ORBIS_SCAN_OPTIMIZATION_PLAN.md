@@ -4,6 +4,8 @@ This plan turns the SquirrelDisk and PDU research into independently testable im
 
 Supporting research: [`../research/squirreldisk-orbis-optimizations.md`](../research/squirreldisk-orbis-optimizations.md)
 
+The schema, native transport, checkpoint, and incremental-refresh proposals below are historical. The scan pipeline redesign supersedes those unchecked items. See [`../benchmarks/orbis-scan-pipeline-redesign.md`](../benchmarks/orbis-scan-pipeline-redesign.md) and [`../architecture/orbis-progressive-scanning.md`](../architecture/orbis-progressive-scanning.md) for the retained design.
+
 ## Goals
 
 - Reduce full-scan time without changing reported allocated sizes.
@@ -392,7 +394,7 @@ This is a product decision. Do not implement it automatically as a hidden optimi
 
 ---
 
-## Stage 8: evaluate a native scanner
+## Stage 8: evaluate a native scanner (superseded)
 
 ### Purpose
 
@@ -402,7 +404,9 @@ Determine whether a Rust or Swift scanner is justified after the Node implementa
 
 Do not start this stage unless Stage 5 measurements show filesystem traversal still dominates and misses the agreed performance target.
 
-### Prototype
+The redesign kept the TypeScript coordinator and added a narrow native metadata transport rather than a second scanner. Packed `ORB1` pages and descriptor-relative traversal now cover the measured N-API and path-opening costs. The full-scanner prototype checklist no longer applies.
+
+### Superseded prototype
 
 - [ ] Define a small versioned protocol for start, progress, cancellation, error, and completion.
 - [ ] Compare a Rust Rayon implementation with the optimized Node scanner.

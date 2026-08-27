@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { OrbisWorker } from '../src/main/controller'
+import type { WorkerTransport } from '../src/main/scan-execution'
 
 const mocks = vi.hoisted(() => {
   const handlers = new Map<string, (...args: unknown[]) => unknown>()
@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => {
     destroy = vi.fn(() => { this.destroyed = true })
     isDestroyed = () => this.destroyed
   }
-  class FakeWorker implements OrbisWorker {
+  class FakeWorker implements WorkerTransport {
     static instances: FakeWorker[] = []
     readonly messages: unknown[] = []
     terminated = false
@@ -84,12 +84,17 @@ describe('Orbis feature host', () => {
     expect(mocks.FakeWorker.instances[0]!.messages[0]).toMatchObject({ type: 'start' })
   })
 
-  it('starts one standalone scan only after its renderer loads', async () => {
+  it('loads standalone without scanning until requested', async () => {
     await feature.register(standaloneContext)
     expect(mocks.FakeWindow.instances).toHaveLength(1)
     expect(mocks.FakeWindow.instances[0]!.loadFile).toHaveBeenCalledWith('/tmp/orbis-renderer.html')
-    expect(mocks.FakeWorker.instances).toHaveLength(1)
+    expect(mocks.FakeWorker.instances).toHaveLength(0)
     expect(mocks.appearanceDispose).not.toHaveBeenCalled()
+
+    const start = mocks.handlers.get(IPC.startScan)!
+    await start({ sender: mocks.FakeWindow.instances[0]!.webContents })
+    expect(mocks.FakeWorker.instances).toHaveLength(1)
+
     await feature.dispose()
     expect(mocks.FakeWorker.instances[0]!.terminated).toBe(true)
     expect(mocks.handlers.size).toBe(0)

@@ -3,17 +3,19 @@
 mod fsevents;
 pub use fsevents::{capture_volume_checkpoint, read_changes};
 
-use napi::bindgen_prelude::{AsyncTask, Error, Result, Task};
+use napi::bindgen_prelude::{AsyncTask, Buffer, Error, Result, Task};
 use napi_derive::napi;
 use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
-use std::collections::HashSet;
+use std::fs::File;
 #[cfg(target_os = "macos")]
-use std::fs::{self, File};
+use std::ffi::CString;
 #[cfg(target_os = "macos")]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
-use std::path::{Path, PathBuf};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+#[cfg(target_os = "macos")]
+use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +23,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 
-#[napi(object)]
+#[derive(Clone)]
 pub struct MetadataEntry {
     pub name: String,
     pub kind: String,
@@ -33,12 +35,34 @@ pub struct MetadataEntry {
     pub error_code: Option<i32>,
 }
 
-#[napi(object)]
 pub struct MetadataPage {
     pub entries: Vec<MetadataEntry>,
     pub done: bool,
     pub bulk_entries: i64,
     pub fallback_entries: i64,
+}
+
+#[napi(object)]
+pub struct PackedMetadataPage {
+    pub payload: Buffer,
+    pub count: u32,
+    pub done: bool,
+    pub bulk_entries: i64,
+    pub fallback_entries: i64,
+}
+
+pub struct ReadPageOutput {
+    payload: Vec<u8>,
+    count: u32,
+    done: bool,
+    bulk_entries: i64,
+    fallback_entries: i64,
+}
+
+#[napi]
+pub struct MetadataTree {
+    #[cfg(target_os = "macos")]
+    root: Arc<Mutex<Option<File>>>,
 }
 
 #[napi]
@@ -49,14 +73,10 @@ pub struct DirectoryCursor {
 
 #[cfg(target_os = "macos")]
 struct CursorState {
-    path: PathBuf,
     parent_device: u64,
-    file: Arc<File>,
+    file: Option<File>,
     pending_bulk: VecDeque<MetadataEntry>,
     bulk_done: bool,
-    fallback_names: Option<Vec<String>>,
-    fallback_index: usize,
-    emitted_names: HashSet<String>,
     closed: bool,
 }
 
@@ -67,8 +87,8 @@ pub struct ReadPageTask {
 }
 
 impl Task for ReadPageTask {
-    type Output = MetadataPage;
-    type JsValue = MetadataPage;
+    type Output = ReadPageOutput;
+    type JsValue = PackedMetadataPage;
 
     fn compute(&mut self) -> Result<Self::Output> {
         #[cfg(target_os = "macos")]
@@ -77,7 +97,12 @@ impl Task for ReadPageTask {
                 .inner
                 .lock()
                 .map_err(|_| Error::from_reason("metadata cursor lock poisoned"))?;
-            read_page_from_state(&mut state, self.limit)
+            let page = read_page_from_state(&mut state, self.limit)?;
+            let count = page.entries.len() as u32;
+            Ok(ReadPageOutput {
+                payload: encode_metadata_page(&page.entries), count, done: page.done,
+                bulk_entries: page.bulk_entries, fallback_entries: page.fallback_entries,
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -89,7 +114,10 @@ impl Task for ReadPageTask {
     }
 
     fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output)
+        Ok(PackedMetadataPage {
+            payload: output.payload.into(), count: output.count, done: output.done,
+            bulk_entries: output.bulk_entries, fallback_entries: output.fallback_entries,
+        })
     }
 }
 
@@ -116,42 +144,111 @@ impl DirectoryCursor {
         #[cfg(target_os = "macos")]
         if let Ok(mut state) = self.inner.lock() {
             state.closed = true;
+            state.file.take();
         }
     }
 }
 
 #[napi]
-pub fn open_directory(path: String) -> Result<DirectoryCursor> {
+impl MetadataTree {
+    #[napi]
+    pub fn open_directory(&self, relative_path: String) -> Result<DirectoryCursor> {
+        #[cfg(target_os = "macos")]
+        {
+            validate_relative_path(&relative_path)?;
+            let root = self.root.lock().map_err(|_| Error::from_reason("metadata tree lock poisoned"))?;
+            let root = root.as_ref().ok_or_else(|| Error::from_reason("metadata tree is closed"))?;
+            let duplicated = unsafe { libc::dup(root.as_raw_fd()) };
+            if duplicated < 0 { return Err(io_error(std::io::Error::last_os_error())); }
+            let mut file = unsafe { File::from_raw_fd(duplicated) };
+            for component in relative_path.split('/').filter(|component| !component.is_empty()) {
+                let name = CString::new(component.as_bytes()).map_err(|_| Error::from_reason("metadata path contains NUL"))?;
+                let descriptor = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+                if descriptor < 0 { return Err(io_error(std::io::Error::last_os_error())); }
+                file = unsafe { File::from_raw_fd(descriptor) };
+            }
+            return cursor_from_file(file);
+        }
+        #[cfg(not(target_os = "macos"))]
+        { let _ = relative_path; Err(Error::from_reason("getattrlistbulk is only available on macOS")) }
+    }
+
+    #[napi]
+    pub fn close(&self) {
+        #[cfg(target_os = "macos")]
+        if let Ok(mut root) = self.root.lock() { root.take(); }
+    }
+}
+
+#[napi]
+pub fn open_metadata_tree(target: String) -> Result<MetadataTree> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::MetadataExt;
-        let path_buf = PathBuf::from(path);
-        let metadata = fs::symlink_metadata(&path_buf).map_err(io_error)?;
-        if !metadata.is_dir() {
-            return Err(Error::from_reason("metadata cursor requires a directory"));
-        }
-        let file = File::open(&path_buf).map_err(io_error)?;
-        return Ok(DirectoryCursor {
-            inner: Arc::new(Mutex::new(CursorState {
-                path: path_buf,
-                parent_device: metadata.dev(),
-                file: Arc::new(file),
-                pending_bulk: VecDeque::new(),
-                bulk_done: false,
-                fallback_names: None,
-                fallback_index: 0,
-                emitted_names: HashSet::new(),
-                closed: false,
-            })),
-        });
+        let path = CString::new(Path::new(&target).as_os_str().as_bytes()).map_err(|_| Error::from_reason("metadata target contains NUL"))?;
+        let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if descriptor < 0 { return Err(io_error(std::io::Error::last_os_error())); }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        return Ok(MetadataTree { root: Arc::new(Mutex::new(Some(file))) });
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        let _ = path;
-        Err(Error::from_reason(
-            "getattrlistbulk is only available on macOS",
-        ))
+    { let _ = target; Err(Error::from_reason("getattrlistbulk is only available on macOS")) }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_relative_path(path: &str) -> Result<()> {
+    if path.starts_with('/') || path.as_bytes().contains(&0) || path.split('/').any(|part| part.is_empty() && !path.is_empty() || part == "." || part == "..") {
+        return Err(Error::from_reason("invalid relative metadata path"));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cursor_from_file(file: File) -> Result<DirectoryCursor> {
+    use std::mem::MaybeUninit;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 { return Err(io_error(std::io::Error::last_os_error())); }
+    let stat = unsafe { stat.assume_init() };
+    Ok(DirectoryCursor { inner: Arc::new(Mutex::new(CursorState {
+        parent_device: stat.st_dev as u64, file: Some(file), pending_bulk: VecDeque::new(), bulk_done: false, closed: false,
+    })) })
+}
+
+fn encode_metadata_page(entries: &[MetadataEntry]) -> Vec<u8> {
+    const HEADER_SIZE: usize = 16;
+    const RECORD_SIZE: usize = 48;
+    let name_bytes = entries.iter().map(|entry| entry.name.as_bytes().len()).sum::<usize>();
+    let mut output = vec![0u8; HEADER_SIZE + RECORD_SIZE * entries.len() + name_bytes];
+    output[0..4].copy_from_slice(b"ORB1");
+    output[4..6].copy_from_slice(&1u16.to_le_bytes());
+    output[6..8].copy_from_slice(&(RECORD_SIZE as u16).to_le_bytes());
+    output[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    output[12..16].copy_from_slice(&(name_bytes as u32).to_le_bytes());
+    let mut name_offset = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let record = HEADER_SIZE + index * RECORD_SIZE;
+        let name = entry.name.as_bytes();
+        output[record..record + 4].copy_from_slice(&(name_offset as u32).to_le_bytes());
+        output[record + 4..record + 8].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        output[record + 8] = match entry.kind.as_str() { "file" => 1, "directory" => 2, "symlink" => 3, _ => 0 };
+        let device = entry.device.parse::<u64>().ok();
+        let inode = entry.inode.parse::<u64>().ok();
+        let link_count = u64::try_from(entry.link_count).ok();
+        let mut flags = if entry.mount_point { 1 } else { 0 };
+        if device.is_some() { flags |= 1 << 1; }
+        if inode.is_some() { flags |= 1 << 2; }
+        if link_count.is_some() { flags |= 1 << 3; }
+        if entry.error_code.is_some() { flags |= 1 << 4; }
+        output[record + 9] = flags;
+        output[record + 12..record + 16].copy_from_slice(&entry.error_code.unwrap_or(0).to_le_bytes());
+        output[record + 16..record + 24].copy_from_slice(&device.unwrap_or(0).to_le_bytes());
+        output[record + 24..record + 32].copy_from_slice(&inode.unwrap_or(0).to_le_bytes());
+        output[record + 32..record + 40].copy_from_slice(&(entry.allocated_bytes.max(0) as u64).to_le_bytes());
+        output[record + 40..record + 48].copy_from_slice(&link_count.unwrap_or(0).to_le_bytes());
+        let blob = HEADER_SIZE + RECORD_SIZE * entries.len() + name_offset;
+        output[blob..blob + name.len()].copy_from_slice(name);
+        name_offset += name.len();
+    }
+    output
 }
 
 fn clamp_page_limit(limit: u32) -> usize {
@@ -163,52 +260,13 @@ fn read_page_from_state(state: &mut CursorState, safe_limit: usize) -> Result<Me
     if state.closed {
         return Ok(empty_page(true));
     }
-    if let Some(names) = state.fallback_names.as_ref() {
-        let start = state.fallback_index;
-        let end = (start + safe_limit).min(names.len());
-        let entries = names[start..end]
-            .iter()
-            .map(|name| metadata_entry(&state.path, name, state.parent_device))
-            .collect::<Vec<_>>();
-        state.fallback_index = end;
-        return Ok(MetadataPage {
-            done: end == names.len(),
-            bulk_entries: 0,
-            fallback_entries: entries.len() as i64,
-            entries,
-        });
-    }
+    let file = state.file.as_ref().ok_or_else(|| Error::from_reason("metadata cursor is closed"))?;
     let (entries, bulk_error) = fill_requested_entries(
-        &mut state.pending_bulk,
-        &mut state.bulk_done,
-        safe_limit,
-        || read_bulk_records(state.file.as_raw_fd(), state.parent_device),
+        &mut state.pending_bulk, &mut state.bulk_done, safe_limit,
+        || read_bulk_records(file.as_raw_fd(), state.parent_device),
     );
+    if let Some(error) = bulk_error { return Err(error); }
     let bulk_entries = entries.len();
-    for entry in &entries {
-        state.emitted_names.insert(entry.name.clone());
-    }
-    if bulk_error.is_some() {
-        let fallback_names = read_fallback_names(&state.path, &state.emitted_names)?;
-        let take = (safe_limit - entries.len()).min(fallback_names.len());
-        let mut entries = entries;
-        entries.extend(
-            fallback_names[..take]
-                .iter()
-                .map(|name| metadata_entry(&state.path, name, state.parent_device)),
-        );
-        state.fallback_index = take;
-        state.fallback_names = Some(fallback_names);
-        return Ok(MetadataPage {
-            done: state
-                .fallback_names
-                .as_ref()
-                .is_some_and(|fallback| state.fallback_index == fallback.len()),
-            bulk_entries: bulk_entries as i64,
-            fallback_entries: (entries.len() - bulk_entries) as i64,
-            entries,
-        });
-    }
     let done = state.bulk_done && state.pending_bulk.is_empty();
     Ok(MetadataPage {
         bulk_entries: bulk_entries as i64,
@@ -249,57 +307,6 @@ fn empty_page(done: bool) -> MetadataPage {
         bulk_entries: 0,
         fallback_entries: 0,
     }
-}
-
-#[cfg(target_os = "macos")]
-fn metadata_entry(directory: &Path, name: &str, parent_device: u64) -> MetadataEntry {
-    use std::os::unix::fs::MetadataExt;
-    let path = directory.join(name);
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let kind = if metadata.file_type().is_symlink() {
-                "symlink"
-            } else if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            };
-            MetadataEntry {
-                name: name.to_owned(),
-                kind: kind.to_owned(),
-                device: metadata.dev().to_string(),
-                inode: metadata.ino().to_string(),
-                allocated_bytes: (metadata.blocks() as i128 * 512).min(i64::MAX as i128) as i64,
-                link_count: metadata.nlink().min(i64::MAX as u64) as i64,
-                mount_point: metadata.is_dir() && metadata.dev() != parent_device,
-                error_code: None,
-            }
-        }
-        Err(error) => MetadataEntry {
-            name: name.to_owned(),
-            kind: "other".to_owned(),
-            device: String::new(),
-            inode: String::new(),
-            allocated_bytes: 0,
-            link_count: 0,
-            mount_point: false,
-            error_code: error.raw_os_error(),
-        },
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_fallback_names(directory: &Path, emitted: &HashSet<String>) -> Result<Vec<String>> {
-    let mut names = fs::read_dir(directory)
-        .map_err(io_error)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| !emitted.contains(name) && !name.is_empty() && name != "." && name != "..")
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    Ok(names)
 }
 
 #[cfg(target_os = "macos")]
@@ -347,19 +354,21 @@ fn parse_bulk_records(buffer: &[u8], count: usize, parent_device: u64) -> Result
     let mut entries = Vec::with_capacity(count);
     let mut offset = 0_usize;
     for _ in 0..count {
-        if offset + 32 > buffer.len() {
+        if offset.checked_add(32).is_none_or(|end| end > buffer.len()) {
             return Err(Error::from_reason(
                 "getattrlistbulk returned a truncated record",
             ));
         }
         let record_length =
             u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
-        if record_length < 32 || offset + record_length > buffer.len() {
+        let Some(record_end) = offset.checked_add(record_length) else {
+            return Err(Error::from_reason("getattrlistbulk returned an invalid record length"));
+        };
+        if record_length < 32 || record_end > buffer.len() {
             return Err(Error::from_reason(
                 "getattrlistbulk returned an invalid record length",
             ));
         }
-        let record_end = offset + record_length;
         let commonattr = u32::from_ne_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
         let dirattr = u32::from_ne_bytes(buffer[offset + 12..offset + 16].try_into().unwrap());
         let fileattr = u32::from_ne_bytes(buffer[offset + 16..offset + 20].try_into().unwrap());
@@ -389,12 +398,12 @@ fn parse_bulk_records(buffer: &[u8], count: usize, parent_device: u64) -> Result
                 i32::from_ne_bytes(buffer[cursor..cursor + 4].try_into().unwrap());
             let reference_length =
                 u32::from_ne_bytes(buffer[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
-            let data_start = (cursor as isize + reference_offset as isize) as usize;
+            let data_start = usize::try_from(reference_offset).ok().and_then(|relative| cursor.checked_add(relative));
+            let data_end = data_start.and_then(|start| start.checked_add(reference_length));
             if reference_offset < 0
-                || data_start < cursor + 8
-                || data_start >= record_end
+                || data_start.is_none_or(|start| start < cursor + 8 || start >= record_end)
                 || reference_length == 0
-                || data_start + reference_length > record_end
+                || data_end.is_none_or(|end| end > record_end)
             {
                 if error_code.is_some() {
                     // Degenerate error record: skip it rather than fail the directory.
@@ -405,7 +414,7 @@ fn parse_bulk_records(buffer: &[u8], count: usize, parent_device: u64) -> Result
                     "getattrlistbulk returned an invalid name reference",
                 ));
             }
-            let bytes = &buffer[data_start..data_start + reference_length];
+            let bytes = &buffer[data_start.unwrap()..data_end.unwrap()];
             let end = bytes
                 .iter()
                 .position(|byte| *byte == 0)
@@ -535,12 +544,53 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::fs;
 
     #[test]
     fn clamps_page_limits_to_supported_range() {
         assert_eq!(clamp_page_limit(0), 1);
         assert_eq!(clamp_page_limit(512), 512);
         assert_eq!(clamp_page_limit(2_048), 1_024);
+    }
+
+    #[test]
+    fn encodes_packed_metadata_pages() {
+        let entries = vec![MetadataEntry {
+            name: "café".into(), kind: "file".into(), device: "7".into(), inode: "9".into(),
+            allocated_bytes: 4096, link_count: 2, mount_point: true, error_code: None,
+        }, MetadataEntry {
+            name: "denied".into(), kind: "other".into(), device: "".into(), inode: "".into(),
+            allocated_bytes: 0, link_count: 0, mount_point: false, error_code: Some(13),
+        }];
+        let packed = encode_metadata_page(&entries);
+        assert_eq!(&packed[0..4], b"ORB1");
+        assert_eq!(u16::from_le_bytes(packed[4..6].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(packed[6..8].try_into().unwrap()), 48);
+        assert_eq!(u32::from_le_bytes(packed[8..12].try_into().unwrap()), 2);
+        assert_eq!(packed[24], 1);
+        assert_eq!(packed[25] & 0x0f, 0x0f);
+        assert_eq!(i32::from_le_bytes(packed[76..80].try_into().unwrap()), 13);
+        assert_eq!(&packed[112..], "cafédenied".as_bytes());
+        assert_eq!(encode_metadata_page(&[]).len(), 16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptor_tree_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("orbis-tree-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(root.join("real/child")).unwrap();
+        symlink(root.join("real"), root.join("alias")).unwrap();
+        symlink(root.join("real/child"), root.join("real/final-alias")).unwrap();
+        let tree = open_metadata_tree(root.to_string_lossy().into_owned()).unwrap();
+        assert!(tree.open_directory("real/child".into()).is_ok());
+        assert!(tree.open_directory("alias/child".into()).is_err());
+        assert!(tree.open_directory("real/final-alias".into()).is_err());
+        for invalid in ["/absolute", "a//b", ".", "..", "a/../b"] { assert!(tree.open_directory(invalid.into()).is_err()); }
+        tree.close();
+        assert!(tree.open_directory("".into()).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,15 +1,16 @@
 import { constants } from 'node:fs'
 import { copyFile, lstat, open, rename, statfs } from 'node:fs/promises'
-import { dirname, normalize, relative, resolve, sep } from 'node:path'
+import { basename, dirname, normalize, relative, resolve, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { ChangeJournal } from './change-journal'
 import { createChangeJournal, FSEVENT_FLAGS, nativeChangeJournalAddon } from './change-journal'
 import { prepareDatabaseDirectory, readMetadata, removeDatabaseFiles } from './database'
-import { measureScanAsync, runWithScanDiagnostics } from './diagnostics'
+import { createScanTimingMilestones, measureScan, measureScanAsync, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone } from './diagnostics'
 import { FullScanResumeStore, type FullScanResumeDescriptor, type FullScanResumeLoad } from './full-scan-resume'
 import type { IndexManifest, JournalCursor } from './index-manifest'
 import { planDirtyScopes, scanReplacementScopes } from './incremental-scanner'
 import { IncrementalFallbackError, replaceIndexSubtrees } from './persistent-index-database'
+import { publicationIdFromDatabaseFile } from './publication-artifacts'
 import { loadNativeOrbisAddon } from './scan-metadata'
 import { ScanCanceledError, STARTUP_EXCLUSIONS, scanFilesystem, type ScanOptions, type ScanResult, type ScanTotals } from './scanner'
 
@@ -21,6 +22,7 @@ export interface ActivePersistentIndex {
 export interface RefreshRequest extends ScanOptions {
   readonly active?: ActivePersistentIndex
   readonly changeJournal?: ChangeJournal
+  readonly resumeExpected?: boolean
 }
 
 export type RefreshOutcome =
@@ -33,10 +35,17 @@ const HISTORY_TIMEOUT_MS = 10_000
 // straggler hedge; the cursor model catches anything later at the next drain
 // or scan. The resume-validation read keeps the default 100ms quiet wait.
 const REPLAY_QUIET_MS = 10
-const MAX_RESUME_RESTARTS = 3
 
 export function refreshPersistentIndex(request: RefreshRequest): Promise<RefreshOutcome> {
-  return runWithScanDiagnostics(request.generation, () => measureScanAsync('refresh-total', () => refreshPersistentIndexImpl(request)))
+  return runWithScanDiagnostics(request.generation, () => {
+    const timing = request.resumeExpected ? createScanTimingMilestones() : undefined
+    const report = (milestone: ResumeMilestone): void => {
+      if (milestone === 'first-metadata-page') timing?.mark('resume-first-metadata-page')
+      request.onResumeMilestone?.(milestone)
+    }
+    if (request.resumeExpected) report('preparation-started')
+    return measureScanAsync('refresh-total', () => refreshPersistentIndexImpl({ ...request, onResumeMilestone: report }))
+  })
 }
 
 async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<RefreshOutcome> {
@@ -122,7 +131,7 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
 
 async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | undefined, fallbackReason?: string, raceRetry = 0, resumeRestarts = 0, saved?: FullScanResumeLoad): Promise<RefreshOutcome> {
   const resumeStore = new FullScanResumeStore(request.indexDirectory)
-  const resumable = journal && resumeRestarts < MAX_RESUME_RESTARTS && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1'
+  const resumable = journal && resumeRestarts === 0 && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1'
     ? await prepareResumableFullScan(request, journal, resumeStore, saved)
     : undefined
   if (!resumable) await Promise.all([removeDatabaseFiles(request.partialPath), removeDatabaseFiles(request.publishedPath)])
@@ -131,6 +140,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
     : journal && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1' ? safeCheckpoint(journal, request.target) : undefined
   let result: ScanResult
   try {
+    if (!resumable?.candidate) recordScanCounter('fullScanAttempts')
     result = resumable?.candidate
       ? readCandidateResult(resumable.candidate, request.generation)
       : await scanFilesystem({ ...request, partialPath: resumable?.partialPath ?? request.partialPath, publishedPath: resumable?.candidatePath ?? request.publishedPath,
@@ -142,6 +152,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
     const message = error instanceof Error ? error.message : String(error)
     if (resumable && message.startsWith('resume-invalidated:')) {
       await resumeStore.discard(resumable.descriptor.scanId)
+      recordScanCounter('fullScanRetries')
       return fullRefresh(request, journal, message.slice('resume-invalidated:'.length), raceRetry, resumeRestarts + 1)
     }
     throw error
@@ -289,7 +300,7 @@ async function prepareResumableFullScan(request: RefreshRequest, journal: Change
     // (persisted at each 30s drain and at pause), so replaying from the
     // scan-start baseline would discard a perfectly resumable scan whenever
     // the long window trips a journal limit or drop flag.
-    const history = journal.readChanges(request.target, store.cursor(loaded.descriptor, loaded.drainedThrough), MAX_EVENTS, HISTORY_TIMEOUT_MS)
+    const history = measureScan('resume-history-validation', () => journal.readChanges(request.target, store.cursor(loaded.descriptor, loaded.drainedThrough), MAX_EVENTS, HISTORY_TIMEOUT_MS))
     if (history.requiresFullScan) {
       await store.discard(loaded.descriptor.scanId)
       const fresh = await createResumableFullScan(request, journal, store)
@@ -324,8 +335,8 @@ async function createResumableFullScan(request: RefreshRequest, journal: ChangeJ
 }
 
 function scanIdFromPaths(partialPath: string, candidatePath: string): string | undefined {
-  const partial = /(?:^|\/)index-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.partial\.sqlite$/u.exec(partialPath)?.[1]
-  const candidate = /(?:^|\/)index-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.sqlite$/u.exec(candidatePath)?.[1]
+  const partial = publicationIdFromDatabaseFile(basename(partialPath), true)
+  const candidate = publicationIdFromDatabaseFile(basename(candidatePath), false)
   return partial && partial === candidate ? partial : undefined
 }
 
@@ -351,8 +362,9 @@ function readCandidateResult(path: string, generation: number): ScanResult {
 
 async function retryFullRefresh(request: RefreshRequest, journal: ChangeJournal, reason: string, raceRetry: number, resumeRestarts: number): Promise<RefreshOutcome> {
   if (raceRetry < 1) {
+    recordScanCounter('fullScanRetries')
     await new FullScanResumeStore(request.indexDirectory).discard().catch(() => false)
-    return fullRefresh(request, journal, reason, raceRetry + 1, resumeRestarts)
+    return fullRefresh(request, journal, reason, raceRetry + 1, Math.max(1, resumeRestarts))
   }
   // Preserve the checkpointed candidate and descriptor: a busy FSEvents
   // window must not destroy resumable progress. The controller surfaces the
@@ -369,7 +381,7 @@ async function retryFullRefresh(request: RefreshRequest, journal: ChangeJournal,
 function createIdentityLookup(path: string, target: string): { lookup(path: string): { device: string; inode: string } | undefined; close(): void } {
   const database = new DatabaseSync(path, { readOnly: true })
   const node = database.prepare('SELECT device, inode FROM nodes WHERE path = ?')
-  const alias = database.prepare('SELECT device, inode FROM file_aliases WHERE path_key = ?')
+  const alias = database.prepare('SELECT device, inode FROM hardlink_paths WHERE path_key = ?')
   return {
     lookup: (absolutePath) => {
       const direct = node.get(absolutePath) as { device?: string; inode?: string } | undefined

@@ -2,7 +2,8 @@ import { BrowserWindow, dialog, shell, type WebContents } from 'electron'
 import { Worker } from 'node:worker_threads'
 import { validateFeatureResources, type EmbeddedFeatureSurface, type FeatureContext, type MoirasiaFeature } from '@moirasia/desktop-shell/feature'
 import { desktopWindowChromeOptions, neutralWindowBackground, registerProductAppearance } from '@moirasia/desktop-shell/main'
-import { OrbisController, type OrbisWorkerFactory } from './controller'
+import { OrbisController } from './controller'
+import { WorkerScanExecution, type WorkerTransportFactory } from './scan-execution'
 import { registerIpc } from './ipc'
 
 export class OrbisFeature implements MoirasiaFeature {
@@ -24,7 +25,7 @@ export class OrbisFeature implements MoirasiaFeature {
     const dataDirectory = ctx.paths.dataDirectory
     if (!workerPath || !dataDirectory) throw new Error('Orbis feature resources are incomplete')
 
-    const controller = new OrbisController(createWorkerFactory(workerPath, nativeAddonPath), {
+    const controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, nativeAddonPath)), {
       dataDirectory,
       ...(process.env.ORBIS_SCAN_ROOT ? { initialTarget: process.env.ORBIS_SCAN_ROOT } : {}),
       ...(ctx.mode === 'standalone'
@@ -70,7 +71,6 @@ export class OrbisFeature implements MoirasiaFeature {
         if (!renderer) throw new Error('Orbis standalone renderer is missing')
         await loadRenderer(standaloneWindow, renderer)
         standaloneWindow.show()
-        await controller.startScan()
       }
     } catch (error) {
       disposeIpc?.()
@@ -118,7 +118,7 @@ export class OrbisFeature implements MoirasiaFeature {
 
 export const feature = new OrbisFeature()
 
-function createWorkerFactory(workerPath: string, nativeAddonPath: string | undefined): OrbisWorkerFactory {
+function createWorkerFactory(workerPath: string, nativeAddonPath: string | undefined): WorkerTransportFactory {
   return { create: () => nativeAddonPath ? new Worker(workerPath, { workerData: { nativeAddonPath } }) : new Worker(workerPath) }
 }
 

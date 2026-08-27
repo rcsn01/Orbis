@@ -8,6 +8,7 @@ import { FullScanResumeStore } from '../src/main/full-scan-resume'
 import { IndexManifestStore } from '../src/main/index-manifest'
 import { ProgressiveScanControl, ScanCanceledError, scanFilesystem } from '../src/main/scanner'
 import { ConstructionDatabase } from '../src/main/construction-database'
+import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
 import type { DirectoryMetadataEntry, DirectoryMetadataSource } from '../src/main/scan-metadata'
 
 const cleanup: string[] = []
@@ -37,15 +38,26 @@ describe('resumable Orbis full scans', () => {
     const candidatePath = join(indexes, descriptor.candidateFile)
     const abort = new AbortController()
     const sequences: number[] = []
+    let previewCount = 0
     const first = scanFilesystem({
       generation: 1, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
       signal: abort.signal, control: new ProgressiveScanControl(), resumable: { descriptor, store, resume: false }, onCheckpoint: (sequence) => sequences.push(sequence),
-      onPreview: () => abort.abort()
+      onPreview: () => { previewCount += 1; if (previewCount === 2) abort.abort() }
     })
     await expect(first).rejects.toBeInstanceOf(ScanCanceledError)
     expect(sequences.length).toBeGreaterThan(1)
-    const loaded = await store.load(target)
+    const loadEvents: OrbisTimingEvent[] = []
+    const loadCounters = emptyScanCounters()
+    const unsubscribeLoadTimings = subscribeScanDiagnostics((event) => { if (event.generation === 20) loadEvents.push(event) })
+    const unsubscribeLoadCounters = subscribeScanCounters((event) => { if (event.generation === 20) loadCounters[event.counter] += event.value })
+    let loaded: Awaited<ReturnType<FullScanResumeStore['load']>>
+    try { loaded = await runWithScanDiagnostics(20, () => store.load(target)) }
+    finally { unsubscribeLoadTimings(); unsubscribeLoadCounters() }
     expect(loaded).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+    for (const phase of ['resume-load-total', 'resume-descriptor-validation', 'resume-file-validation', 'resume-candidate-validation', 'resume-construction-validation', 'resume-integrity-check', 'resume-foreign-key-check']) {
+      expect(loadEvents.filter((event) => event.phase === phase), phase).toHaveLength(1)
+    }
+    expect(loadCounters.resumeFullValidations).toBe(1)
     const drain = ConstructionDatabase.openResumable(partialPath)
     drain.setJournalDrain([join(target, 'changed-scope')], '12')
     drain.checkpoint()
@@ -63,11 +75,28 @@ describe('resumable Orbis full scans', () => {
     checkpoint.close()
 
     const resumedSequences: number[] = []
-    const result = await scanFilesystem({
-      generation: 2, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
-      resumable: { descriptor, store, resume: true }, onCheckpoint: (sequence) => resumedSequences.push(sequence)
-    })
-    expect(resumedSequences).toHaveLength(2)
+    const events: OrbisTimingEvent[] = []
+    const counters = emptyScanCounters()
+    const milestones: string[] = []
+    const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 2) events.push(event) })
+    const unsubscribeCounters = subscribeScanCounters((event) => { if (event.generation === 2) counters[event.counter] += event.value })
+    let result: Awaited<ReturnType<typeof scanFilesystem>>
+    try {
+      result = await scanFilesystem({
+        generation: 2, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
+        resumable: { descriptor, store, resume: true }, onCheckpoint: (sequence) => resumedSequences.push(sequence),
+        onResumeMilestone: (milestone) => milestones.push(milestone)
+      })
+    } finally { unsubscribeTimings(); unsubscribeCounters() }
+    expect(resumedSequences).toHaveLength(3)
+    for (const phase of ['resume-database-open', 'resume-incomplete-recovery', 'resume-hardlink-repair', 'resume-aggregate-repair', 'resume-scheduler-repair', 'resume-semantic-totals', 'resume-checkpoint']) {
+      const matches = events.filter((event) => event.phase === phase)
+      expect(matches, phase).toHaveLength(1)
+      expect(matches[0]!.durationMs).toBeGreaterThanOrEqual(0)
+    }
+    expect(milestones).toEqual(['first-metadata-page'])
+    expect(counters.resumeRecoveryRoots).toBeGreaterThan(0)
+    expect(counters.resumeReplayedEntries).toBeGreaterThan(0)
     const candidate = new DatabaseSync(result.publishedPath, { readOnly: true })
     try {
       expect(candidate.prepare('SELECT id FROM nodes WHERE parent_id IS NULL').get()).toEqual({ id: expectedRootId })
