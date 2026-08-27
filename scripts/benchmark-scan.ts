@@ -683,10 +683,7 @@ function makeResumeSample(
     clickToFirstMetadataPreviewMs: required('resume-click-to-first-metadata-preview'),
     workerToFirstMetadataPageMs: firstPage,
     completionMs,
-    phases: {
-      ...Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
-      ...(scanTimings['resume-aggregate-fallback'] === undefined ? {} : { 'resume-aggregate-fallback': scanTimings['resume-aggregate-fallback'] })
-    },
+    phases: Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
     counters
   }
 }
@@ -726,11 +723,7 @@ function makeFixtureReport(fixture: string, manifest: FixtureReport['manifest'],
         clickToFirstMetadataPageMs: values((sample) => sample.resume!.clickToFirstMetadataPageMs),
         clickToFirstMetadataPreviewMs: values((sample) => sample.resume!.clickToFirstMetadataPreviewMs),
         completionMs: values((sample) => sample.resume!.completionMs),
-        phases: Object.fromEntries([
-          ...RESUME_SCAN_PHASES.map((phase) => [phase, values((sample) => sample.resume!.phases[phase] ?? 0)] as const),
-          ...(samples.some((sample) => sample.resume!.phases['resume-aggregate-fallback'] !== undefined)
-            ? [['resume-aggregate-fallback', values((sample) => sample.resume!.phases['resume-aggregate-fallback'] ?? 0)] as const] : [])
-        ]),
+        phases: Object.fromEntries(RESUME_SCAN_PHASES.map((phase) => [phase, values((sample) => sample.resume!.phases[phase] ?? 0)])),
         counters: Object.fromEntries(SCAN_COUNTER_NAMES.map((counter) => [counter, values((sample) => sample.resume!.counters[counter])]))
       } } : {})
     }
@@ -744,7 +737,7 @@ function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly 
     classifyResumeValidation(worker)
     if (worker.counters.resumeRecoveryRoots < 1) throw new Error('Resume diagnostics did not report a recovery root')
     if (worker.counters.resumeReplayedEntries < 1) throw new Error('Resume diagnostics did not report replayed entries')
-    if (worker.counters.resumeAggregateFallbacks !== 0) throw new Error('Stage 5 resume used the aggregate fallback')
+    if (worker.counters.resumeAggregateFallbacks !== 0) throw new Error('Removed aggregate fallback was used')
     if (manifest.profile !== 'live' && manifest.name === 'deep' && worker.counters.resumeRepairedAncestors >= manifest.directories) {
       throw new Error('Deep resume repaired every directory instead of only affected ancestors')
     }

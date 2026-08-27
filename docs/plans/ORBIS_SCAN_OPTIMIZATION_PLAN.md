@@ -4,7 +4,7 @@ This plan turns the SquirrelDisk and PDU research into independently testable im
 
 Supporting research: [`../research/squirreldisk-orbis-optimizations.md`](../research/squirreldisk-orbis-optimizations.md)
 
-Resume-specific stages are tracked in [`../../ORBIS_RESUME_OPTIMIZATION_PLAN.md`](../../ORBIS_RESUME_OPTIMIZATION_PLAN.md). Stage 5 now scopes hard-link, scheduler, and aggregate recovery to affected rows while retaining the recursive aggregate rebuild only as a guarded diagnostic fallback; focused lifecycle coverage, fresh-scan parity, schema-8 diagnostics, and matched resume measurements have passed.
+Resume-specific stages are tracked in [`../../ORBIS_RESUME_OPTIMIZATION_PLAN.md`](../../ORBIS_RESUME_OPTIMIZATION_PLAN.md). Stage 5 now scopes hard-link, scheduler, and aggregate recovery to affected rows; scoped mismatches abort without a recursive global rebuild. Focused lifecycle coverage, fresh-scan parity, schema-8 diagnostics, and matched recovery measurements have passed. The plan's <=25% whole-load receipt timing gate remains open.
 
 The schema, native transport, checkpoint, and incremental-refresh proposals below are historical. The scan pipeline redesign supersedes those unchecked items. See [`../benchmarks/orbis-scan-pipeline-redesign.md`](../benchmarks/orbis-scan-pipeline-redesign.md) and [`../architecture/orbis-progressive-scanning.md`](../architecture/orbis-progressive-scanning.md) for the retained design.
 

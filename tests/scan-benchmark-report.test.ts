@@ -33,10 +33,10 @@ describe('scan benchmark report schema', () => {
     expect(() => validateScanBenchmarkReport(report('resume-process-restart'))).toThrow(/no resume metrics/)
   })
 
-  it('accepts an optional aggregate fallback work phase', () => {
+  it('rejects removed aggregate fallback work phase', () => {
     const value = resume()
     Object.assign(value.phases as Record<string, number>, { 'resume-aggregate-fallback': 1 })
-    expect(() => validateScanBenchmarkReport(report('resume-clean-pause', value))).not.toThrow()
+    expect(() => validateScanBenchmarkReport(report('resume-clean-pause', value))).toThrow(/phases/)
   })
 
   it('rejects missing counters and invalid durations', () => {

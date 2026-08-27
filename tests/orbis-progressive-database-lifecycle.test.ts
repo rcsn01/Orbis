@@ -212,81 +212,47 @@ describe('ConstructionDatabase construction lifecycle', () => {
     } finally { database.abort() }
   })
 
-  it('repairs scoped aggregates and uses the diagnostic fallback only after an affected mismatch', async () => {
+  it('aborts on a scoped aggregate mismatch without a global repair', async () => {
     const fixture = await createAggregateRecoveryFixture()
     installAggregateAudit(fixture.path)
     installAggregateFault(fixture.path, 'one-shot')
+    const before = readConstructionSnapshot(fixture.path)
     const counters = emptyScanCounters()
     const events: OrbisTimingEvent[] = []
     const unsubscribeCounters = subscribeScanCounters((event) => { if (event.generation === 101) counters[event.counter] += event.value })
     const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 101) events.push(event) })
     const resumed = ConstructionDatabase.openResumable(fixture.path)
-    try {
-      const recovery = runWithScanDiagnostics(101, () => resumed.recoverIncompleteDirectories())
-      expect(recovery.repairedAncestors).toBe(2)
-      resumed.checkpoint({ reason: 'resume' })
-      expect(counters.resumeAggregateFallbacks).toBe(1)
-      expect(events.filter((event) => event.phase === 'resume-aggregate-fallback')).toHaveLength(1)
-    } finally {
-      resumed.abort()
-      unsubscribeCounters()
-      unsubscribeTimings()
-    }
-    const snapshot = readConstructionSnapshot(fixture.path)
-    expect(snapshot.directoryAggregateOracle).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: fixture.rootId }), expect.objectContaining({ id: fixture.affectedId })
-    ]))
-    for (const aggregate of snapshot.directoryAggregateOracle) {
-      const node = snapshot.nodes.find((row) => row.id === aggregate.id)
-      expect(node).toMatchObject(aggregate)
-    }
-    const audit = new DatabaseSync(fixture.path, { readOnly: true })
-    try {
-      const writes = (audit.prepare('SELECT node_id AS nodeId FROM aggregate_audit').all() as unknown as Array<{ nodeId: string }>).map((row) => row.nodeId)
-      expect(new Set(writes)).toEqual(new Set([fixture.rootId, fixture.affectedId, fixture.stableId, fixture.unrelatedId]))
-    } finally { audit.close() }
-  })
-
-  it('rejects unrelated aggregate corruption instead of invoking the global fallback', async () => {
-    const fixture = await createAggregateRecoveryFixture()
-    const malformed = new DatabaseSync(fixture.path)
-    try { malformed.prepare('UPDATE nodes SET size_bytes = size_bytes + 1 WHERE id = ?').run(fixture.stableId) }
-    finally { malformed.close() }
-    installAggregateFault(fixture.path, 'one-shot')
-    const before = readConstructionSnapshot(fixture.path)
-    const counters = emptyScanCounters()
-    const events: OrbisTimingEvent[] = []
-    const unsubscribeCounters = subscribeScanCounters((event) => { if (event.generation === 102) counters[event.counter] += event.value })
-    const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 102) events.push(event) })
-    const resumed = ConstructionDatabase.openResumable(fixture.path)
     let error: unknown
-    try { runWithScanDiagnostics(102, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+    try { runWithScanDiagnostics(101, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
       resumed.abort()
       unsubscribeCounters()
       unsubscribeTimings()
     }
     expect(error).not.toBeInstanceOf(ConstructionError)
-    expect(String((error as Error)?.message)).toMatch(/unrelated.*aggregate/i)
+    expect(String((error as Error)?.message)).toMatch(/Scoped aggregate repair did not converge/)
     expect(counters.resumeAggregateFallbacks).toBe(0)
     expect(events.filter((event) => event.phase === 'resume-aggregate-fallback')).toHaveLength(0)
     expect(readConstructionSnapshot(fixture.path)).toEqual(before)
+    const audit = new DatabaseSync(fixture.path, { readOnly: true })
+    try { expect(audit.prepare('SELECT node_id FROM aggregate_audit').all()).toEqual([]) }
+    finally { audit.close() }
   })
 
-  it('rolls back a persistent aggregate fallback fault with the durable checkpoint intact', async () => {
+  it('rolls back a persistent scoped aggregate fault with the durable checkpoint intact', async () => {
     const fixture = await createAggregateRecoveryFixture()
     installAggregateFault(fixture.path, 'persistent')
     const before = readConstructionSnapshot(fixture.path)
     const counters = emptyScanCounters()
-    const unsubscribe = subscribeScanCounters((event) => { if (event.generation === 103) counters[event.counter] += event.value })
+    const unsubscribe = subscribeScanCounters((event) => { if (event.generation === 102) counters[event.counter] += event.value })
     const resumed = ConstructionDatabase.openResumable(fixture.path)
     let error: unknown
-    try { runWithScanDiagnostics(103, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+    try { runWithScanDiagnostics(102, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
       resumed.abort()
       unsubscribe()
     }
     expect(error).not.toBeInstanceOf(ConstructionError)
-    expect(String((error as Error)?.message)).toMatch(/after resume fallback|aggregate/i)
-    expect(counters.resumeAggregateFallbacks).toBe(1)
+    expect(String((error as Error)?.message)).toMatch(/Scoped aggregate repair did not converge/)
+    expect(counters.resumeAggregateFallbacks).toBe(0)
     expect(readConstructionSnapshot(fixture.path)).toEqual(before)
   })
 

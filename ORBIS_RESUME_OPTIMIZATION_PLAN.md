@@ -2,14 +2,14 @@
 
 ## Purpose
 
-Resume should preserve every durability and correctness guarantee of a fresh scan without making the user wait through avoidable whole-database work. The current path does four expensive things before it emits resumed traversal progress:
+Resume should preserve every durability and correctness guarantee of a fresh scan without making the user wait through avoidable whole-database work. The pre-optimization path did four expensive things before it emitted resumed traversal progress:
 
 1. `FullScanResumeStore.load()` validates the construction database with SQLite integrity and foreign-key checks.
 2. `ConstructionDatabase.recoverIncompleteDirectories()` resets interrupted work.
 3. Recovery rebuilds hard-link ownership, directory aggregates, and scheduler state across the whole construction database.
 4. The scanner writes a `synchronous=FULL` resume checkpoint.
 
-The controller often validated the same saved scan during Pause or application initialization. The worker does not know that, so it validates it again. The UI reports only `scanning`, which makes this preparation look like a stall.
+The controller often validated the same saved scan during Pause or application initialization. The worker did not know that, so it validated the scan again. The UI reported only `scanning`, which made this preparation look like a stall.
 
 This plan splits the work into five stages. Instrumentation lands first, then visible preparation status, then the two performance changes. The last stage proves the result with matched resume benchmarks and failure tests.
 
@@ -118,7 +118,7 @@ Extend typed scan counters with:
 - `resumeDeletedNodes`
 - `resumeAffectedHardlinkIdentities`
 - `resumeRepairedAncestors`
-- `resumeAggregateFallbacks`
+- `resumeAggregateFallbacks` (retained as a zero-valued schema-8 compatibility field)
 - `resumeRepairedSchedulerRows`
 - `resumeReplayedEntries`
 
@@ -130,7 +130,7 @@ Publish `resume-first-metadata-page` once, when the first page accepted after re
 
 ### Benchmark schema
 
-Move the scan benchmark report to schema 8. Add a `resume` section per sample; the nested `resume-aggregate-fallback` phase is optional because normal recovery does not emit it:
+Move the scan benchmark report to schema 8. Add a `resume` section per sample with the required resume phases. Aggregate fallback is no longer a recovery phase; retain its counter as a zero-valued compatibility field for existing schema-8 reports:
 
 ```ts
 interface ResumeBenchmarkSample {
@@ -460,7 +460,7 @@ Assert that unrelated node IDs, task rows, owners, and observation rows do not c
 
 # Stage 5: replace the global recursive aggregate rebuild
 
-**Status:** Implemented. Scoped aggregate repair, guarded fallback validation, propagation bookkeeping, generated-tree parity, deep write auditing, saved-preview checks, schema-8 diagnostics, and matched clean-Pause measurements passed. The full rebuild remains available only as a diagnostic fallback for one release.
+**Status:** Implemented. Scoped aggregate repair, propagation bookkeeping, generated-tree parity, deep write auditing, saved-preview checks, schema-8 diagnostics, and matched clean-Pause recovery measurements passed. The former recursive fallback has been removed. The <=25% whole-load receipt timing gate remains open; the current evidence is recorded in the benchmark document.
 
 ## Goal
 
@@ -499,11 +499,9 @@ Rebuild `#propagatedToParent` for every retained unreadable node whose parent li
 
 If semantic totals dominate after the closure removal, add persisted counters in a separate schema change with a migration and independent parity tests.
 
-### Fallback
+### Mismatch handling
 
-Keep a private full-rebuild implementation for one release as a diagnostic fallback, guarded by an explicit recovery error and counter. It must not silently repair arbitrary corruption. Receipt or structural validation failure still follows the authoritative full-validation or restart path.
-
-Remove the fallback after benchmark coverage and production diagnostics show no scoped-recovery mismatches.
+Scoped aggregate repair is authoritative. If an affected directory still fails its direct-child equation after repair, throw the scoped mismatch and abort the recovery transaction. Do not attempt a global rebuild or repair unrelated rows. Receipt or structural validation failure still follows the authoritative full-validation or restart path.
 
 ## Tests
 
@@ -523,7 +521,7 @@ Required results:
 - Clean same-process Resume performs zero full validations.
 - Receipt validation time is at most 25% of the previous full-validation median on standard fixtures.
 - Recovery SQL row updates scale with reported recovery roots, affected identities, scheduler rows, and ancestor rows. They must not equal total construction rows unless the root itself was interrupted.
-- Deep fixture recovery removes the global recursive-closure phase.
+- Resume recovery contains no global recursive aggregate closure.
 - Time from Resume click to first new metadata page improves by at least 50% on the wide and deep resume fixtures, or is below 500 ms warm, whichever condition is met first.
 - Uninterrupted traversal throughput, first-preview latency, checkpoint count, and final database size do not regress by more than 5% in matched five-sample medians.
 - Every optimized result passes fresh-scan row parity, schema validation, foreign-key checks, and hard-link ownership checks.
@@ -570,7 +568,7 @@ Also correct stale startup wording while touching the architecture document. Sta
 8. Compare scoped recovery output with the current full rebuild across generated fixtures.
 9. Land Stage 5 aggregate repair and remove the normal global closure.
 10. Run the full verification and matched benchmark matrix.
-11. Keep the diagnostic full-rebuild fallback for one release, then remove it after evidence supports removal.
+11. Done. Removed the diagnostic full-rebuild fallback after scoped recovery coverage was sufficient.
 
 # Final verification commands
 
@@ -595,7 +593,7 @@ The work is complete when:
 - Clean same-process Resume reuses a verified checkpoint without a second full integrity pass.
 - Crash, restart, timeout, and tamper paths still perform authoritative validation.
 - Recovery touches interrupted scopes, affected hard-link identities, and affected ancestors instead of rebuilding the whole construction database.
-- The global recursive aggregate closure is absent from normal resume.
+- The global recursive aggregate closure is absent from resume recovery.
 - The first newly scanned metadata page arrives within the acceptance target.
 - Final candidates remain row-for-row semantically equivalent to fresh scans under the repository's parity checks.
 - Tests, native builds, packaging, and matched benchmarks pass.

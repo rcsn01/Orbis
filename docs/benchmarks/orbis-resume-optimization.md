@@ -2,7 +2,7 @@
 
 ## Stage 1 instrumentation
 
-Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and the aggregate-fallback counter. Schema-7 reports below are historical artifacts.
+Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and retains the aggregate-fallback counter as a legacy compatibility field. Schema-7 reports below are historical artifacts.
 
 ### Timing interpretation
 
@@ -18,7 +18,7 @@ Enclosing and sequential phases are attributable parts of resume wall time:
 Nested work phases describe work inside validation or recovery. Do not add them to their enclosing phase:
 
 - Descriptor, file, candidate, construction, integrity, and foreign-key validation
-- Hard-link, aggregate, optional aggregate-fallback, and scheduler repair
+- Hard-link, aggregate, and scheduler repair
 
 `resume-first-metadata-page` is an elapsed milestone from worker refresh entry. Controller milestones measure from the Resume invocation to worker preparation, progress, accepted metadata, and the first preview containing that metadata.
 
@@ -31,7 +31,7 @@ Nested work phases describe work inside validation or recovery. Do not add them 
 - `resumeDeletedNodes` counts descendants removed before replay.
 - `resumeAffectedHardlinkIdentities` counts identities captured from reset roots and their deleted descendants.
 - `resumeRepairedAncestors` counts directory aggregate rows recomputed for the affected recovery set. It no longer counts a whole-database pass.
-- `resumeAggregateFallbacks` counts scoped aggregate mismatches that entered the guarded diagnostic global rebuild. Normal Stage 5 resume samples must report zero.
+- `resumeAggregateFallbacks` is a retained schema-8 compatibility counter. The aggregate fallback was removed, so current Stage 5 samples always report zero.
 - `resumeRepairedSchedulerRows` counts task rows in reset-root and affected owner-parent ancestor chains.
 - `resumeReplayedEntries` counts metadata entries accepted after recovery.
 
@@ -99,15 +99,15 @@ These small runs validate report shape and lifecycle counters, not performance.
 
 ## Stage 5 bounded aggregate results
 
-Stage 5 keeps the recursive aggregate closure only as a guarded diagnostic fallback. Normal resume uses one prepared direct-child equation update per affected directory, in descending depth order, and validates both affected and unaffected rows before any fallback. The fallback remains inside the recovery transaction and is rejected when unrelated aggregate corruption is present.
+Stage 5 uses one prepared direct-child equation update per affected directory, in descending depth order. A scoped equation mismatch aborts the recovery transaction; resume never runs a global aggregate rebuild.
 
 The matched clean-Pause matrix below used one warm-up and five measured samples at metadata concurrency 4 and batch size 256 on the same warm macOS fixture host. The Stage 4 baseline is commit `41036e0`; the clean Stage 5 run is commit `555f603`. Both trees were clean when their reports were captured. Reports are schema 7 for the baseline and schema 8 for Stage 5:
 
-| Fixture | Stage 4 first page median | Stage 5 first page median | Stage 4 completion median | Stage 5 completion median | Stage 4 repaired ancestors | Stage 5 repaired ancestors | Stage 5 fallbacks |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| wide | 175.36 ms | 179.29 ms | 390.62 ms | 395.94 ms | 1 | 1 | 0 |
-| deep | 164.63 ms | 160.71 ms | 446.31 ms | 447.19 ms | 65 | 65 | 0 |
-| hardlinks | 284.81 ms | 276.01 ms | 715.86 ms | 697.50 ms | 103 | 98 | 0 |
+| Fixture | Stage 4 first page median | Stage 5 first page median | Stage 4 completion median | Stage 5 completion median | Stage 4 repaired ancestors | Stage 5 repaired ancestors |
+|---|---:|---:|---:|---:|---:|---:|
+| wide | 175.36 ms | 179.29 ms | 390.62 ms | 395.94 ms | 1 | 1 |
+| deep | 164.63 ms | 160.71 ms | 446.31 ms | 447.19 ms | 65 | 65 |
+| hardlinks | 284.81 ms | 276.01 ms | 715.86 ms | 697.50 ms | 103 | 98 |
 
 The first-page medians are all below the 500 ms warm target. The deep fixture's 65 repaired rows are below its 129 directory rows, and the hard-link fixture also avoids a whole-directory rewrite. Stage 5 aggregate-repair medians were 0.09 ms, 0.47 ms, and 1.04 ms for wide, deep, and hardlinks. The matched reports are:
 
@@ -118,7 +118,9 @@ The first-page medians are all below the 500 ms warm target. The deep fixture's 
 - `benchmark-results/orbis-resume-stage5-clean-deep-baseline.json`
 - `benchmark-results/orbis-resume-stage5-clean-hardlinks-baseline.json`
 
-Independent full-scan comparisons on the same three fixtures kept throughput, first-preview latency, checkpoint count, and final database size within the five-percent regression budget. Lifecycle, generated-tree oracle, deep-chain write-audit, fallback, unreadable-propagation, saved-preview, and fresh-candidate parity tests passed. No fallback was observed in the normal matrix; fallback coverage is intentionally fault-injected.
+The receipt path's end-to-end timing gate needs separate follow-up. The Stage 1 full-validation medians for `resume-load-total` were 2.69 ms, 3.06 ms, and 3.66 ms for wide, deep, and hardlinks. The Stage 5 receipt medians were 2.20 ms, 1.97 ms, and 2.16 ms, or roughly 82%, 65%, and 59% of those baselines. Receipt validation does skip the integrity and foreign-key phases, but shared descriptor, artifact-stamp, SQLite-open, and post-query checks still dominate these small fixtures. Therefore the plan's <=25% whole-load gate is not met by this matrix; it needs either a receipt-path optimization or an explicit target revision.
+
+Independent full-scan comparisons on the same three fixtures kept throughput, first-preview latency, checkpoint count, and final database size within the five-percent regression budget. Lifecycle, generated-tree oracle, deep-chain write-audit, scoped-mismatch rollback, unreadable-propagation, saved-preview, and fresh-candidate parity tests passed. The retained legacy fallback counter stayed at zero in the normal matrix.
 
 ## Quick validation report
 
