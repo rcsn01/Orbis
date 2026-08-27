@@ -35,7 +35,7 @@ describe('scan benchmark report schema', () => {
 
   it('accepts an optional aggregate fallback work phase', () => {
     const value = resume()
-    ;(value.phases as Record<string, number>)['resume-aggregate-fallback'] = 1
+    Object.assign(value.phases as Record<string, number>, { 'resume-aggregate-fallback': 1 })
     expect(() => validateScanBenchmarkReport(report('resume-clean-pause', value))).not.toThrow()
   })
 

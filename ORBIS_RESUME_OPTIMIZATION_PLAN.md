@@ -118,6 +118,7 @@ Extend typed scan counters with:
 - `resumeDeletedNodes`
 - `resumeAffectedHardlinkIdentities`
 - `resumeRepairedAncestors`
+- `resumeAggregateFallbacks`
 - `resumeRepairedSchedulerRows`
 - `resumeReplayedEntries`
 
@@ -129,7 +130,7 @@ Publish `resume-first-metadata-page` once, when the first page accepted after re
 
 ### Benchmark schema
 
-Move the scan benchmark report to schema 7. Add a `resume` section per sample:
+Move the scan benchmark report to schema 8. Add a `resume` section per sample; the nested `resume-aggregate-fallback` phase is optional because normal recovery does not emit it:
 
 ```ts
 interface ResumeBenchmarkSample {
@@ -352,7 +353,7 @@ Do not add a persisted trust flag to `scan-resume.json`. It would survive crashe
 
 # Stage 4: recover only interrupted scopes
 
-**Status:** Complete. Scoped hard-link and scheduler recovery, structural invalidation, the legacy full-rebuild oracle, focused parity coverage, full verification, packaging, and schema-7 quick benchmark checks passed.
+**Status:** Complete as the preceding scoped-recovery stage. Its hard-link and scheduler work is now joined by Stage 5 aggregate scoping; schema-7 quick reports remain historical.
 
 ## Goal
 
@@ -459,6 +460,8 @@ Assert that unrelated node IDs, task rows, owners, and observation rows do not c
 
 # Stage 5: replace the global recursive aggregate rebuild
 
+**Status:** Implemented. Scoped aggregate repair, guarded fallback validation, propagation bookkeeping, generated-tree parity, deep write auditing, saved-preview checks, schema-8 diagnostics, and matched clean-Pause measurements passed. The full rebuild remains available only as a diagnostic fallback for one release.
+
 ## Goal
 
 Remove the whole-database recursive closure from normal resume recovery. Recompute only reset roots, owner-movement parents, and their ancestors.
@@ -488,7 +491,7 @@ Use one prepared statement and the temporary depth ordering. The affected set is
 
 ### Propagation bookkeeping
 
-Rebuild `#propagatedToParent` for every unreadable recovery root and every retained unreadable node whose parent lies in `recovery_ancestors`. Record the contribution already present in that parent's recomputed aggregate. An unreadable node outside those relationships cannot participate in a later affected settlement and needs no process-local entry. Add an invariant test that settles each affected ancestor after recovery and proves no retained unreadable contribution is applied twice.
+Rebuild `#propagatedToParent` for every retained unreadable node whose parent lies in `recovery_ancestors` (a reset root is queued after mutation and is therefore not itself unreadable). Record the contribution already present in that node's recomputed aggregate. An unreadable node outside those relationships cannot participate in a later affected settlement and needs no process-local entry. Add an invariant test that settles each affected ancestor after recovery and proves no retained unreadable contribution is applied twice.
 
 ### Semantic totals
 
@@ -549,7 +552,7 @@ Update these files as implementation lands:
 
 - `CONTEXT.md` with `resume validation receipt`, `recovery root`, and `affected recovery set`.
 - `docs/architecture/orbis-progressive-scanning.md` with preparation stages, receipt trust lifetime, scoped recovery, and the remaining mid-directory replay cost.
-- `README.md` with visible Pause and Resume behavior only. Keep implementation details in architecture docs.
+- Leave `README.md` unchanged; keep the Stage 5 implementation details in architecture and benchmark docs.
 - `docs/benchmarks/orbis-resume-optimization.md` with commit-pinned baseline and final matched reports.
 - `docs/plans/ORBIS_SCAN_OPTIMIZATION_PLAN.md` with links to this plan and measured completion status.
 
@@ -582,7 +585,7 @@ pnpm verify
 pnpm package:mac:unsigned
 ```
 
-Run the new resume benchmark in quick mode during development and five-sample standard mode for acceptance. Store both raw schema-7 reports and the Markdown comparison. The final review must cover standards and this plan separately.
+Run the new resume benchmark in quick mode during development and five-sample standard mode for acceptance. Store both raw schema-8 reports and the Markdown comparison; retain schema-7 reports only as historical baselines. The final review must cover standards and this plan separately.
 
 # Definition of done
 

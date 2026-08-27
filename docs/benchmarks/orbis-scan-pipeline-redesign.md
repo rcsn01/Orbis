@@ -43,4 +43,4 @@ pnpm benchmark:scan -- --profile baseline --warmup 1 --samples 5 --fixture all -
 
 Repeat the five refresh scenarios with the same cache state and artifacts: warm no-change, one-file allocation, directory rename, hard-link owner change, and dropped-history fallback. Evaluate deterministic result parity first. Then apply the scan-time, first-preview, RSS, and database-byte gates from the redesign plan. Do not compare this quick dirty-tree run with historical reports made from different implementations.
 
-Resume measurements use report schema 7 and are documented separately in `docs/benchmarks/orbis-resume-optimization.md`. Schema-6 reports do not contain resume lifecycle metrics and are not resume baselines.
+Current resume measurements use report schema 8 and are documented separately in `docs/benchmarks/orbis-resume-optimization.md`. Schema-7 reports remain historical Stage 4 artifacts; schema-6 reports do not contain resume lifecycle metrics and are not resume baselines.

@@ -2,7 +2,7 @@
 
 ## Stage 1 instrumentation
 
-Stage 1 records the current resume path before validation and recovery are optimized. Report schema 7 separates enclosing phases, nested work, and elapsed milestones.
+Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and the aggregate-fallback counter. Schema-7 reports below are historical artifacts.
 
 ### Timing interpretation
 
@@ -18,7 +18,7 @@ Enclosing and sequential phases are attributable parts of resume wall time:
 Nested work phases describe work inside validation or recovery. Do not add them to their enclosing phase:
 
 - Descriptor, file, candidate, construction, integrity, and foreign-key validation
-- Hard-link, aggregate, and scheduler repair
+- Hard-link, aggregate, optional aggregate-fallback, and scheduler repair
 
 `resume-first-metadata-page` is an elapsed milestone from worker refresh entry. Controller milestones measure from the Resume invocation to worker preparation, progress, accepted metadata, and the first preview containing that metadata.
 
@@ -30,7 +30,8 @@ Nested work phases describe work inside validation or recovery. Do not add them 
 - `resumeRecoveryRoots` counts highest interrupted roots reset to entry zero.
 - `resumeDeletedNodes` counts descendants removed before replay.
 - `resumeAffectedHardlinkIdentities` counts identities captured from reset roots and their deleted descendants.
-- `resumeRepairedAncestors` counts directory aggregate rows rebuilt by the Stage 4 global aggregate pass; Stage 5 will narrow this set.
+- `resumeRepairedAncestors` counts directory aggregate rows recomputed for the affected recovery set. It no longer counts a whole-database pass.
+- `resumeAggregateFallbacks` counts scoped aggregate mismatches that entered the guarded diagnostic global rebuild. Normal Stage 5 resume samples must report zero.
 - `resumeRepairedSchedulerRows` counts task rows in reset-root and affected owner-parent ancestor chains.
 - `resumeReplayedEntries` counts metadata entries accepted after recovery.
 
@@ -80,9 +81,9 @@ The benchmark's `resume.validation` field describes the measured worker. It uses
 
 One-sample quick checks on the tiny fixture produced a `receipt` classification for clean Pause, process restart, and unacknowledged Pause. Each measured worker recorded `resumeFullValidations: 0`, `resumeReceiptValidations: 1`, and `resumeReceiptFallbacks: 0`. These checks validate the handoff and classification logic, not a speed claim.
 
-## Stage 4 scoped recovery checks
+## Stage 4 scoped recovery checks (historical)
 
-Stage 4 captures interrupted roots, their deleted descendants, affected hard-link identities, owner parents, and ancestor rows in connection-local temporary tables before mutation. Hard-link and scheduler repair are scoped to that set. Directory aggregates remain a global rebuild until Stage 5; the `resumeRepairedAncestors` counter makes that boundary explicit.
+Stage 4 captured interrupted roots, their deleted descendants, affected hard-link identities, owner parents, and ancestor rows in connection-local temporary tables before mutation. Hard-link and scheduler repair were scoped to that set. Directory aggregates remained a global rebuild in that stage; the `resumeRepairedAncestors` counter made that boundary explicit.
 
 Focused lifecycle coverage verifies two interrupted roots, focus transfer, external owner reuse and recreation, unaffected identities, exact single-link files, last-path removal, binary path ordering, scheduler readiness, and structural `hardlink_groups` rejection. The recovery transaction preserves the durable checkpoint for ordinary SQL or representative errors; only the explicit invalid-resume construction check enters restart handling.
 
@@ -95,6 +96,29 @@ The requested one-sample schema-7 checks also passed on the dirty tree. They cla
 | Unacknowledged Pause / hardlinks | 6 | 0 | 13 | 8 | 114 |
 
 These small runs validate report shape and lifecycle counters, not performance.
+
+## Stage 5 bounded aggregate results
+
+Stage 5 keeps the recursive aggregate closure only as a guarded diagnostic fallback. Normal resume uses one prepared direct-child equation update per affected directory, in descending depth order, and validates both affected and unaffected rows before any fallback. The fallback remains inside the recovery transaction and is rejected when unrelated aggregate corruption is present.
+
+The matched clean-Pause matrix below used one warm-up and five measured samples at metadata concurrency 4 and batch size 256 on the same warm macOS fixture host. The Stage 4 baseline is commit `41036e0`; the clean Stage 5 run is commit `555f603`. Both trees were clean when their reports were captured. Reports are schema 7 for the baseline and schema 8 for Stage 5:
+
+| Fixture | Stage 4 first page median | Stage 5 first page median | Stage 4 completion median | Stage 5 completion median | Stage 4 repaired ancestors | Stage 5 repaired ancestors | Stage 5 fallbacks |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| wide | 175.36 ms | 179.29 ms | 390.62 ms | 395.94 ms | 1 | 1 | 0 |
+| deep | 164.63 ms | 160.71 ms | 446.31 ms | 447.19 ms | 65 | 65 | 0 |
+| hardlinks | 284.81 ms | 276.01 ms | 715.86 ms | 697.50 ms | 103 | 98 | 0 |
+
+The first-page medians are all below the 500 ms warm target. The deep fixture's 65 repaired rows are below its 129 directory rows, and the hard-link fixture also avoids a whole-directory rewrite. Stage 5 aggregate-repair medians were 0.09 ms, 0.47 ms, and 1.04 ms for wide, deep, and hardlinks. The matched reports are:
+
+- `benchmark-results/orbis-resume-stage4-clean-wide-baseline.json` (captured from `41036e0`)
+- `benchmark-results/orbis-resume-stage4-clean-deep-baseline.json` (captured from `41036e0`)
+- `benchmark-results/orbis-resume-stage4-clean-hardlinks-baseline.json` (captured from `41036e0`)
+- `benchmark-results/orbis-resume-stage5-clean-wide-baseline.json`
+- `benchmark-results/orbis-resume-stage5-clean-deep-baseline.json`
+- `benchmark-results/orbis-resume-stage5-clean-hardlinks-baseline.json`
+
+Independent full-scan comparisons on the same three fixtures kept throughput, first-preview latency, checkpoint count, and final database size within the five-percent regression budget. Lifecycle, generated-tree oracle, deep-chain write-audit, fallback, unreadable-propagation, saved-preview, and fresh-candidate parity tests passed. No fallback was observed in the normal matrix; fallback coverage is intentionally fault-injected.
 
 ## Quick validation report
 
