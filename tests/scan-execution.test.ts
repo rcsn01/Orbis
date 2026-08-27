@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  WorkerScanExecution, type ScanExecutionRequest, type WorkerTransport
+  WorkerScanExecution, type ScanExecutionRequest, type ScanUpdate, type WorkerTransport
 } from '../src/main/scan-execution'
 import type { WorkerStartMessage } from '../src/main/scan-execution-protocol'
+import type { ResumeValidationReceipt } from '../src/main/full-scan-resume'
 import type { ProgressivePreview, ScanResult } from '../src/main/scanner'
 
 class FakeWorker implements WorkerTransport {
@@ -95,6 +96,15 @@ describe('WorkerScanExecution', () => {
     expect(updates).toEqual(['progress', 'preview-2'])
   })
 
+  it('copies a resume receipt into the worker start message', async () => {
+    const worker = new FakeWorker()
+    const execution = new WorkerScanExecution({ create: () => worker })
+    const receipt = { version: 1, kind: 'construction', scanId: 'd1234567-89ab-4cde-8fab-0123456789ab', descriptorDigest: '0'.repeat(64), checkpointSequence: 1, drainedThrough: '0', database: { file: 'index-d1234567-89ab-4cde-8fab-0123456789ab.partial.sqlite', device: '1', inode: '2', size: 1, modifiedNs: '3', changedNs: '4' }, source: 'acknowledged-pause' } satisfies ResumeValidationReceipt
+    const session = await execution.start({ ...request('resume-receipt'), resumeExpected: true, resumeReceipt: receipt })
+    expect(worker.startMessage().resumeReceipt).toEqual(receipt)
+    await session.pause()
+  })
+
   it('forwards only current resume milestones', async () => {
     const worker = new FakeWorker()
     const execution = new WorkerScanExecution({ create: () => worker })
@@ -116,6 +126,52 @@ describe('WorkerScanExecution', () => {
     await consume
     expect(start.resumeExpected).toBe(true)
     expect(milestones).toEqual(['preparation-started', 'first-metadata-page'])
+  })
+
+  it('forwards only ordered preparation phases from the current resume request', async () => {
+    const worker = new FakeWorker()
+    const execution = new WorkerScanExecution({ create: () => worker })
+    const session = await execution.start({ ...request('preparation'), resumeExpected: true })
+    const start = worker.startMessage()
+    const phases: string[] = []
+    const consume = (async () => {
+      for await (const update of session.events) if (update.type === 'resume-preparation') phases.push(update.phase)
+    })()
+    const send = (phase: unknown, overrides: Record<string, unknown> = {}): void => worker.emit({
+      type: 'resume-preparation', generation: start.generation, requestId: start.requestId, phase, ...overrides
+    })
+
+    send('validating')
+    send('validating')
+    send('history')
+    send('recovering')
+    send('history')
+    send('unknown')
+    send(42)
+    send('repairing', { generation: start.generation + 1 })
+    const focus = session.focus('n-root')
+    const currentRequest = (worker.messages.at(-1) as { requestId: number }).requestId
+    send('repairing')
+    worker.emit({ type: 'focus-accepted', generation: start.generation, requestId: currentRequest, accepted: true })
+    await focus
+    send('repairing', { requestId: currentRequest })
+    send('starting', { requestId: currentRequest })
+    worker.emit({ type: 'progress', generation: start.generation, requestId: currentRequest, progress: { stage: 'traversing', scannedItems: 1, discoveredBytes: 2, elapsedMs: 3, currentItem: 'file' } })
+    send('starting', { requestId: currentRequest })
+    worker.emit({ type: 'complete', generation: start.generation, requestId: currentRequest, result: result(start) })
+    await session.result
+    await consume
+    expect(phases).toEqual(['validating', 'history', 'recovering', 'repairing', 'starting'])
+
+    const freshWorker = new FakeWorker()
+    const freshExecution = new WorkerScanExecution({ create: () => freshWorker })
+    const fresh = await freshExecution.start(request('fresh'))
+    const freshStart = freshWorker.startMessage()
+    freshWorker.emit({ type: 'resume-preparation', generation: freshStart.generation, requestId: freshStart.requestId, phase: 'validating' })
+    freshWorker.emit({ type: 'complete', generation: freshStart.generation, requestId: freshStart.requestId, result: result(freshStart) })
+    const freshUpdates: ScanUpdate[] = []
+    for await (const update of fresh.events) freshUpdates.push(update)
+    expect(freshUpdates).toEqual([])
   })
 
   it('pauses and terminates the active session before starting its replacement', async () => {

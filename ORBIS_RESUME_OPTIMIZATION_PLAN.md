@@ -69,7 +69,7 @@ Resume button
 
 # Stage 1: measure the resume path
 
-**Status:** Implemented and validated with schema-7 quick lifecycle runs. The clean, commit-pinned five-sample baseline remains pending.
+**Status:** Complete. Schema-7 quick lifecycle runs and the clean, commit-pinned five-sample baseline at `80ca1ce` passed report validation.
 
 ## Goal
 
@@ -171,6 +171,8 @@ Capture the unoptimized baseline before changing validation or recovery.
 
 # Stage 2: show resume preparation in the UI
 
+**Status:** Complete. Focused tests, type checking, the full unit and native suites, Electron smoke tests, verification build, and unsigned macOS packaging passed.
+
 ## Goal
 
 A Resume click must produce visible feedback before database validation or recovery finishes. The saved preview stays on screen while preparation runs.
@@ -238,6 +240,8 @@ Do not show a determinate percentage during preparation. The existing progress m
 - Traversal progress retains its current behavior after the stage transition.
 
 # Stage 3: reuse trusted validation with a resume receipt
+
+**Status:** Complete. Full verification and matched one-sample receipt-classification runs passed; the quick runs are not a performance claim.
 
 ## Goal
 
@@ -314,6 +318,14 @@ Add an optional receipt to `ScanExecutionRequest` and the worker start message. 
 
 `prepareResumableFullScan()` asks the store to load with the receipt. The store either returns a receipt-validated load or performs full validation. Refresh and scanner modules do not inspect receipt fields.
 
+### Implementation notes
+
+The receipt is single-use. The controller clears it as soon as it hands it to the worker, and also clears it when the saved checkpoint is discarded, published, or no longer valid. Receipt fallback reasons stay on the internal diagnostics channel. Renderer snapshots and IPC payloads do not contain receipt data.
+
+Read-only SQLite checks use an immutable URI when the validated database has no live WAL or rollback journal. A normal read-only connection can update shared-memory sidecar timestamps even when it changes no rows, which would make a clean receipt fail its post-query stamp check. Live WAL or journal state still uses normal SQLite access and authoritative validation.
+
+Benchmark classification uses counters from the measured worker. Fallback takes precedence over receipt validation, and receipt validation takes precedence over full validation. Startup or crash validation that occurs before the measured worker is therefore not counted in that worker's `validation` field.
+
 ## Threat and race model
 
 The indexes directory is app-private and artifact mutations are serialized by `PublicationArtifacts`. A matching inode, main-file and sidecar stamps, matching checkpoint row, and unchanged post-query stamps are enough to reuse validation within the same process. The before-and-after stamp checks close the pathname replacement window around SQLite validation. Tests must include rename replacement, same-name replacement, and WAL or shared-memory sidecar appearance.
@@ -340,6 +352,8 @@ Do not add a persisted trust flag to `scan-resume.json`. It would survive crashe
 
 # Stage 4: recover only interrupted scopes
 
+**Status:** Complete. Scoped hard-link and scheduler recovery, structural invalidation, the legacy full-rebuild oracle, focused parity coverage, full verification, packaging, and schema-7 quick benchmark checks passed.
+
 ## Goal
 
 Replace global hard-link and scheduler reconstruction with recovery proportional to interrupted directory roots and the identities they touched.
@@ -360,8 +374,8 @@ Populate all tables before deleting rows. This preserves the evidence needed for
 
 Run recovery inside the existing construction transaction:
 
-1. Capture recovery roots, descendants, ancestors, affected identities, and observation parents.
-2. When entering traversal recovery from `scanning` or `paused`, assert that construction `hardlink_groups` is empty. It is a finalization artifact and its foreign keys would otherwise constrain owner-path deletion. A `finalizing` construction follows candidate validation or finalization retry instead of traversal recovery. Treat nonempty groups in a traversal-phase construction as invalid resumable state and fall back to authoritative restart handling.
+1. Validate the construction phase and, before any recovery mutation, assert that traversal-phase `hardlink_groups` is empty. It is a finalization artifact and its foreign keys would otherwise constrain owner-path deletion. A `finalizing` construction follows candidate validation or finalization retry instead of traversal recovery. Treat nonempty groups in a traversal-phase construction as invalid resumable state and fall back to authoritative restart handling.
+2. Capture recovery roots, descendants, ancestors, affected identities, and observation parents.
 3. Delete `hardlink_owners` only for affected identities.
 4. Delete affected `hardlink_paths` before node cascades can invalidate owner references.
 5. Delete children of recovery roots. Existing foreign-key cascades remove descendant tasks and observations.

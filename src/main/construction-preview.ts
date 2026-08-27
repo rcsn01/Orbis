@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { lstat, statfs } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { Breadcrumb, NodeSummary } from '../shared/contracts'
 import { buildChart } from './chart'
 import type { FullScanResumeLoad } from './full-scan-resume'
@@ -112,7 +113,7 @@ async function openConstructionDatabase(load: ConstructionResumeLoad): Promise<{
   if (resolve(load.partialPath) !== resolve(expectedPartialPath) || resolve(load.candidatePath) !== resolve(expectedCandidatePath)) return undefined
 
   const [directoryStats, targetStats, partialStats] = await Promise.all([
-    lstat(directory), lstat(descriptor.target), lstat(load.partialPath)
+    lstat(directory, { bigint: true }), lstat(descriptor.target, { bigint: true }), lstat(load.partialPath, { bigint: true })
   ])
   if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink()
     || `${String(directoryStats.dev)}:${String(directoryStats.ino)}` !== descriptor.indexDirectoryIdentity
@@ -120,7 +121,9 @@ async function openConstructionDatabase(load: ConstructionResumeLoad): Promise<{
     || String(targetStats.dev) !== descriptor.targetDevice || String(targetStats.ino) !== descriptor.targetInode
     || !partialStats.isFile() || partialStats.isSymbolicLink()) return undefined
 
-  const database = new DatabaseSync(load.partialPath, { readOnly: true })
+  const databaseLocation = await previewDatabaseLocation(load)
+  if (!databaseLocation) return undefined
+  const database = new DatabaseSync(databaseLocation, { readOnly: true })
   let handedOff = false
   try {
     database.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=1000; PRAGMA foreign_keys=ON;')
@@ -207,6 +210,28 @@ class ConstructionPreviewDatabase implements ConstructionDatabase {
   }
 }
 
+async function previewDatabaseLocation(load: ConstructionResumeLoad): Promise<string | undefined> {
+  const [journal, wal, shm] = await Promise.all([
+    previewSidecar(`${load.partialPath}-journal`), previewSidecar(`${load.partialPath}-wal`), previewSidecar(`${load.partialPath}-shm`)
+  ])
+  if (journal.kind !== 'absent' || wal.kind === 'unsafe' || shm.kind === 'unsafe'
+    || (wal.kind === 'regular') !== (shm.kind === 'regular')
+    || wal.kind === 'regular' && wal.size > 0n) return load.partialPath
+  return `${pathToFileURL(load.partialPath).href}?immutable=1`
+}
+
+type PreviewSidecar = { readonly kind: 'absent' | 'regular' | 'unsafe'; readonly size: bigint }
+
+async function previewSidecar(path: string): Promise<PreviewSidecar> {
+  try {
+    const stats = await lstat(path, { bigint: true })
+    if (!stats.isFile() || stats.isSymbolicLink()) return { kind: 'unsafe', size: 0n }
+    return { kind: 'regular', size: stats.size }
+  } catch (error) {
+    return errorCode(error) === 'ENOENT' ? { kind: 'absent', size: 0n } : { kind: 'unsafe', size: 0n }
+  }
+}
+
 async function readVolume(target: string): Promise<{ readonly capacityBytes: number; readonly freeBytes: number } | undefined> {
   try {
     const value = await statfs(target)
@@ -217,6 +242,8 @@ async function readVolume(target: string): Promise<{ readonly capacityBytes: num
     return undefined
   }
 }
+
+function errorCode(error: unknown): unknown { return error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined }
 
 function blockBytes(blocks: number | bigint, size: number | bigint): number | undefined {
   const blockCount = Number(blocks)

@@ -1,9 +1,10 @@
 import type { ProgressSnapshot } from '../shared/contracts'
-import type { OrbisTimingEvent, ResumeMilestone, ScanCounterRecord } from './diagnostics'
+import type { OrbisTimingEvent, ResumeMilestone, ResumePreparationPhase, ResumeReceiptFallbackReason, ScanCounterRecord } from './diagnostics'
 import type { JournalCursor } from './index-manifest'
 import type { FolderSizeEstimate } from './scan-metadata'
 import type { ProgressivePreview, ScanResult, ScanTotals } from './scanner'
 import type { ActivePersistentIndex } from './refresh-engine'
+import type { ResumeValidationReceipt } from './full-scan-resume'
 
 export interface WorkerStartMessage {
   readonly type: 'start'
@@ -15,6 +16,7 @@ export interface WorkerStartMessage {
   readonly indexDirectory: string
   readonly startupRoot: boolean
   readonly resumeExpected: boolean
+  readonly resumeReceipt?: ResumeValidationReceipt
   readonly initialEstimate?: FolderSizeEstimate
   readonly active?: ActivePersistentIndex
 }
@@ -28,6 +30,7 @@ export type WorkerMessage = WorkerStartMessage | WorkerCancelMessage | WorkerPau
 export interface WorkerProgressMessage { readonly type: 'progress'; readonly generation: number; readonly requestId: number; readonly progress: ProgressSnapshot }
 export interface WorkerPreviewMessage { readonly type: 'preview'; readonly generation: number; readonly requestId: number; readonly preview: ProgressivePreview }
 export interface WorkerResumeMilestoneMessage { readonly type: 'resume-milestone'; readonly generation: number; readonly requestId: number; readonly milestone: ResumeMilestone }
+export interface WorkerResumePreparationMessage { readonly type: 'resume-preparation'; readonly generation: number; readonly requestId: number; readonly phase: ResumePreparationPhase }
 export interface WorkerResolvedNodeMessage { readonly type: 'resolved-node'; readonly generation: number; readonly requestId: number; readonly path: string | null }
 export interface WorkerFocusAcceptedMessage { readonly type: 'focus-accepted'; readonly generation: number; readonly requestId: number; readonly accepted: boolean }
 export interface WorkerCompleteMessage {
@@ -54,5 +57,6 @@ export interface WorkerDiagnosticsMessage {
   readonly timings: readonly OrbisTimingEvent[]
   readonly checkpointCount: number
   readonly counters: ScanCounterRecord
+  readonly resumeReceiptFallbackReasons?: readonly ResumeReceiptFallbackReason[]
 }
-export type WorkerResultMessage = WorkerProgressMessage | WorkerPreviewMessage | WorkerResumeMilestoneMessage | WorkerResolvedNodeMessage | WorkerFocusAcceptedMessage | WorkerCompleteMessage | WorkerUnchangedMessage | WorkerCanceledMessage | WorkerPausedMessage | WorkerErrorMessage | WorkerDiagnosticsMessage
+export type WorkerResultMessage = WorkerProgressMessage | WorkerPreviewMessage | WorkerResumeMilestoneMessage | WorkerResumePreparationMessage | WorkerResolvedNodeMessage | WorkerFocusAcceptedMessage | WorkerCompleteMessage | WorkerUnchangedMessage | WorkerCanceledMessage | WorkerPausedMessage | WorkerErrorMessage | WorkerDiagnosticsMessage

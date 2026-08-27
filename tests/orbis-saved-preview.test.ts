@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import type { OrbisSnapshot } from '../src/shared/contracts'
 import { OrbisController, type OrbisShell } from '../src/main/controller'
 import { WorkerScanExecution, type WorkerTransport, type WorkerTransportFactory } from '../src/main/scan-execution'
 import { FullScanResumeStore, type FullScanResumeDescriptor } from '../src/main/full-scan-resume'
@@ -87,7 +88,7 @@ describe('saved Orbis previews', () => {
       await controller.initialize()
       await controller.startScan()
       expect(controller.snapshot().scan.status).toBe('scanning')
-      expect(controller.snapshot().focus).toBeNull()
+      expect(controller.snapshot()).toMatchObject({ focus: fixture.preview.focus, scan: { progress: { stage: 'resuming', currentItem: 'Validating saved scan' } } })
 
       const paused = await controller.cancelScan()
       expect(workers).toHaveLength(1)
@@ -168,10 +169,15 @@ describe('saved Orbis previews', () => {
     const controller = createController({ create: () => (worker = new TestWorker()) }, { indexDirectory: fixture.indexDirectory })
     try {
       await controller.initialize()
+      const snapshots: OrbisSnapshot[] = []
+      controller.subscribe((snapshot) => snapshots.push(snapshot))
       await controller.rescan()
       worker!.emit('error', new Error('worker failed'))
+      expect(controller.snapshot().chart).toEqual(fixture.preview.chart)
       await waitFor(() => controller.snapshot().scan.status === 'canceled')
       expect(controller.snapshot()).toMatchObject({ committed: false, focus: fixture.preview.focus, scan: { status: 'canceled', resume: { available: true } } })
+      expect(snapshots.length).toBeGreaterThan(0)
+      expect(snapshots.every((snapshot) => snapshot.chart.length > 0)).toBe(true)
     } finally { await controller.close() }
   })
 })

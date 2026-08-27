@@ -1,8 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
-  createControllerTimingMilestones, createScanTimingMilestones, runWithScanDiagnostics,
-  subscribeControllerDiagnostics, subscribeScanDiagnostics, type OrbisTimingEvent
+  createControllerTimingMilestones, createScanTimingMilestones, isResumePreparationPhase, RESUME_PREPARATION_PHASES,
+  runWithScanDiagnostics, subscribeControllerDiagnostics, subscribeScanDiagnostics, type OrbisTimingEvent
 } from '../src/main/diagnostics'
+
+describe('resume preparation phases', () => {
+  it('accepts exactly the fixed preparation vocabulary', () => {
+    for (const phase of RESUME_PREPARATION_PHASES) expect(isResumePreparationPhase(phase)).toBe(true)
+    for (const value of ['unknown', '', 1, null, undefined, {}, ['validating']]) expect(isResumePreparationPhase(value)).toBe(false)
+  })
+})
 
 describe('resume diagnostic milestones', () => {
   it('shares one scan epoch, publishes once, and preserves generation', () => {

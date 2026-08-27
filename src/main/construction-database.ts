@@ -32,9 +32,8 @@ export interface ConstructionWorkBatch {
   readonly done: boolean
 }
 
-export interface ConstructionRecoveryReport {
-  readonly retained: number
-  readonly reset: number
+export interface ResumeRecoveryReport {
+  readonly roots: number
   readonly deletedNodes: number
   readonly affectedHardlinkIdentities: number
   readonly repairedAncestors: number
@@ -1196,56 +1195,362 @@ export class ConstructionDatabase implements ChartDataSource {
     }
   }
 
-  recoverIncompleteDirectories(): ConstructionRecoveryReport {
+  recoverIncompleteDirectories(): ResumeRecoveryReport {
     this.#assertBuilding()
     const schedulerTiming = createScanTimingAccumulator('resume-scheduler-repair')
+    let recoveryTablesCreated = false
+    let recoveryFailed = false
     try {
+      const phase = this.phase
+      const pendingTasks = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM directory_tasks WHERE status IN ('queued', 'scanning')").get() as { count: number }).count)
+      const hardlinkGroups = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM hardlink_groups').get() as { count: number }).count)
+      if ((phase === 'scanning' || phase === 'paused') && hardlinkGroups !== 0) {
+        throw new ConstructionError('invalid-resume', 'Traversal construction contains finalized hard-link groups')
+      }
+      if ((phase === 'awaiting-reconciliation' || phase === 'finalizing') && pendingTasks !== 0) {
+        throw new ConstructionError('invalid-resume', 'Finalization construction contains queued directory work')
+      }
+      // A construction in the finalization-only part of its lifecycle has no
+      // directory cursor to recover. Leave it intact so finish() can retry
+      // candidate creation.
+      if (phase === 'awaiting-reconciliation' || phase === 'finalizing') return emptyResumeRecoveryReport()
+
+      // A caller may resume from a database opened by this same process after a
+      // page was accepted but before its metadata batch was flushed. Recovery
+      // must capture the durable SQL view, not the half-visible accumulator.
+      this.#flushPendingMetadataBatch()
+      recoveryTablesCreated = true
+      this.#dropRecoveryTables()
+      this.#prepareRecoverySet()
+      const roots = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM recovery_roots').get() as { count: number }).count)
+      if (roots === 0) return emptyResumeRecoveryReport()
+      const deletedNodes = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM recovery_subtree').get() as { count: number }).count)
+      const invalidObservation = this.#database.prepare(`SELECT observations.node_id AS nodeId
+        FROM recovery_observation_parents affected
+        JOIN directory_observations observations ON observations.node_id = affected.id
+        WHERE affected.old_duplicate_count > observations.direct_duplicate_count
+           OR affected.old_duplicate_count > observations.direct_skipped_count
+        LIMIT 1`).get() as { nodeId?: string } | undefined
+      if (invalidObservation?.nodeId) throw new Error(`Inconsistent duplicate observation for directory ${invalidObservation.nodeId}`)
+      const multipleRepresentatives = this.#database.prepare(`SELECT paths.device, paths.inode
+        FROM recovery_identities paths
+        JOIN nodes representatives ON representatives.device = paths.device AND representatives.inode = paths.inode
+          AND representatives.kind = 'file'
+        WHERE representatives.id NOT IN (SELECT id FROM recovery_subtree)
+        GROUP BY paths.device, paths.inode HAVING COUNT(*) > 1 LIMIT 1`).get() as { device?: string; inode?: string } | undefined
+      if (multipleRepresentatives?.device !== undefined) {
+        throw new Error(`Multiple representative nodes for hard-link identity ${multipleRepresentatives.device}:${multipleRepresentatives.inode}`)
+      }
+
+      // Only duplicate observations belonging to surviving parents need a
+      // delta. Root observations are reset below, and observations in the
+      // deleted subtree disappear with their nodes.
       this.#database.exec(`
-        CREATE TEMP TABLE recovery_roots (id TEXT PRIMARY KEY);
-        INSERT INTO recovery_roots SELECT task.node_id FROM directory_tasks task
-        WHERE task.status IN ('queued', 'scanning') AND NOT EXISTS (
-          WITH RECURSIVE ancestors(id, parent_id) AS (
-            SELECT parent.id, parent.parent_id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE child.id = task.node_id
-            UNION ALL SELECT parent.id, parent.parent_id FROM nodes parent JOIN ancestors child ON parent.id = child.parent_id
-          ) SELECT 1 FROM ancestors JOIN directory_tasks ancestor_task ON ancestor_task.node_id = ancestors.id
-            WHERE ancestor_task.status IN ('queued', 'scanning')
+        UPDATE directory_observations
+        SET direct_skipped_count = direct_skipped_count - (SELECT old_duplicate_count FROM recovery_observation_parents WHERE id = directory_observations.node_id),
+            direct_duplicate_count = direct_duplicate_count - (SELECT old_duplicate_count FROM recovery_observation_parents WHERE id = directory_observations.node_id)
+        WHERE node_id IN (SELECT id FROM recovery_observation_parents);
+
+        UPDATE directory_tasks SET focused = 1
+        WHERE node_id IN (SELECT id FROM recovery_roots)
+          AND EXISTS (
+            SELECT 1 FROM directory_tasks focused
+            JOIN recovery_subtree deleted ON deleted.id = focused.node_id
+            WHERE deleted.root_id = directory_tasks.node_id AND focused.focused = 1
+          );
+
+        DELETE FROM hardlink_owners
+        WHERE EXISTS (
+          SELECT 1 FROM recovery_identities affected
+          WHERE affected.device = hardlink_owners.device AND affected.inode = hardlink_owners.inode
         );
-      `)
-      const deletedNodes = Number((this.#database.prepare(`WITH RECURSIVE reset_nodes(id) AS (
-        SELECT nodes.id FROM nodes JOIN recovery_roots ON nodes.parent_id = recovery_roots.id
-        UNION ALL SELECT nodes.id FROM nodes JOIN reset_nodes ON nodes.parent_id = reset_nodes.id
-      ) SELECT COUNT(*) AS count FROM reset_nodes`).get() as { count: number }).count)
-      this.#database.exec(`
-        DELETE FROM hardlink_paths WHERE parent_id IN (SELECT id FROM recovery_roots);
-        DELETE FROM nodes WHERE parent_id IN (SELECT id FROM recovery_roots);
-        DELETE FROM hardlink_owners;
+        DELETE FROM hardlink_paths
+        WHERE parent_id IN (
+          SELECT id FROM recovery_roots
+          UNION ALL SELECT id FROM recovery_subtree
+        );
+        DELETE FROM nodes WHERE id IN (SELECT id FROM recovery_subtree);
+
         UPDATE nodes SET size_bytes = own_bytes, direct_children = 0, descendant_count = 0,
-          unreadable_count = own_unreadable, scan_state = 'queued', enumeration_complete = 0 WHERE id IN (SELECT id FROM recovery_roots);
-        UPDATE directory_tasks SET status = 'queued', entries_read = 0 WHERE node_id IN (SELECT id FROM recovery_roots);
+          unreadable_count = own_unreadable, scan_state = 'queued', enumeration_complete = 0
+        WHERE id IN (SELECT id FROM recovery_roots);
+        UPDATE directory_tasks SET status = 'queued', entries_read = 0
+        WHERE node_id IN (SELECT id FROM recovery_roots);
         UPDATE directory_observations SET direct_skipped_count = 0, direct_unreadable_count = 0,
           direct_disappearing_count = 0, direct_symlink_count = 0, direct_nested_mount_count = 0,
-          direct_duplicate_count = 0, enumeration_status = 'queued' WHERE node_id IN (SELECT id FROM recovery_roots);
+          direct_duplicate_count = 0, enumeration_status = 'queued'
+        WHERE node_id IN (SELECT id FROM recovery_roots);
       `)
-      const rebuilt = this.#rebuildConstructionState()
-      const repairedSchedulerRows = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks').get() as { count: number }).count)
-      schedulerTiming.measure(() => this.#database.exec(`
-        UPDATE directory_tasks SET subtree_complete = CASE WHEN node_id IN
-          (SELECT id FROM nodes WHERE scan_state IN ('complete', 'unreadable')) THEN 1 ELSE 0 END;
-        UPDATE directory_tasks SET pending_children = (SELECT COUNT(*) FROM nodes child JOIN directory_tasks child_task ON child_task.node_id = child.id
-          WHERE child.parent_id = directory_tasks.node_id AND child_task.subtree_complete = 0);
-        UPDATE directory_tasks SET ready = CASE WHEN subtree_complete = 1 THEN 0 WHEN node_id IN (SELECT id FROM nodes WHERE parent_id IS NULL) THEN 1
-          WHEN node_id IN (SELECT child.id FROM nodes child JOIN nodes parent ON parent.id = child.parent_id WHERE parent.enumeration_complete = 1) THEN 1 ELSE 0 END;
-      `))
+
+      const affectedHardlinkIdentities = this.#repairAffectedHardLinks()
+      this.#expandRecoveryAncestors()
+      const repairedAncestors = this.#rebuildAllDirectoryAggregates()
+      const repairedSchedulerRows = schedulerTiming.measure(() => this.#repairAffectedScheduler())
       this.#pendingSubtrees = Number((this.#database.prepare('SELECT COUNT(*) AS count FROM directory_tasks WHERE subtree_complete = 0').get() as { count: number }).count)
-      const counts = this.#database.prepare(`SELECT (SELECT COUNT(*) FROM directory_tasks WHERE status IN ('complete', 'unreadable')) AS retained,
-        (SELECT COUNT(*) FROM recovery_roots) AS reset`).get() as { retained: number; reset: number }
-      this.#database.exec('DROP TABLE recovery_roots')
-      return {
-        retained: Number(counts.retained), reset: Number(counts.reset), deletedNodes,
-        affectedHardlinkIdentities: rebuilt.affectedHardlinkIdentities,
-        repairedAncestors: rebuilt.repairedAncestors, repairedSchedulerRows
+      return { roots, deletedNodes, affectedHardlinkIdentities, repairedAncestors, repairedSchedulerRows }
+    } catch (error) {
+      recoveryFailed = true
+      throw error
+    } finally {
+      let cleanupError: unknown
+      if (recoveryTablesCreated) {
+        try { this.#dropRecoveryTables() } catch (error) { cleanupError = error }
       }
-    } finally { schedulerTiming.publish() }
+      schedulerTiming.publish()
+      if (cleanupError !== undefined && !recoveryFailed) throw cleanupError
+    }
+  }
+
+  #prepareRecoverySet(): void {
+    this.#database.exec(`
+      CREATE TEMP TABLE recovery_roots (
+        id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        depth INTEGER NOT NULL
+      );
+      CREATE TEMP TABLE recovery_subtree (
+        root_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        parent_id TEXT,
+        depth INTEGER NOT NULL,
+        PRIMARY KEY (root_id, id)
+      );
+      CREATE TEMP TABLE recovery_ancestors (
+        id TEXT PRIMARY KEY,
+        depth INTEGER NOT NULL
+      );
+      CREATE TEMP TABLE recovery_identities (
+        device TEXT NOT NULL,
+        inode TEXT NOT NULL,
+        PRIMARY KEY (device, inode)
+      );
+      CREATE TEMP TABLE recovery_owner_parents (id TEXT PRIMARY KEY);
+      CREATE TEMP TABLE recovery_observation_parents (
+        id TEXT PRIMARY KEY,
+        old_duplicate_count INTEGER NOT NULL
+      );
+
+      INSERT INTO recovery_roots (id, parent_id, depth)
+      SELECT task.node_id, node.parent_id, node.depth
+      FROM directory_tasks task JOIN nodes node ON node.id = task.node_id
+      WHERE task.status IN ('queued', 'scanning') AND NOT EXISTS (
+        WITH RECURSIVE ancestors(id, parent_id) AS (
+          SELECT parent.id, parent.parent_id
+          FROM nodes child JOIN nodes parent ON parent.id = child.parent_id
+          WHERE child.id = task.node_id
+          UNION ALL
+          SELECT parent.id, parent.parent_id
+          FROM nodes parent JOIN ancestors child ON parent.id = child.parent_id
+        )
+        SELECT 1 FROM ancestors JOIN directory_tasks ancestor_task ON ancestor_task.node_id = ancestors.id
+        WHERE ancestor_task.status IN ('queued', 'scanning')
+      );
+
+      WITH RECURSIVE descendants(root_id, id, parent_id, depth) AS (
+        SELECT roots.id, child.id, child.parent_id, child.depth
+        FROM recovery_roots roots JOIN nodes child ON child.parent_id = roots.id
+        UNION ALL
+        SELECT descendants.root_id, child.id, child.parent_id, child.depth
+        FROM descendants JOIN nodes child ON child.parent_id = descendants.id
+      )
+      INSERT INTO recovery_subtree (root_id, id, parent_id, depth)
+      SELECT root_id, id, parent_id, depth FROM descendants;
+
+      WITH RECURSIVE ancestors(id, depth) AS (
+        SELECT id, depth FROM recovery_roots
+        UNION
+        SELECT parent.id, parent.depth
+        FROM nodes child JOIN ancestors current ON current.id = child.id
+        JOIN nodes parent ON parent.id = child.parent_id
+      )
+      INSERT OR IGNORE INTO recovery_ancestors (id, depth)
+      SELECT id, depth FROM ancestors;
+
+      INSERT INTO recovery_identities (device, inode)
+      SELECT DISTINCT paths.device, paths.inode
+      FROM hardlink_paths paths
+      WHERE paths.device <> '' AND paths.inode <> ''
+        AND paths.parent_id IN (
+          SELECT id FROM recovery_roots
+          UNION ALL SELECT id FROM recovery_subtree
+        );
+
+      INSERT OR IGNORE INTO recovery_owner_parents (id)
+      SELECT DISTINCT representatives.parent_id
+      FROM nodes representatives
+      JOIN recovery_identities affected ON affected.device = representatives.device AND affected.inode = representatives.inode
+      WHERE representatives.kind = 'file'
+        AND representatives.parent_id IS NOT NULL
+        AND representatives.parent_id NOT IN (SELECT id FROM recovery_subtree);
+
+      INSERT OR IGNORE INTO recovery_owner_parents (id)
+      SELECT DISTINCT owner_node.parent_id
+      FROM hardlink_owners owners
+      JOIN recovery_identities affected ON affected.device = owners.device AND affected.inode = owners.inode
+      JOIN nodes owner_node ON owner_node.id = owners.node_id
+      WHERE owner_node.parent_id IS NOT NULL
+        AND owner_node.parent_id NOT IN (SELECT id FROM recovery_subtree);
+
+      INSERT INTO recovery_observation_parents (id, old_duplicate_count)
+      SELECT paths.parent_id,
+        SUM(CASE WHEN owners.path_key = paths.path_key THEN 0 ELSE 1 END)
+      FROM hardlink_paths paths
+      JOIN recovery_identities affected ON affected.device = paths.device AND affected.inode = paths.inode
+      LEFT JOIN hardlink_owners owners ON owners.device = paths.device AND owners.inode = paths.inode
+      WHERE paths.parent_id NOT IN (
+        SELECT id FROM recovery_roots
+        UNION ALL SELECT id FROM recovery_subtree
+      )
+      GROUP BY paths.parent_id;
+    `)
+  }
+
+  #dropRecoveryTables(): void {
+    this.#database.exec(`
+      DROP TABLE IF EXISTS temp.recovery_observation_parents;
+      DROP TABLE IF EXISTS temp.recovery_owner_parents;
+      DROP TABLE IF EXISTS temp.recovery_identities;
+      DROP TABLE IF EXISTS temp.recovery_ancestors;
+      DROP TABLE IF EXISTS temp.recovery_subtree;
+      DROP TABLE IF EXISTS temp.recovery_roots;
+    `)
+  }
+
+  #repairAffectedHardLinks(): number {
+    const hardlinks = createScanTimingAccumulator('resume-hardlink-repair')
+    try {
+      return hardlinks.measure(() => {
+        const identities = this.#database.prepare('SELECT device, inode FROM recovery_identities ORDER BY device COLLATE BINARY, inode COLLATE BINARY').all() as unknown as Array<{ device: string; inode: string }>
+        const paths = this.#database.prepare(`SELECT parent_id AS parentId, name, path_key AS pathKey, device, inode,
+          allocated_bytes AS allocatedBytes FROM hardlink_paths WHERE device = ? AND inode = ? ORDER BY path_key COLLATE BINARY`)
+        const representatives = this.#database.prepare(`SELECT id, parent_id AS parentId, name, path, kind,
+          own_bytes AS ownBytes, size_bytes AS sizeBytes, own_unreadable AS ownUnreadable,
+          direct_children AS directChildren, descendant_count AS descendantCount,
+          unreadable_count AS unreadableCount, device, inode, scan_state AS scanState,
+          enumeration_complete AS enumerationComplete, depth FROM nodes
+          WHERE kind = 'file' AND device = ? AND inode = ? ORDER BY id COLLATE BINARY`)
+        const parentNode = this.#database.prepare("SELECT path, depth FROM nodes WHERE id = ? AND kind = 'directory'")
+        const insertOwnerParent = this.#database.prepare('INSERT OR IGNORE INTO recovery_owner_parents (id) SELECT ? WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?)')
+        const deleteNode = this.#database.prepare('DELETE FROM nodes WHERE id = ?')
+        const bumpDuplicate = this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
+          direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`)
+        const seed = Buffer.from(this.nodeIdSeed, 'hex')
+
+        for (const identity of identities) {
+          const aliases = paths.all(identity.device, identity.inode) as unknown as Array<{
+            parentId: string; name: string; pathKey: string; device: string; inode: string; allocatedBytes: number
+          }>
+          aliases.sort((left, right) => comparePathKeys(left.pathKey, right.pathKey))
+          const stale = representatives.all(identity.device, identity.inode) as unknown as Array<{
+            id: string; parentId: string; name: string; path: string; kind: string; ownBytes: number; sizeBytes: number;
+            ownUnreadable: number; directChildren: number; descendantCount: number; unreadableCount: number;
+            device: string; inode: string; scanState: string; enumerationComplete: number; depth: number
+          }>
+          if (stale.length > 1) throw new Error(`Multiple representative nodes for hard-link identity ${identity.device}:${identity.inode}`)
+
+          if (aliases.length === 0) {
+            for (const node of stale) deleteNode.run(node.id)
+            continue
+          }
+
+          const owner = aliases[0]!
+          const parent = parentNode.get(owner.parentId) as { path?: string; depth?: number } | undefined
+          if (!parent?.path || parent.depth === undefined) throw new Error(`Missing owner parent for hard-link identity ${identity.device}:${identity.inode}`)
+          const nodeId = `n-${createHmac('sha256', seed).update(owner.parentId).update('\0').update(owner.name).digest('hex').slice(0, 32)}`
+          const expectedPath = join(parent.path, owner.name)
+          const existing = stale[0]
+          const reusable = existing !== undefined
+            && existing.id === nodeId && existing.parentId === owner.parentId && existing.name === owner.name
+            && existing.path === expectedPath && existing.kind === 'file'
+            && existing.device === owner.device && existing.inode === owner.inode
+            && Number(existing.ownBytes) === Number(owner.allocatedBytes) && Number(existing.sizeBytes) === Number(owner.allocatedBytes)
+            && Number(existing.ownUnreadable) === 0 && Number(existing.directChildren) === 0
+            && Number(existing.descendantCount) === 0 && Number(existing.unreadableCount) === 0
+            && existing.scanState === 'complete' && Number(existing.enumerationComplete) === 1
+            && Number(existing.depth) === Number(parent.depth) + 1
+          if (!reusable) {
+            if (existing) deleteNode.run(existing.id)
+            this.#insertNode.run(nodeId, owner.parentId, owner.name, expectedPath, 'file', owner.allocatedBytes, owner.allocatedBytes,
+              owner.device, owner.inode, 'complete', 1, Number(parent.depth) + 1)
+          }
+          insertOwnerParent.run(owner.parentId, owner.parentId)
+          this.#setHardLinkOwner.run(owner.device, owner.inode, nodeId, owner.pathKey)
+          for (const duplicate of aliases.slice(1)) bumpDuplicate.run(duplicate.parentId)
+        }
+        return identities.length
+      })
+    } finally { hardlinks.publish() }
+  }
+
+  #expandRecoveryAncestors(): void {
+    this.#database.exec(`
+      WITH RECURSIVE ancestors(id, depth) AS (
+        SELECT nodes.id, nodes.depth
+        FROM nodes JOIN recovery_owner_parents parents ON parents.id = nodes.id
+        UNION
+        SELECT parent.id, parent.depth
+        FROM nodes child JOIN ancestors current ON current.id = child.id
+        JOIN nodes parent ON parent.id = child.parent_id
+      )
+      INSERT OR IGNORE INTO recovery_ancestors (id, depth)
+      SELECT id, depth FROM ancestors;
+    `)
+  }
+
+  #rebuildAllDirectoryAggregates(): number {
+    const aggregates = createScanTimingAccumulator('resume-aggregate-repair')
+    let repairedAncestors = 0
+    try {
+      aggregates.measure(() => {
+        repairedAncestors = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'directory'").get() as { count: number }).count)
+        this.#database.exec(`
+          UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
+          UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
+          WITH RECURSIVE closure(ancestor, descendant) AS (
+            SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
+            UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
+          ), totals AS (
+            SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
+            FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
+          ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
+            descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
+            unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
+        `)
+        this.#propagatedToParent.clear()
+        for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
+          this.#propagatedToParent.set(row.id, {
+            bytes: Number(row.sizeBytes) - Number(row.ownBytes),
+            descendants: Number(row.descendantCount),
+            unreadable: Number(row.unreadableCount)
+          })
+        }
+      })
+      return repairedAncestors
+    } finally { aggregates.publish() }
+  }
+
+  #repairAffectedScheduler(): number {
+    const rows = this.#database.prepare(`SELECT task.node_id AS id, task.status, nodes.scan_state AS scanState,
+      parent.enumeration_complete AS parentEnumerationComplete, recovery.depth
+      FROM directory_tasks task JOIN nodes ON nodes.id = task.node_id
+      LEFT JOIN nodes parent ON parent.id = nodes.parent_id
+      JOIN recovery_ancestors recovery ON recovery.id = task.node_id
+      ORDER BY recovery.depth DESC, task.node_id COLLATE BINARY`).all() as unknown as Array<{
+        id: string; status: string; scanState: string; parentEnumerationComplete?: number; depth: number
+      }>
+    const roots = new Set((this.#database.prepare('SELECT id FROM recovery_roots').all() as unknown as Array<{ id: string }>).map((row) => row.id))
+    const pendingChildren = this.#database.prepare(`SELECT COUNT(*) AS count FROM nodes child
+      JOIN directory_tasks child_task ON child_task.node_id = child.id
+      WHERE child.parent_id = ? AND child_task.subtree_complete = 0`)
+    const update = this.#database.prepare('UPDATE directory_tasks SET pending_children = ?, subtree_complete = ?, ready = ? WHERE node_id = ?')
+    for (const row of rows) {
+      const pending = Number((pendingChildren.get(row.id) as { count: number }).count)
+      const subtreeComplete = (row.scanState === 'complete' || row.scanState === 'unreadable') && pending === 0
+      const terminal = row.status === 'complete' || row.status === 'unreadable'
+      const ready = terminal || subtreeComplete ? 0 : roots.has(row.id) || Number(row.parentEnumerationComplete ?? 0) === 1 ? 1 : 0
+      update.run(pending, subtreeComplete ? 1 : 0, ready, row.id)
+    }
+    return rows.length
   }
 
   bumpRevision(): number {
@@ -1427,87 +1732,6 @@ export class ConstructionDatabase implements ChartDataSource {
     try { this.#close() } catch { /* Preserve scan error. */ }
   }
 
-  #rebuildConstructionState(): { readonly affectedHardlinkIdentities: number; readonly repairedAncestors: number } {
-    const hardlinks = createScanTimingAccumulator('resume-hardlink-repair')
-    const aggregates = createScanTimingAccumulator('resume-aggregate-repair')
-    let affectedHardlinkIdentities = 0
-    let repairedAncestors = 0
-    try {
-      hardlinks.measure(() => {
-        this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = MAX(0, direct_skipped_count - direct_duplicate_count),
-          direct_duplicate_count = 0`).run()
-        const aliases = this.#database.prepare(`SELECT parent_id AS parentId, name, path_key AS pathKey, device, inode,
-          allocated_bytes AS allocatedBytes FROM hardlink_paths`).all() as unknown as Array<{ parentId: string; name: string; pathKey: string; device: string; inode: string; allocatedBytes: number }>
-        const groups = new Map<string, typeof aliases>()
-        for (const alias of aliases) {
-          if (alias.device === '' || alias.inode === '') continue
-          const key = `${alias.device}\0${alias.inode}`
-          const group = groups.get(key) ?? []
-          group.push(alias)
-          groups.set(key, group)
-        }
-        affectedHardlinkIdentities = groups.size
-        const seed = Buffer.from(this.nodeIdSeed, 'hex')
-        const existingNodes = this.#database.prepare("SELECT id, device, inode FROM nodes WHERE kind = 'file'")
-        const deleteNode = this.#database.prepare('DELETE FROM nodes WHERE id = ?')
-        const parentNode = this.#database.prepare('SELECT path, depth FROM nodes WHERE id = ?')
-        const bumpDuplicate = this.#database.prepare(`UPDATE directory_observations SET direct_skipped_count = direct_skipped_count + 1,
-          direct_duplicate_count = direct_duplicate_count + 1 WHERE node_id = ?`)
-        const fileNodes = new Map<string, string[]>()
-        for (const row of existingNodes.all() as unknown as Array<{ id: string; device: string; inode: string }>) {
-          const key = `${row.device}\0${row.inode}`
-          const ids = fileNodes.get(key) ?? []
-          ids.push(row.id)
-          fileNodes.set(key, ids)
-        }
-        for (const group of groups.values()) {
-          group.sort((left, right) => Buffer.compare(Buffer.from(left.pathKey, 'utf8'), Buffer.from(right.pathKey, 'utf8')))
-          const owner = group[0]!
-          const id = `n-${createHmac('sha256', seed).update(owner.parentId).update('\0').update(owner.name).digest('hex').slice(0, 32)}`
-          const existing = fileNodes.get(`${owner.device}\0${owner.inode}`) ?? []
-          if (group.length === 1 && existing.length === 1 && existing[0] === id) {
-            this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
-            continue
-          }
-          for (const rowId of existing) deleteNode.run(rowId)
-          const parent = parentNode.get(owner.parentId) as { path?: string; depth?: number } | undefined
-          if (!parent?.path) continue
-          this.#insertNode.run(id, owner.parentId, owner.name, join(parent.path, owner.name), 'file', owner.allocatedBytes, owner.allocatedBytes, owner.device, owner.inode, 'complete', 1, Number(parent.depth ?? 0) + 1)
-          this.setHardLinkOwner(owner.device, owner.inode, id, owner.pathKey)
-          for (const duplicate of group.slice(1)) bumpDuplicate.run(duplicate.parentId)
-        }
-      })
-      aggregates.measure(() => {
-        repairedAncestors = Number((this.#database.prepare("SELECT COUNT(*) AS count FROM nodes WHERE kind = 'directory'").get() as { count: number }).count)
-        this.#database.exec(`
-          UPDATE nodes SET direct_children = (SELECT COUNT(*) FROM nodes child WHERE child.parent_id = nodes.id);
-          UPDATE nodes SET size_bytes = own_bytes, descendant_count = 0, unreadable_count = own_unreadable;
-          WITH RECURSIVE closure(ancestor, descendant) AS (
-            SELECT parent_id, id FROM nodes WHERE parent_id IS NOT NULL
-            UNION ALL SELECT nodes.parent_id, closure.descendant FROM nodes JOIN closure ON nodes.id = closure.ancestor WHERE nodes.parent_id IS NOT NULL
-          ), totals AS (
-            SELECT ancestor, SUM(nodes.own_bytes) AS bytes, COUNT(*) AS descendants, SUM(nodes.own_unreadable) AS unreadable
-            FROM closure JOIN nodes ON nodes.id = closure.descendant GROUP BY ancestor
-          ) UPDATE nodes SET size_bytes = own_bytes + COALESCE((SELECT bytes FROM totals WHERE ancestor = nodes.id), 0),
-            descendant_count = COALESCE((SELECT descendants FROM totals WHERE ancestor = nodes.id), 0),
-            unreadable_count = own_unreadable + COALESCE((SELECT unreadable FROM totals WHERE ancestor = nodes.id), 0);
-        `)
-        this.#propagatedToParent.clear()
-        for (const row of this.#database.prepare("SELECT id, size_bytes AS sizeBytes, own_bytes AS ownBytes, descendant_count AS descendantCount, unreadable_count AS unreadableCount FROM nodes WHERE scan_state = 'unreadable'").all() as unknown as Array<{ id: string; sizeBytes: number; ownBytes: number; descendantCount: number; unreadableCount: number }>) {
-          this.#propagatedToParent.set(row.id, {
-            bytes: Number(row.sizeBytes) - Number(row.ownBytes),
-            descendants: Number(row.descendantCount),
-            unreadable: Number(row.unreadableCount)
-          })
-        }
-      })
-      return { affectedHardlinkIdentities, repairedAncestors }
-    } finally {
-      hardlinks.publish()
-      aggregates.publish()
-    }
-  }
-
   #applyAncestorDelta(parentId: string | null, bytes: number, descendants: number, unreadable: number): void {
     if (!parentId) return
     const batch = this.#metadataBatch
@@ -1523,6 +1747,8 @@ export class ConstructionDatabase implements ChartDataSource {
   }
 
   #parentId(id: string): string | null {
+    const pending = this.#metadataBatch.fileNodes.get(id)
+    if (pending) return pending.parentId
     const row = this.#parentIdStatement.get(id) as unknown as { parentId: string | null } | undefined
     return row?.parentId ?? null
   }
@@ -1575,6 +1801,10 @@ function migrateConstructionSchema(database: DatabaseSync): void {
     try { database.exec('ROLLBACK') } catch { /* Preserve the migration error. */ }
     throw error
   }
+}
+
+function emptyResumeRecoveryReport(): ResumeRecoveryReport {
+  return { roots: 0, deletedNodes: 0, affectedHardlinkIdentities: 0, repairedAncestors: 0, repairedSchedulerRows: 0 }
 }
 
 function emptyConstructionPageResult(): MutableConstructionPageResult {

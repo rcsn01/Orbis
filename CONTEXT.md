@@ -1,5 +1,9 @@
 # Orbis domain vocabulary
 
+- **Resume preparation**: the path-free, indeterminate UI state between accepting Resume and the first resumed traversal update. It keeps the last durable construction preview visible while the worker validates history, recovers interrupted work, repairs the index, and starts traversal.
+- **Resume validation receipt**: an in-memory proof tied to one validated descriptor, checkpoint row, database file, and SQLite sidecar set. It crosses from the main process to one worker attempt; it never authorizes a path and any mismatch returns to authoritative validation.
+- **Affected recovery set**: the interrupted roots, deleted descendants, hard-link identities, owner parents, and ancestor rows captured before construction recovery mutates the database. It bounds hard-link and scheduler repair without changing the saved schema; Stage 4 still rebuilds directory aggregates globally.
+
 Settled terms used across the codebase. Keep these meanings stable when naming
 new symbols or writing docs.
 

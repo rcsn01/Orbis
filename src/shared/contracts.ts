@@ -1,4 +1,4 @@
-export type ScanStage = "traversing" | "indexing"
+export type ScanStage = "resuming" | "traversing" | "indexing"
 export type ScanStatus = "idle" | "scanning" | "completed" | "canceled" | "fatal-error"
 export type NodeKind = "directory" | "file"
 export type DirectoryScanState = "queued" | "scanning" | "complete" | "unreadable"
@@ -147,7 +147,7 @@ function isScan(value: unknown): boolean {
 }
 
 function isProgress(value: unknown): boolean {
-  if (!isRecord(value) || (value.stage !== "traversing" && value.stage !== "indexing")) return false
+  if (!isRecord(value) || (value.stage !== "resuming" && value.stage !== "traversing" && value.stage !== "indexing")) return false
   return integer(value.scannedItems) && nonnegative(value.scannedItems) && finite(value.discoveredBytes) && nonnegative(value.discoveredBytes)
     && finite(value.elapsedMs) && nonnegative(value.elapsedMs) && typeof value.currentItem === "string"
 }

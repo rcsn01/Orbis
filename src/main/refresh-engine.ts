@@ -5,8 +5,8 @@ import { DatabaseSync } from 'node:sqlite'
 import type { ChangeJournal } from './change-journal'
 import { createChangeJournal, FSEVENT_FLAGS, nativeChangeJournalAddon } from './change-journal'
 import { prepareDatabaseDirectory, readMetadata, removeDatabaseFiles } from './database'
-import { createScanTimingMilestones, measureScan, measureScanAsync, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone } from './diagnostics'
-import { FullScanResumeStore, type FullScanResumeDescriptor, type FullScanResumeLoad } from './full-scan-resume'
+import { createScanTimingMilestones, measureScan, measureScanAsync, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone, type ResumePreparationPhase } from './diagnostics'
+import { FullScanResumeStore, type FullScanResumeDescriptor, type FullScanResumeLoad, type ResumeValidationReceipt } from './full-scan-resume'
 import type { IndexManifest, JournalCursor } from './index-manifest'
 import { planDirtyScopes, scanReplacementScopes } from './incremental-scanner'
 import { IncrementalFallbackError, replaceIndexSubtrees } from './persistent-index-database'
@@ -23,6 +23,8 @@ export interface RefreshRequest extends ScanOptions {
   readonly active?: ActivePersistentIndex
   readonly changeJournal?: ChangeJournal
   readonly resumeExpected?: boolean
+  readonly resumeReceipt?: ResumeValidationReceipt
+  readonly onResumePreparation?: (phase: ResumePreparationPhase) => void | Promise<void>
 }
 
 export type RefreshOutcome =
@@ -56,8 +58,9 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
   const addon = request.changeJournal ? undefined : await loadNativeOrbisAddon(request.nativeAddonPath)
   const journal = request.changeJournal ?? createChangeJournal(nativeChangeJournalAddon(addon))
   const activeCursor = request.active?.manifest.journal
+  if (request.resumeExpected) await request.onResumePreparation?.('validating')
   const saved = journal && process.env.ORBIS_DISABLE_INCREMENTAL_SCAN !== '1'
-    ? await new FullScanResumeStore(request.indexDirectory).load(request.target) : { kind: 'none' as const }
+    ? await new FullScanResumeStore(request.indexDirectory).load(request.target, request.resumeReceipt) : { kind: 'none' as const }
   if (saved.kind === 'construction' || saved.kind === 'candidate') return fullRefresh(request, journal, undefined, 0, 0, saved)
   if (process.env.ORBIS_DISABLE_INCREMENTAL_SCAN === '1' || !request.active || !journal || !activeCursor) {
     return fullRefresh(request, journal)
@@ -141,6 +144,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
   let result: ScanResult
   try {
     if (!resumable?.candidate) recordScanCounter('fullScanAttempts')
+    if (resumable?.candidate) await request.onResumePreparation?.('starting')
     result = resumable?.candidate
       ? readCandidateResult(resumable.candidate, request.generation)
       : await scanFilesystem({ ...request, partialPath: resumable?.partialPath ?? request.partialPath, publishedPath: resumable?.candidatePath ?? request.publishedPath,
@@ -300,6 +304,7 @@ async function prepareResumableFullScan(request: RefreshRequest, journal: Change
     // (persisted at each 30s drain and at pause), so replaying from the
     // scan-start baseline would discard a perfectly resumable scan whenever
     // the long window trips a journal limit or drop flag.
+    await request.onResumePreparation?.('history')
     const history = measureScan('resume-history-validation', () => journal.readChanges(request.target, store.cursor(loaded.descriptor, loaded.drainedThrough), MAX_EVENTS, HISTORY_TIMEOUT_MS))
     if (history.requiresFullScan) {
       await store.discard(loaded.descriptor.scanId)
@@ -324,7 +329,7 @@ async function createResumableFullScan(request: RefreshRequest, journal: ChangeJ
   if (!scanId) return undefined
   const checkpoint = safeCheckpoint(journal, request.target)
   if (!checkpoint?.journalUuid) return undefined
-  const [target, directory] = await Promise.all([lstat(request.target), lstat(request.indexDirectory)])
+  const [target, directory] = await Promise.all([lstat(request.target, { bigint: true }), lstat(request.indexDirectory, { bigint: true })])
   if (!target.isDirectory() || target.isSymbolicLink() || !directory.isDirectory() || directory.isSymbolicLink() || checkpoint.device !== String(target.dev)) return undefined
   const descriptor = store.descriptor({
     scanId, target: request.target, targetDevice: String(target.dev), targetInode: String(target.ino),
@@ -415,7 +420,7 @@ function safeCheckpoint(journal: ChangeJournal, target: string) {
 
 async function validateActiveTarget(manifest: IndexManifest): Promise<string | undefined> {
   try {
-    const stats = await lstat(manifest.target)
+    const stats = await lstat(manifest.target, { bigint: true })
     if (!stats.isDirectory() || stats.isSymbolicLink()) return 'target-replaced'
     return String(stats.dev) === manifest.targetDevice && String(stats.ino) === manifest.targetInode ? undefined : 'target-replaced'
   } catch { return 'target-unavailable' }
@@ -442,7 +447,7 @@ function metadataRevision(path: string): number {
 }
 
 async function volumeFor(target: string): Promise<{ capacityBytes: number; freeBytes: number; targetAllocatedBytes: number }> {
-  const [value, targetStats] = await Promise.all([statfs(target), lstat(target)])
+  const [value, targetStats] = await Promise.all([statfs(target), lstat(target, { bigint: true })])
   return {
     capacityBytes: Number(value.blocks) * Number(value.bsize),
     freeBytes: Number(value.bfree) * Number(value.bsize),

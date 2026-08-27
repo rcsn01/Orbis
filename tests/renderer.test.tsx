@@ -81,6 +81,28 @@ describe("Orbis renderer", () => {
     expect(screen.queryByText("selected folder")).toBeNull()
   })
 
+  it("keeps saved results visible during resume preparation", async () => {
+    const user = userEvent.setup()
+    const paused: OrbisSnapshot = { ...scanning, scan: { status: "canceled", generation: 1, progress: null, totals: null, error: null, resume: { available: true, checkpointedAt: "2026-01-01T00:00:00.000Z" } } }
+    const preparing: OrbisSnapshot = { ...paused, scan: { status: "scanning", generation: 2, progress: { stage: "resuming", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "Validating saved scan" }, totals: null, error: null } }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(paused)
+    vi.mocked(window.orbis.rescan).mockResolvedValueOnce(preparing)
+    render(<App />)
+    const savedSegment = await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, 80\.0 percent/ })
+    await user.click(screen.getAllByRole("button", { name: "Resume" })[0]!)
+    expect(await screen.findByText("Preparing resume...")).toBeVisible()
+    expect(screen.getByText("Validating saved scan", { exact: false })).toBeVisible()
+    const progress = screen.getByRole("progressbar", { name: "Resume preparation" })
+    expect(progress).toHaveAttribute("aria-valuenow", "4")
+    expect(progress).toHaveAttribute("aria-valuetext", "Validating saved scan")
+    expect(savedSegment).toBeVisible()
+    publish?.({ ...preparing, scan: { ...preparing.scan, progress: { ...preparing.scan.progress!, currentItem: "Repairing saved index" } } })
+    expect(await screen.findByText("Repairing saved index", { exact: false })).toBeVisible()
+    expect(savedSegment).toBeVisible()
+    publish?.(scanning)
+    expect(await screen.findByText("Scanning…")).toBeVisible()
+  })
+
   it("shows scan progress, supports keyboard segment activation, drill-down, file selection, and Finder reveal", async () => {
     const user = userEvent.setup()
     render(<App />)

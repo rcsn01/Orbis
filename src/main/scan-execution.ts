@@ -1,9 +1,10 @@
 import type { ProgressSnapshot } from '../shared/contracts'
-import type { ResumeMilestone } from './diagnostics'
+import { isResumePreparationPhase, RESUME_PREPARATION_PHASES, type ResumeMilestone, type ResumePreparationPhase } from './diagnostics'
 import type { JournalCursor } from './index-manifest'
 import { PublicationArtifacts } from './publication-artifacts'
 import type { FolderSizeEstimate } from './scan-metadata'
 import type { ActivePersistentIndex } from './refresh-engine'
+import type { ResumeValidationReceipt } from './full-scan-resume'
 import type { ProgressivePreview, ScanResult, ScanTotals } from './scanner'
 import type {
   WorkerCompleteMessage, WorkerFocusAcceptedMessage, WorkerMessage, WorkerPausedMessage,
@@ -27,6 +28,7 @@ export interface ScanExecutionRequest {
   readonly indexDirectory: string
   readonly startupRoot: boolean
   readonly resumeExpected?: boolean
+  readonly resumeReceipt?: ResumeValidationReceipt
   readonly initialEstimate?: FolderSizeEstimate
   readonly active?: ActivePersistentIndex
 }
@@ -35,6 +37,7 @@ export type ScanUpdate =
   | { readonly type: 'progress'; readonly progress: ProgressSnapshot }
   | { readonly type: 'preview'; readonly preview: ProgressivePreview }
   | { readonly type: 'resume-milestone'; readonly milestone: ResumeMilestone }
+  | { readonly type: 'resume-preparation'; readonly phase: ResumePreparationPhase }
 
 export type ScanOutcome =
   | { readonly kind: 'completed'; readonly result: ScanResult; readonly refresh?: WorkerCompleteMessage['refresh'] }
@@ -120,6 +123,7 @@ class WorkerScanSession implements ScanSession {
   readonly result = this.#outcome.promise
   #requestId = 1
   #latestPreviewRevision = -1
+  #latestResumePreparation = -1
   #terminal = false
   #stopping = false
   #terminated = false
@@ -148,6 +152,7 @@ class WorkerScanSession implements ScanSession {
       type: 'start', generation: this.generation, requestId: this.#requestId,
       target: this.request.target, partialPath: this.request.partialPath, publishedPath: this.request.publishedPath,
       indexDirectory: this.request.indexDirectory, startupRoot: this.request.startupRoot, resumeExpected: this.request.resumeExpected === true,
+      ...(this.request.resumeReceipt ? { resumeReceipt: this.request.resumeReceipt } : {}),
       ...(this.request.initialEstimate ? { initialEstimate: this.request.initialEstimate } : {}),
       ...(this.request.active ? { active: this.request.active } : {})
     }
@@ -211,7 +216,14 @@ class WorkerScanSession implements ScanSession {
       return
     }
     if (message.type === 'progress' && message.progress) {
+      this.#latestResumePreparation = RESUME_PREPARATION_PHASES.length
       this.#updates.push({ type: 'progress', progress: message.progress })
+    } else if (message.type === 'resume-preparation' && message.requestId === this.#requestId && this.request.resumeExpected === true && isResumePreparationPhase(message.phase)) {
+      const phase = RESUME_PREPARATION_PHASES.indexOf(message.phase)
+      if (phase > this.#latestResumePreparation) {
+        this.#latestResumePreparation = phase
+        this.#updates.push({ type: 'resume-preparation', phase: message.phase })
+      }
     } else if (message.type === 'resume-milestone' && isResumeMilestone(message.milestone)) {
       this.#updates.push({ type: 'resume-milestone', milestone: message.milestone })
     } else if (message.type === 'preview' && message.preview) {

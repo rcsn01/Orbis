@@ -33,6 +33,40 @@ export const RESUME_CONTROLLER_PHASES = [
 
 export type ResumeMilestone = 'preparation-started' | 'first-metadata-page' | 'first-metadata-preview'
 
+export const RESUME_RECEIPT_FALLBACK_REASONS = [
+  'malformed-receipt', 'descriptor-mismatch', 'target-mismatch', 'target-identity-mismatch',
+  'index-directory-identity-mismatch', 'artifact-presence-mismatch', 'database-stamp-mismatch',
+  'sidecar-stamp-mismatch', 'resume-row-mismatch', 'candidate-metadata-mismatch',
+  'sqlite-validation-failed', 'validation-race', 'unacknowledged-journal-state'
+] as const
+export type ResumeReceiptFallbackReason = typeof RESUME_RECEIPT_FALLBACK_REASONS[number]
+
+export interface OrbisResumeReceiptFallbackEvent {
+  readonly scope: 'scan'
+  readonly kind: 'resume-receipt-fallback'
+  readonly reason: ResumeReceiptFallbackReason
+  readonly generation: number
+}
+
+type ResumeReceiptFallbackListener = (event: OrbisResumeReceiptFallbackEvent) => void
+
+export const RESUME_PREPARATION_PHASES = [
+  'validating', 'history', 'recovering', 'repairing', 'starting'
+] as const
+export type ResumePreparationPhase = typeof RESUME_PREPARATION_PHASES[number]
+
+export const RESUME_PREPARATION_MESSAGES: Readonly<Record<ResumePreparationPhase, string>> = Object.freeze({
+  validating: 'Validating saved scan',
+  history: 'Checking filesystem changes',
+  recovering: 'Preparing interrupted directories',
+  repairing: 'Repairing saved index',
+  starting: 'Starting filesystem traversal'
+})
+
+export function isResumePreparationPhase(value: unknown): value is ResumePreparationPhase {
+  return typeof value === 'string' && (RESUME_PREPARATION_PHASES as readonly string[]).includes(value)
+}
+
 export const SCAN_COUNTER_NAMES = [
   'fullScanAttempts', 'fullScanRetries', 'nativePageReads', 'nodePageReads', 'nativePayloadBytes',
   'metadataEntries', 'metadataBatchFlushes', 'metadataRowsFlushed', 'schedulerSelects',
@@ -66,10 +100,11 @@ export interface ControllerTimingMilestones { mark(generation: number, phase: st
 const scanChannel = channel('orbis.scan.timing')
 const counterChannel = channel('orbis.scan.counter')
 const controllerChannel = channel('orbis.controller.timing')
+const resumeReceiptFallbackChannel = channel('orbis.scan.resume-receipt-fallback')
 const scanContext = new AsyncLocalStorage<{ readonly generation: number; readonly workDurations: Map<string, number> }>()
 
 export function runWithScanDiagnostics<T>(generation: number, operation: () => T): T {
-  if (!scanChannel.hasSubscribers && !counterChannel.hasSubscribers) return operation()
+  if (!scanChannel.hasSubscribers && !counterChannel.hasSubscribers && !resumeReceiptFallbackChannel.hasSubscribers) return operation()
   return scanContext.run({ generation, workDurations: new Map() }, operation)
 }
 
@@ -182,6 +217,18 @@ export function subscribeScanCounters(listener: CounterListener): () => void {
   const subscription = (message: unknown): void => listener(message as OrbisCounterEvent)
   counterChannel.subscribe(subscription)
   return () => counterChannel.unsubscribe(subscription)
+}
+
+export function publishResumeReceiptFallback(reason: ResumeReceiptFallbackReason): void {
+  const context = scanContext.getStore()
+  if (!context) return
+  resumeReceiptFallbackChannel.publish({ scope: 'scan', kind: 'resume-receipt-fallback', reason, generation: context.generation } satisfies OrbisResumeReceiptFallbackEvent)
+}
+
+export function subscribeResumeReceiptFallbacks(listener: ResumeReceiptFallbackListener): () => void {
+  const subscription = (message: unknown): void => listener(message as OrbisResumeReceiptFallbackEvent)
+  resumeReceiptFallbackChannel.subscribe(subscription)
+  return () => resumeReceiptFallbackChannel.unsubscribe(subscription)
 }
 
 export function subscribeControllerDiagnostics(listener: TimingListener): () => void {

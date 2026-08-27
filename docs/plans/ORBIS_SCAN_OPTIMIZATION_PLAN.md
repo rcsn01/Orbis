@@ -4,6 +4,8 @@ This plan turns the SquirrelDisk and PDU research into independently testable im
 
 Supporting research: [`../research/squirreldisk-orbis-optimizations.md`](../research/squirreldisk-orbis-optimizations.md)
 
+Resume-specific stages are tracked in [`../../ORBIS_RESUME_OPTIMIZATION_PLAN.md`](../../ORBIS_RESUME_OPTIMIZATION_PLAN.md). Stage 4 now scopes hard-link and scheduler recovery to interrupted roots while retaining the global aggregate rebuild until Stage 5; focused lifecycle coverage, full verification, packaging, and schema-7 quick checks have passed.
+
 The schema, native transport, checkpoint, and incremental-refresh proposals below are historical. The scan pipeline redesign supersedes those unchecked items. See [`../benchmarks/orbis-scan-pipeline-redesign.md`](../benchmarks/orbis-scan-pipeline-redesign.md) and [`../architecture/orbis-progressive-scanning.md`](../architecture/orbis-progressive-scanning.md) for the retained design.
 
 ## Goals

@@ -4,9 +4,10 @@ import { lstat, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ConstructionDatabase, type ConstructionPage } from '../src/main/construction-database'
+import { ConstructionDatabase, ConstructionError, type ConstructionPage } from '../src/main/construction-database'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
 import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters } from '../src/main/diagnostics'
+import { readConstructionSnapshot, recoverWithLegacyReference } from './helpers/orbis-resume-recovery'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -102,9 +103,259 @@ describe('ConstructionDatabase construction lifecycle', () => {
     const resumed = ConstructionDatabase.openResumable(path)
     try {
       const recovery = resumed.recoverIncompleteDirectories()
-      expect(recovery.reset).toBeGreaterThan(0)
+      expect(recovery.roots).toBeGreaterThan(0)
       expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: sourceId, pathKey: 'Z-sources/file' })
     } finally { resumed.abort() }
+  })
+
+  it('repairs only interrupted roots, affected hard links, and their scheduler ancestors', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-scoped-recovery-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const paths = new Map<string, string>([['root', directory]])
+    const pathFor = (parentId: string, name: string): string => join(paths.get(parentId) ?? directory, name)
+    const node = (id: string, parentId: string, name: string, kind: 'directory' | 'file', inode: string, ownBytes = 0) => ({
+      id, parentId, name, path: pathFor(parentId, name), kind, ownBytes, device: '1', inode
+    })
+    const directoryNode = (id: string, parentId: string, name: string, inode: string) => {
+      const path = pathFor(parentId, name)
+      paths.set(id, path)
+      return { id, parentId, name, path, kind: 'directory' as const, ownBytes: 0, device: '1', inode }
+    }
+    const taskPage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean, focused = false, entriesRead = 0): ConstructionPage => ({
+      taskId, depth, focused, entriesRead, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+    })
+    const entry = (value: ReturnType<typeof node>, pathKey: string, linkCount?: number) => ({
+      kind: 'node' as const, node: { node: value, pathKey, ...(linkCount === undefined ? {} : { linkCount }) }
+    })
+    const seed = database.nodeIdSeed
+    const hardLinkId = (parentId: string, name: string): string => `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update(parentId).update('\0').update(name).digest('hex').slice(0, 32)}`
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: taskPage('root', 0, [
+        entry(directoryNode('left', 'root', 'left', '2'), 'left'), entry(directoryNode('right', 'root', 'right', '3'), 'right')
+      ], true) })
+
+      database.takeWork({ limit: 2, focusTurns: 0 })
+      database.accept({ kind: 'page', page: taskPage('left', 1, [
+        entry(directoryNode('stable', 'left', 'stable', '4'), 'left/stable'), entry(directoryNode('reset', 'left', 'reset', '5'), 'left/reset')
+      ], true) })
+      database.accept({ kind: 'page', page: taskPage('right', 1, [
+        entry(directoryNode('stable-right', 'right', 'stable-right', '6'), 'right/stable-right'), entry(directoryNode('reset-right', 'right', 'reset-right', '7'), 'right/reset-right')
+      ], false) })
+      database.markUnreadable('right')
+
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: taskPage('stable', 2, [
+        entry(node(hardLinkId('stable', 'external'), 'stable', 'external', 'file', '50', 10), 'left/stable/external', 2)
+      ], true) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: taskPage('reset', 2, [
+        entry(node(hardLinkId('reset', 'reset-file'), 'reset', 'reset-file', 'file', '50', 10), 'left/reset/reset-file', 2),
+        entry(directoryNode('nested', 'reset', 'nested', '8'), 'left/reset/nested')
+      ], false) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: taskPage('stable-right', 2, [
+        entry(node('single', 'stable-right', 'single', 'file', '60', 10), 'right/stable-right/single', 1),
+        entry(node(hardLinkId('stable-right', 'u-a'), 'stable-right', 'u-a', 'file', '61', 10), 'right/stable-right/u-a', 2),
+        entry(node(hardLinkId('stable-right', 'u-b'), 'stable-right', 'u-b', 'file', '61', 10), 'right/stable-right/u-b', 2)
+      ], true) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.promoteSubtree('nested')
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const before = readConstructionSnapshot(path)
+      expect(before.directoryTasks.find((row) => row.nodeId === 'stable-right')).toMatchObject({ status: 'complete', ready: 0 })
+      const legacy = recoverWithLegacyReference(path, join(directory, 'legacy.sqlite'))
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        const recovery = resumed.recoverIncompleteDirectories()
+        expect(recovery).toEqual({ roots: 2, deletedNodes: 2, affectedHardlinkIdentities: 1, repairedAncestors: 7, repairedSchedulerRows: 6 })
+        expect(resumed.taskIsFocused('reset')).toBe(true)
+        expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: hardLinkId('stable', 'external'), pathKey: 'left/stable/external' })
+        expect(resumed.takeWork({ limit: 2, focusTurns: 0 }).work.map((task) => task.id)).toEqual(['reset', 'reset-right'])
+        resumed.checkpoint({ reason: 'resume' })
+        expect(readConstructionSnapshot(path).directoryTasks.find((row) => row.nodeId === 'right')).toMatchObject({ status: 'unreadable', pendingChildren: 1, subtreeComplete: 0, ready: 0 })
+      } finally { resumed.abort() }
+
+      const after = readConstructionSnapshot(path)
+      expect(after.nodes).toEqual(legacy.nodes)
+      expect(after.hardlinkOwners).toEqual(legacy.hardlinkOwners)
+      expect(after.hardlinkPaths).toEqual(legacy.hardlinkPaths)
+      expect(after.directoryObservations).toEqual(legacy.directoryObservations)
+      expect(after.directoryTasks.find((row) => row.nodeId === 'stable-right')).toEqual(before.directoryTasks.find((row) => row.nodeId === 'stable-right'))
+      expect(after.directoryTasks.filter((row) => row.ready === 1).map((row) => row.nodeId)).toEqual(['reset', 'reset-right'])
+      expect(after.hardlinkOwners).toEqual([
+        { device: '1', inode: '50', nodeId: hardLinkId('stable', 'external'), pathKey: 'left/stable/external' },
+        { device: '1', inode: '61', nodeId: hardLinkId('stable-right', 'u-a'), pathKey: 'right/stable-right/u-a' }
+      ])
+      expect(after.hardlinkPaths).toEqual([
+        { parentId: 'stable', name: 'external', pathKey: 'left/stable/external', device: '1', inode: '50', allocatedBytes: 10 },
+        { parentId: 'stable-right', name: 'u-a', pathKey: 'right/stable-right/u-a', device: '1', inode: '61', allocatedBytes: 10 },
+        { parentId: 'stable-right', name: 'u-b', pathKey: 'right/stable-right/u-b', device: '1', inode: '61', allocatedBytes: 10 }
+      ])
+      expect(after.directoryObservations.find((row) => row.nodeId === 'stable')?.directDuplicateCount).toBe(0)
+      expect(after.directoryObservations.find((row) => row.nodeId === 'stable-right')).toEqual(before.directoryObservations.find((row) => row.nodeId === 'stable-right'))
+      expect(after.nodes.some((row) => row.nodeId === 'nested')).toBe(false)
+    } finally { database.abort() }
+  })
+
+  it('reuses an unchanged surviving hard-link representative', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-hardlink-reuse-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const idFor = (parentId: string, name: string): string => `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update(parentId).update('\0').update(name).digest('hex').slice(0, 32)}`
+    const directoryEntry = (id: string, parentId: string, name: string, inode: string, pathKey: string) => ({
+      kind: 'node' as const, node: { node: { id, parentId, name, path: join(directory, ...pathKey.split('/')), kind: 'directory' as const, ownBytes: 0, device: '1', inode }, pathKey }
+    })
+    const fileEntry = (parentId: string, name: string, inode: string, pathKey: string) => ({
+      kind: 'node' as const, node: { node: { id: idFor(parentId, name), parentId, name, path: join(directory, ...pathKey.split('/')), kind: 'file' as const, ownBytes: 10, device: '1', inode }, pathKey, linkCount: 2 }
+    })
+    const makePage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean): ConstructionPage => ({
+      taskId, depth, focused: false, entriesRead: 0, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+    })
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: makePage('root', 0, [
+        directoryEntry('stable', 'root', 'a-stable', '2', 'a-stable'), directoryEntry('reset', 'root', 'z-reset', '3', 'z-reset')
+      ], true) })
+      database.takeWork({ limit: 2, focusTurns: 0 })
+      database.accept({ kind: 'page', page: makePage('stable', 1, [fileEntry('stable', 'external', '90', 'a-stable/external')], true) })
+      database.accept({ kind: 'page', page: makePage('reset', 1, [fileEntry('reset', 'reset-file', '90', 'z-reset/reset-file')], false) })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const before = readConstructionSnapshot(path)
+      const beforeNode = before.nodes.find((row) => row.device === '1' && row.inode === '90')
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, affectedHardlinkIdentities: 1 })
+        resumed.checkpoint({ reason: 'resume' })
+      } finally { resumed.abort() }
+      const after = readConstructionSnapshot(path)
+      expect(after.nodes.find((row) => row.device === '1' && row.inode === '90')).toEqual(beforeNode)
+      expect(after.hardlinkOwners).toEqual([{ device: '1', inode: '90', nodeId: idFor('stable', 'external'), pathKey: 'a-stable/external' }])
+    } finally { database.abort() }
+  })
+
+  it('preserves the durable checkpoint when hard-link node-ID insertion collides', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-hardlink-collision-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const idFor = (parentId: string, name: string): string => `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update(parentId).update('\0').update(name).digest('hex').slice(0, 32)}`
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([
+        { kind: 'node', node: { node: { id: 'stable', parentId: 'root', name: 'stable', path: join(directory, 'stable'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'stable' } },
+        { kind: 'node', node: { node: { id: 'reset', parentId: 'root', name: 'reset', path: join(directory, 'reset'), kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'reset' } }
+      ]) })
+      database.takeWork({ limit: 2, focusTurns: 0 })
+      const resetOwner = idFor('reset', 'file')
+      database.accept({ kind: 'page', page: { ...page([], true, 0, 'stable'), depth: 1 } })
+      database.accept({ kind: 'page', page: { ...page([
+        { kind: 'node', node: { node: { id: resetOwner, parentId: 'reset', name: 'file', path: join(directory, 'reset', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '90' }, pathKey: 'reset/file', linkCount: 2 } }
+      ], false, 0, 'reset'), depth: 1 } })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const malformed = new DatabaseSync(path)
+      try {
+        malformed.exec('PRAGMA foreign_keys=ON; BEGIN;')
+        malformed.prepare('INSERT INTO hardlink_paths (parent_id, name, path_key, device, inode, allocated_bytes) VALUES (?, ?, ?, ?, ?, ?)').run('stable', 'external', 'stable/external', '1', '90', 10)
+        malformed.prepare('UPDATE directory_observations SET direct_skipped_count = 1, direct_duplicate_count = 1 WHERE node_id = ?').run('stable')
+        malformed.prepare('DELETE FROM nodes WHERE id = ?').run(resetOwner)
+        malformed.prepare(`INSERT INTO nodes
+          (id, parent_id, name, path, kind, own_bytes, size_bytes, device, inode, scan_state, enumeration_complete, depth)
+          VALUES (?, ?, ?, ?, 'file', 10, 10, '1', '99', 'complete', 1, 2)`).run(idFor('stable', 'external'), 'stable', 'collision', join(directory, 'stable', 'collision'))
+        malformed.exec('COMMIT')
+      } finally { malformed.close() }
+      const before = readConstructionSnapshot(path)
+      const resumed = ConstructionDatabase.openResumable(path)
+      let error: unknown
+      try { resumed.recoverIncompleteDirectories() } catch (caught) { error = caught } finally { resumed.abort() }
+      expect(error).not.toBeInstanceOf(ConstructionError)
+      expect(String((error as Error)?.message)).toMatch(/constraint|unique|primary/i)
+      expect(readConstructionSnapshot(path)).toEqual(before)
+    } finally { database.abort() }
+  })
+
+  it('removes an affected hard-link identity when its last path is in the reset subtree', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-hardlink-no-path-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const makePage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean): ConstructionPage => ({
+      taskId, depth, focused: false, entriesRead: 0, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+    })
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: makePage('root', 0, [
+        { kind: 'node', node: { node: { id: 'stable', parentId: 'root', name: 'stable', path: join(directory, 'stable'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'stable' } },
+        { kind: 'node', node: { node: { id: 'reset', parentId: 'root', name: 'reset', path: join(directory, 'reset'), kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'reset' } }
+      ], true) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: makePage('stable', 1, [], true) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      const ownerId = `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update('reset').update('\0').update('file').digest('hex').slice(0, 32)}`
+      database.accept({ kind: 'page', page: makePage('reset', 1, [
+        { kind: 'node', node: { node: { id: ownerId, parentId: 'reset', name: 'file', path: join(directory, 'reset', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '70' }, pathKey: 'reset/file', linkCount: 2 } }
+      ], false) })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, deletedNodes: 1, affectedHardlinkIdentities: 1, repairedSchedulerRows: 2 })
+        expect(resumed.getHardLinkOwner('1', '70')).toBeUndefined()
+        resumed.checkpoint({ reason: 'resume' })
+      } finally { resumed.abort() }
+      const snapshot = readConstructionSnapshot(path)
+      expect(snapshot.hardlinkOwners).toEqual([])
+      expect(snapshot.hardlinkPaths).toEqual([])
+      expect(snapshot.nodes.some((row) => row.nodeId === ownerId)).toBe(false)
+    } finally { database.abort() }
+  })
+
+  it('rejects finalized hard-link groups before mutating a traversal checkpoint', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-invalid-groups-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+    database.checkpoint({ reason: 'startup' })
+    database.abort()
+    const invalid = new DatabaseSync(path)
+    try {
+      invalid.exec(`
+        PRAGMA foreign_keys=ON;
+        BEGIN;
+        INSERT INTO hardlink_paths (parent_id, name, path_key, device, inode, allocated_bytes)
+          VALUES ('root', 'file', 'file', '1', '80', 10);
+        INSERT INTO hardlink_groups (device, inode, owner_path_key, node_id, allocated_bytes)
+          VALUES ('1', '80', 'file', 'root', 10);
+        COMMIT;
+      `)
+    } finally { invalid.close() }
+    const before = readConstructionSnapshot(path)
+    const resumed = ConstructionDatabase.openResumable(path)
+    try {
+      expect(() => resumed.recoverIncompleteDirectories()).toThrow(ConstructionError)
+      try { resumed.recoverIncompleteDirectories() } catch (error) {
+        expect(error).toMatchObject({ code: 'invalid-resume' })
+      }
+    } finally { resumed.abort() }
+    expect(readConstructionSnapshot(path)).toEqual(before)
   })
 
   it('counts durable checkpoints without treating terminal commit as another checkpoint', async () => {
@@ -219,6 +470,7 @@ describe('ConstructionDatabase construction lifecycle', () => {
     await expect(lstat(join(indexes, `${descriptor.candidateFile}.staging-0123456789abcdef`))).rejects.toMatchObject({ code: 'ENOENT' })
 
     const resumed = ConstructionDatabase.openResumable(partialPath, { candidatePath })
+    expect(resumed.recoverIncompleteDirectories()).toEqual({ roots: 0, deletedNodes: 0, affectedHardlinkIdentities: 0, repairedAncestors: 0, repairedSchedulerRows: 0 })
     const retry = resumed.finish({ kind: 'finalize' })
     expect(retry).toMatchObject({ kind: 'candidate', candidatePath })
   })

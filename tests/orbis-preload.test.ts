@@ -29,4 +29,24 @@ describe('Orbis preload bridge', () => {
     unsubscribe()
     expect(renderer.removeListener).toHaveBeenCalledOnce()
   })
+
+  it('accepts resuming progress and rejects unknown stages', () => {
+    const listeners = new Map<string, (event: unknown, ...args: unknown[]) => void>()
+    const renderer: IpcRendererLike = {
+      invoke: vi.fn(async () => undefined),
+      on: vi.fn((channel, listener) => { listeners.set(channel, listener) }),
+      removeListener: vi.fn()
+    }
+    const listener = vi.fn()
+    createOrbisBridge(renderer).subscribe(listener)
+    const snapshot = {
+      version: 3, committed: false, target: { name: 'root', isStartup: false }, focus: null, breadcrumbs: [], chart: [], largestItems: [],
+      volume: { capacityBytes: 100, freeBytes: 50, scannedBytes: 20, unscannedBytes: 30, sizeAccuracy: 'partial' },
+      scan: { status: 'scanning', generation: 2, progress: { stage: 'resuming', scannedItems: 4, discoveredBytes: 20, elapsedMs: 5, currentItem: 'Validating saved scan' }, totals: null, error: null }
+    }
+    listeners.get('orbis:snapshot')?.({}, snapshot)
+    listeners.get('orbis:snapshot')?.({}, { ...snapshot, scan: { ...snapshot.scan, progress: { ...snapshot.scan.progress, stage: 'waiting' } } })
+    expect(listener).toHaveBeenCalledOnce()
+    expect(listener).toHaveBeenCalledWith(snapshot)
+  })
 })

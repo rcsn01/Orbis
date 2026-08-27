@@ -2,7 +2,10 @@ import { parentPort, workerData } from "node:worker_threads"
 import { ProgressiveScanControl, ScanCanceledError, type ScanProgress, type ScanResult } from "./scanner"
 import { refreshPersistentIndex } from './refresh-engine'
 import type { JournalCursor } from './index-manifest'
-import { emptyScanCounters, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent, type ScanCounterRecord } from "./diagnostics"
+import {
+  emptyScanCounters, subscribeResumeReceiptFallbacks, subscribeScanCounters, subscribeScanDiagnostics,
+  type OrbisTimingEvent, type ResumePreparationPhase, type ResumeReceiptFallbackReason, type ScanCounterRecord
+} from "./diagnostics"
 import type { WorkerMessage, WorkerStartMessage } from './scan-execution-protocol'
 
 if (!parentPort) throw new Error("Orbis scan worker requires a parent port")
@@ -50,16 +53,29 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
   const unsubscribeCounters = counters ? subscribeScanCounters((event) => {
     if (event.generation === message.generation) counters[event.counter] += event.value
   }) : undefined
+  const receiptFallbackReasons: ResumeReceiptFallbackReason[] = []
+  const unsubscribeReceiptFallbacks = timings ? subscribeResumeReceiptFallbacks((event) => {
+    if (event.generation === message.generation) receiptFallbackReasons.push(event.reason)
+  }) : undefined
   let firstMetadataPage = false
   let firstMetadataPreview = false
   let acceptedPages = 0
   const postResumeMilestone = (milestone: 'preparation-started' | 'first-metadata-page' | 'first-metadata-preview'): void => {
     if (active === run) port.postMessage({ type: 'resume-milestone', generation: message.generation, requestId: run.lastRequestId, milestone })
   }
+  const postResumePreparation = async (phase: ResumePreparationPhase): Promise<void> => {
+    if (active !== run || !message.resumeExpected) return
+    port.postMessage({ type: 'resume-preparation', generation: message.generation, requestId: run.lastRequestId, phase })
+    if (phase === 'validating') {
+      const delayMs = resumeValidationDelayMs()
+      if (delayMs > 0) await delay(delayMs)
+    }
+  }
   try {
     const outcome = await refreshPersistentIndex({
       generation: message.generation, target: message.target, partialPath: message.partialPath, publishedPath: message.publishedPath,
       indexDirectory: message.indexDirectory, startupRoot: message.startupRoot, resumeExpected: message.resumeExpected,
+      ...(message.resumeReceipt ? { resumeReceipt: message.resumeReceipt } : {}),
       ...(message.initialEstimate ? { initialEstimate: message.initialEstimate } : {}),
       ...(message.active ? { active: message.active } : {}),
       signal: run.abort.signal, control: run.control,
@@ -69,6 +85,7 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
         if (milestone === 'first-metadata-page') firstMetadataPage = true
         postResumeMilestone(milestone)
       },
+      onResumePreparation: postResumePreparation,
       ...(benchmarkPageSignals() ? { onMetadataPageAccepted: () => {
         acceptedPages += 1
         if (active === run) port.postMessage({ type: 'benchmark-page', generation: message.generation, requestId: run.lastRequestId, page: acceptedPages })
@@ -84,7 +101,7 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
       }
     })
     if (active !== run) return
-    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters)
+    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters, receiptFallbackReasons)
     if (outcome.kind === 'unchanged') {
       port.postMessage({ type: 'unchanged', generation: message.generation, requestId: run.lastRequestId, journal: outcome.journal, totals: outcome.totals, basePublicationId: outcome.basePublicationId })
     } else {
@@ -95,7 +112,7 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
     }
   } catch (error) {
     if (active !== run) return
-    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters)
+    postDiagnostics(message.generation, run.lastRequestId, run.checkpointCount, timings, counters, receiptFallbackReasons)
     if (error instanceof ScanCanceledError || run.abort.signal.aborted) {
       if (run.pauseRequestId !== undefined) port.postMessage({ type: 'paused', generation: message.generation, requestId: run.pauseRequestId, checkpointSequence: run.checkpointSequence })
       else port.postMessage({ type: "canceled", generation: message.generation, requestId: run.lastRequestId })
@@ -104,17 +121,30 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
   } finally {
     unsubscribeTiming?.()
     unsubscribeCounters?.()
+    unsubscribeReceiptFallbacks?.()
     if (active === run) { active = undefined; port.close() }
   }
 }
 
-function postDiagnostics(generation: number, requestId: number, checkpointCount: number, timings: readonly OrbisTimingEvent[] | undefined, counters?: ScanCounterRecord): void {
-  if (timings && counters) port.postMessage({ type: "diagnostics", generation, requestId, timings, checkpointCount, counters })
+function postDiagnostics(
+  generation: number, requestId: number, checkpointCount: number, timings: readonly OrbisTimingEvent[] | undefined,
+  counters: ScanCounterRecord | undefined, receiptFallbackReasons: readonly ResumeReceiptFallbackReason[]
+): void {
+  if (timings && counters) port.postMessage({
+    type: "diagnostics", generation, requestId, timings, checkpointCount, counters,
+    ...(receiptFallbackReasons.length > 0 ? { resumeReceiptFallbackReasons: [...receiptFallbackReasons] } : {})
+  })
 }
 function nativeAddonPath(): { readonly nativeAddonPath?: string } {
   const value = workerData && typeof workerData === "object" && "nativeAddonPath" in workerData ? (workerData as { nativeAddonPath?: unknown }).nativeAddonPath : undefined
   return typeof value === "string" && value.length > 0 ? { nativeAddonPath: value } : {}
 }
+function resumeValidationDelayMs(): number {
+  if (!workerData || typeof workerData !== 'object' || !('resumeValidationDelayMs' in workerData)) return 0
+  const value = (workerData as { resumeValidationDelayMs?: unknown }).resumeValidationDelayMs
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)) }
 function referenceScan(): { readonly referenceScan?: true } { return isReferenceScan() ? { referenceScan: true } : {} }
 function benchmarkPageSignals(): boolean {
   return Boolean(workerData && typeof workerData === 'object' && 'benchmarkPageSignals' in workerData && (workerData as { benchmarkPageSignals?: unknown }).benchmarkPageSignals === true)

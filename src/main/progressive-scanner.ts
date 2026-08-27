@@ -4,9 +4,10 @@ import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from
 import type { Breadcrumb, ChartSegment, NodeSummary, VolumeSnapshot } from "../shared/contracts"
 import { buildChart } from "./chart"
 import { prepareDatabaseDirectory, removeDatabaseFiles } from "./database"
-import { createScanTimingAccumulator, measureScan, measureScanAsync, publishScanWork, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone, type ScanTimingAccumulator } from "./diagnostics"
+import { createScanTimingAccumulator, measureScan, measureScanAsync, publishScanWork, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone, type ResumePreparationPhase, type ScanTimingAccumulator } from "./diagnostics"
 import {
   ConstructionDatabase,
+  ConstructionError,
   type ConstructionCheckpointRequest,
   type ConstructionInput,
   type ConstructionPage,
@@ -62,6 +63,7 @@ export interface ProgressiveScanOptions extends ScanOptions {
   readonly nativeAddonPath?: string
   readonly onCheckpoint?: (sequence: number) => void
   readonly onResumeMilestone?: (milestone: ResumeMilestone) => void
+  readonly onResumePreparation?: (phase: ResumePreparationPhase) => void | Promise<void>
   readonly onMetadataPageAccepted?: () => void
   readonly drainResumeJournal?: (eventId: string) => { readonly throughEventId: string; readonly scopes: readonly string[]; readonly restartReason?: string }
   /** Internal traversal tuning. The benchmark worker uses ORBIS_METADATA_BATCH_SIZE instead. */
@@ -107,7 +109,7 @@ const MAX_OPEN_HANDLES = 8
 const PREVIEW_INTERVAL_MS = 100
 
 const nativeFileSystem: ScanFileSystem & { opendir(path: string): Promise<NodeDirectoryHandle> } = {
-  lstat: async (path) => lstat(path),
+  lstat: async (path) => lstat(path, { bigint: true }),
   readdir: async () => { throw new Error("Progressive scans use opendir") },
   statfs: async (path) => statfs(path),
   realpath: async (path) => realpath(path),
@@ -170,6 +172,13 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       throwIfCanceled(options.signal)
       if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) throw new Error("Scan target must be a directory")
       const volume = await fileSystem.statfs(target)
+      if (options.resumable?.resume) {
+        const descriptor = options.resumable.descriptor
+        if (target !== descriptor.target || indexIdentity !== descriptor.indexDirectoryIdentity
+          || part(rootStats.dev) !== descriptor.targetDevice || part(rootStats.ino) !== descriptor.targetInode) {
+          throw new Error('resume-invalidated:resume-identity-mismatch')
+        }
+      }
       if (!options.resumable?.resume) await removeDatabaseFiles(options.partialPath)
       return {
         indexRoot, indexIdentity, target, rootStats, rootDevice: part(rootStats.dev),
@@ -194,21 +203,32 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   let resumeJournal: { readonly drainedThrough: string; readonly dirtyScopes: readonly string[] } | undefined
   try {
     if (options.resumable?.resume) {
+      await options.onResumePreparation?.('recovering')
       database = measureScan('resume-database-open', () => ConstructionDatabase.openResumable(options.partialPath, {
         candidatePath: options.publishedPath, onCheckpoint: (_reason, sequence) => options.onCheckpoint?.(sequence)
       }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
-      const recovered = measureScan('resume-incomplete-recovery', () => database!.recoverIncompleteDirectories())
-      recordScanCounter('resumeRecoveryRoots', recovered.reset)
+      let recovered: ReturnType<ConstructionDatabase['recoverIncompleteDirectories']>
+      try {
+        recovered = measureScan('resume-incomplete-recovery', () => database!.recoverIncompleteDirectories())
+      } catch (error) {
+        if (error instanceof ConstructionError && error.code === 'invalid-resume') {
+          throw new Error('resume-invalidated:invalid-construction-state', { cause: error })
+        }
+        throw error
+      }
+      recordScanCounter('resumeRecoveryRoots', recovered.roots)
       recordScanCounter('resumeDeletedNodes', recovered.deletedNodes)
       recordScanCounter('resumeAffectedHardlinkIdentities', recovered.affectedHardlinkIdentities)
       recordScanCounter('resumeRepairedAncestors', recovered.repairedAncestors)
       recordScanCounter('resumeRepairedSchedulerRows', recovered.repairedSchedulerRows)
+      await options.onResumePreparation?.('repairing')
       const persisted = measureScan('resume-semantic-totals', () => database!.semanticTotals())
       Object.assign(totals, persisted)
       activeElapsedBefore = persisted.activeElapsedMs
       measureScan('resume-checkpoint', () => database!.checkpoint({ reason: 'resume' }))
+      await options.onResumePreparation?.('starting')
     } else if (options.resumable) {
       const descriptor = options.resumable.descriptor
       database = measureScan('database-create', () => ConstructionDatabase.create(options.partialPath, {

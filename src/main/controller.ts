@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises'
 import { basename, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
-import type { OrbisSnapshot, SizeAccuracy } from '../shared/contracts'
+import type { OrbisSnapshot, ProgressSnapshot, SizeAccuracy } from '../shared/contracts'
 import { buildChart } from './chart'
 import { readConstructionPreview, resolveConstructionNodePath, type ConstructionResumeLoad } from './construction-preview'
-import { createControllerTimingMilestones, measureController, measureControllerAsync, type ControllerTimingMilestones } from './diagnostics'
-import { FullScanResumeStore, type FullScanResumeLoad } from './full-scan-resume'
+import { createControllerTimingMilestones, measureController, measureControllerAsync, RESUME_PREPARATION_MESSAGES, type ControllerTimingMilestones } from './diagnostics'
+import { FullScanResumeStore, type FullScanResumeLoad, type ResumeValidationReceipt } from './full-scan-resume'
 import { DiskIndex, toSummary } from './index-store'
 import {
   EXCLUSION_POLICY_VERSION, HARD_LINK_ORDERING_VERSION, IndexManifestStore, PERSISTENT_ACCOUNTING_VERSION,
@@ -35,8 +35,11 @@ interface ScanRun {
   readonly target: string
   readonly partialPath: string
   readonly publishedPath: string
-  readonly session: ScanSession
+  readonly sessionPromise: Promise<ScanSession>
   readonly resumeMilestones?: ControllerTimingMilestones
+  readonly durablePreview?: ProgressivePreview
+  readonly durableConstruction?: ConstructionResumeLoad
+  session?: ScanSession
   completed: boolean
   published: boolean
 }
@@ -72,6 +75,8 @@ export class OrbisController {
   #scanStatus: OrbisSnapshot['scan'] = { status: 'idle', generation: 0, progress: null, totals: null, error: null }
   #resume: { readonly available: boolean; readonly checkpointedAt: string } | undefined
   #savedConstruction: ConstructionResumeLoad | undefined
+  #resumeReceipt: ResumeValidationReceipt | undefined
+  #pausedProgress: ProgressSnapshot | undefined
   #listeners = new Set<(snapshot: OrbisSnapshot) => void>()
   #pendingTasks = new Set<Promise<void>>()
   #startQueue: Promise<void> = Promise.resolve()
@@ -156,13 +161,15 @@ export class OrbisController {
       return this.snapshot()
     }
     this.#run = undefined
+    if (this.#scanStatus.progress && this.#scanStatus.progress.stage !== 'resuming') this.#pausedProgress = this.#scanStatus.progress
     this.#preview = undefined
     this.#savedConstruction = undefined
     this.#rejectPendingReveals('Scan paused')
-    await this.#stopRun(run)
+    const stopped = await this.#stopRun(run)
     if (this.#closed || this.#generation !== run.generation || this.#run) return this.snapshot()
-    const saved = await this.#resumeStore.load(run.target)
+    const saved = await this.#loadResumeAfterStop(run.target, stopped)
     if (this.#closed || this.#generation !== run.generation || this.#run) return this.snapshot()
+    this.#rememberResumeLoad(saved)
     this.#resume = saved.kind === 'construction' || saved.kind === 'candidate'
       ? { available: true, checkpointedAt: saved.kind === 'construction' ? saved.checkpointedAt : saved.descriptor.createdAt }
       : undefined
@@ -181,6 +188,7 @@ export class OrbisController {
     }
     this.#preview = undefined
     this.#savedConstruction = undefined
+    this.#resumeReceipt = undefined
     this.#rejectPendingReveals('Saved scan discarded')
     await this.#resumeStore.discard()
     this.#resume = undefined
@@ -196,7 +204,10 @@ export class OrbisController {
       if (!node) throw new Error('Unknown Orbis node')
       if (node.kind !== 'directory') throw new Error('Only directories can become the chart root')
       this.#rejectPendingReveals('The focused folder changed before the item could be revealed')
-      void run.session.focus(id)
+      const session = await run.sessionPromise
+      if (this.#run !== run || run.completed) return this.snapshot()
+      run.session = session
+      void session.focus(id)
       return this.snapshot()
     }
     const saved = this.#savedConstruction
@@ -271,6 +282,7 @@ export class OrbisController {
     this.#active = undefined
     this.#preview = undefined
     this.#savedConstruction = undefined
+    this.#resumeReceipt = undefined
     this.#rejectPendingReveals('Orbis is shutting down')
     this.#focusId = undefined
     // Preserve both possible publications if the manifest-directory sync failed.
@@ -285,14 +297,17 @@ export class OrbisController {
     const manifest = await this.#manifestStore.load()
     this.#activeManifest = manifest
     let saved = await this.#resumeStore.load()
+    this.#rememberResumeLoad(saved)
     if (process.env.ORBIS_DISABLE_INCREMENTAL_SCAN === '1' && saved.kind !== 'none') {
       if (saved.kind === 'construction' || saved.kind === 'candidate' || saved.descriptor) await this.#resumeStore.discard(saved.descriptor?.scanId)
       else await this.#resumeStore.removeDescriptor()
       saved = { kind: 'none' }
+      this.#resumeReceipt = undefined
     }
     if (manifest && saved.kind === 'candidate' && saved.descriptor.candidateFile === manifest.indexFile) {
       await this.#resumeStore.complete(saved.descriptor.scanId)
       saved = { kind: 'none' }
+      this.#resumeReceipt = undefined
     }
     if (saved.kind === 'construction' || saved.kind === 'candidate') {
       this.#resume = { available: true, checkpointedAt: saved.kind === 'construction' ? saved.checkpointedAt : saved.descriptor.createdAt }
@@ -331,8 +346,16 @@ export class OrbisController {
     void task.finally(() => this.#pendingTasks.delete(task)).catch(() => undefined)
   }
 
-  async #stopRun(run: ScanRun): Promise<void> {
-    await run.session.pause()
+  async #stopRun(run: ScanRun): Promise<ScanOutcome> {
+    try {
+      const session = await run.sessionPromise
+      run.session = session
+      return await session.pause()
+    } catch (error) {
+      // A failed or timed-out stop has no clean-pause proof. The caller must
+      // use the authoritative loader instead.
+      return { kind: 'failed', error: error instanceof Error ? error : new Error(String(error)) }
+    }
   }
 
   async #removeRunFiles(run: ScanRun): Promise<void> {
@@ -361,9 +384,12 @@ export class OrbisController {
     const previous = this.#run
     if (previous?.completed) await Promise.allSettled([...this.#pendingTasks])
     const current = this.#run
+    let stoppedSaved: FullScanResumeLoad | undefined
     if (current) {
       this.#run = undefined
-      await this.#stopRun(current)
+      const stopped = await this.#stopRun(current)
+      stoppedSaved = await this.#loadResumeAfterStop(current.target, stopped)
+      this.#rememberResumeLoad(stoppedSaved)
     }
     await mkdir(this.indexDirectory, { recursive: true, mode: 0o700 })
     if (this.#closed) throw new Error('Orbis is shutting down')
@@ -371,11 +397,12 @@ export class OrbisController {
     // Peek at the saved scan (descriptor + file existence) instead of fully
     // validating it: the worker performs the authoritative validation before
     // resuming, and full validation is O(index size) on large saved scans.
-    let saved = await this.#resumeStore.peek()
+    let saved = stoppedSaved ?? await this.#resumeStore.peek()
     if (process.env.ORBIS_DISABLE_INCREMENTAL_SCAN === '1' && saved.kind !== 'none') {
       if (saved.kind === 'construction' || saved.kind === 'candidate' || saved.descriptor) await this.#resumeStore.discard(saved.descriptor?.scanId)
       else await this.#resumeStore.removeDescriptor()
       saved = { kind: 'none' }
+      this.#resumeReceipt = undefined
     }
     const savedDescriptor = saved.kind === 'construction' || saved.kind === 'candidate' || saved.kind === 'restart' ? saved.descriptor : undefined
     if (savedDescriptor && savedDescriptor.target !== target) throw new Error('Discard the saved scan before choosing another folder')
@@ -386,52 +413,86 @@ export class OrbisController {
       await this.#artifacts.discardUnreferencedDatabase(publishedPath)
     }
     const initialEstimate = this.#active?.target === target ? estimateFromIndex(this.#active) : await this.#estimateCache.load(target)
-    this.#preview = undefined
-    this.#savedConstruction = undefined
-    this.#rejectPendingReveals('A newer scan started')
     const active = this.#active?.target === target && this.#activeManifest
       ? { manifest: this.#activeManifest, path: this.#active.path }
       : undefined
     const resumeExpected = saved.kind === 'construction' || saved.kind === 'candidate'
-    const session = await this.scanExecution.start({
+    const durablePreview = resumeExpected ? this.#preview : undefined
+    const durableConstruction = resumeExpected ? this.#savedConstruction : undefined
+    if (durablePreview) this.#preview = { ...durablePreview, generation }
+    else if (!resumeExpected) this.#preview = undefined
+    if (!resumeExpected) {
+      this.#savedConstruction = undefined
+      this.#resumeReceipt = undefined
+      this.#pausedProgress = undefined
+    }
+    const resumeReceipt = resumeExpected ? this.#resumeReceipt : undefined
+    // A receipt is single-use: once worker startup is scheduled it may not be
+    // reused by a later generation or a second worker.
+    this.#resumeReceipt = undefined
+    this.#rejectPendingReveals('A newer scan started')
+    const sessionPromise = Promise.resolve().then(() => this.scanExecution.start({
       target, partialPath, publishedPath, indexDirectory: this.indexDirectory, startupRoot: target === '/', resumeExpected,
+      ...(resumeReceipt ? { resumeReceipt } : {}),
       ...(initialEstimate ? { initialEstimate } : {}), ...(active ? { active } : {})
-    })
-    if (resumeExpected) resumeMilestones.mark(generation, 'resume-click-to-session')
+    }))
     const run: ScanRun = {
-      generation, publicationId, target, partialPath, publishedPath, session,
-      ...(resumeExpected ? { resumeMilestones } : {}), completed: false, published: false
+      generation, publicationId, target, partialPath, publishedPath, sessionPromise,
+      ...(resumeExpected ? { resumeMilestones } : {}),
+      ...(durablePreview ? { durablePreview: { ...durablePreview, generation } } : {}),
+      ...(durableConstruction ? { durableConstruction } : {}),
+      completed: false, published: false
     }
     this.#run = run
     this.#target = target
     this.#resume = undefined
-    this.#scanStatus = { status: 'scanning', generation, progress: null, totals: null, error: null }
+    const retained = this.#pausedProgress
+    const progress: ProgressSnapshot | null = resumeExpected ? {
+      stage: 'resuming', scannedItems: retained?.scannedItems ?? 0,
+      discoveredBytes: retained?.discoveredBytes ?? durablePreview?.volume.scannedBytes ?? 0,
+      elapsedMs: retained?.elapsedMs ?? 0, currentItem: RESUME_PREPARATION_MESSAGES.validating
+    } : null
+    this.#scanStatus = { status: 'scanning', generation, progress, totals: null, error: null }
     this.#startTask(this.#consumeRun(run))
     this.#emit()
     return this.snapshot()
   }
 
   async #consumeRun(run: ScanRun): Promise<void> {
-    for await (const update of run.session.events) {
+    let session: ScanSession
+    try {
+      session = await run.sessionPromise
+      run.session = session
+      run.resumeMilestones?.mark(run.generation, 'resume-click-to-session')
+    } catch (error) {
+      if (this.#run === run && !this.#closed) await this.#handleRunOutcome(run, { kind: 'failed', error: error instanceof Error ? error : new Error(String(error)) })
+      return
+    }
+    if (this.#run !== run || this.#closed || run.completed) {
+      await session.pause()
+      return
+    }
+    for await (const update of session.events) {
       if (this.#run !== run || this.#closed || run.completed) continue
       if (update.type === 'resume-milestone') {
         if (update.milestone === 'preparation-started') run.resumeMilestones?.mark(run.generation, 'resume-click-to-preparation')
-        else if (update.milestone === 'first-metadata-page') {
-          run.resumeMilestones?.mark(run.generation, 'resume-click-to-first-metadata-page')
-        } else if (update.milestone === 'first-metadata-preview') {
-          run.resumeMilestones?.mark(run.generation, 'resume-click-to-first-metadata-preview')
-        }
+        else if (update.milestone === 'first-metadata-page') run.resumeMilestones?.mark(run.generation, 'resume-click-to-first-metadata-page')
+        else if (update.milestone === 'first-metadata-preview') run.resumeMilestones?.mark(run.generation, 'resume-click-to-first-metadata-preview')
         continue
       }
-      if (update.type === 'progress') {
+      if (update.type === 'resume-preparation') {
+        const progress = this.#scanStatus.progress
+        if (progress?.stage !== 'resuming') continue
+        this.#scanStatus = { ...this.#scanStatus, progress: { ...progress, currentItem: RESUME_PREPARATION_MESSAGES[update.phase] } }
+      } else if (update.type === 'progress') {
         run.resumeMilestones?.mark(run.generation, 'resume-click-to-first-progress')
         this.#scanStatus = { status: 'scanning', generation: run.generation, progress: update.progress, totals: null, error: null }
-      } else {
-        if (!this.#preview || update.preview.revision >= this.#preview.revision) this.#preview = update.preview
+      } else if (update.preview.generation === run.generation && (!this.#preview || update.preview.revision >= this.#preview.revision)) {
+        this.#preview = update.preview
       }
       this.#emit()
     }
-    const outcome = await run.session.result
+    const outcome = await session.result
     if (this.#run !== run || this.#closed) {
       if (outcome.kind === 'completed' && !run.published) await this.#removeStaleCandidate(outcome.result.publishedPath)
       return
@@ -452,7 +513,7 @@ export class OrbisController {
       this.#savedConstruction = undefined
       this.#rejectPendingReveals('Scan paused')
       this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
-      await this.#refreshResumeState(run.generation, true)
+      await this.#refreshResumeState(run.generation, true, { target: run.target, outcome })
       this.#emit()
     } else {
       this.#fail(run, outcome.error.message)
@@ -488,6 +549,7 @@ export class OrbisController {
           await this.#resumeStore.complete(run.publicationId).catch(() => false)
           this.#resume = undefined
           this.#savedConstruction = undefined
+          this.#resumeReceipt = undefined
         }
         if (this.#run !== run) {
           try { next.close() } catch { /* A newer run owns controller state. */ }
@@ -499,6 +561,7 @@ export class OrbisController {
         if (manifest) this.#activeManifest = manifest
         this.#preview = undefined
         this.#savedConstruction = undefined
+        this.#resumeReceipt = undefined
         this.#rejectPendingReveals('Scan completed')
         this.#focusId = restoreFocus(next, old, oldFocusId)
         this.#target = next.target
@@ -548,6 +611,7 @@ export class OrbisController {
       this.#activeManifest = nextManifest
       this.#preview = undefined
       this.#savedConstruction = undefined
+      this.#resumeReceipt = undefined
       this.#resume = undefined
       this.#scanStatus = { status: 'completed', generation: run.generation, progress: null, totals, error: null }
       this.#run = undefined
@@ -562,29 +626,50 @@ export class OrbisController {
     await this.#artifacts.discardUnreferencedDatabase(path, { retain: this.#activeManifest ? [this.#activeManifest.indexFile] : [] })
   }
 
-  async #refreshResumeState(generation: number, restorePreview = false): Promise<void> {
-    const saved = await this.#resumeStore.load(this.#target)
+  async #refreshResumeState(
+    generation: number, restorePreview = false,
+    stopped?: { readonly target: string; readonly outcome: ScanOutcome }
+  ): Promise<void> {
+    const saved = stopped ? await this.#loadResumeAfterStop(stopped.target, stopped.outcome) : await this.#resumeStore.load(this.#target)
     if (this.#closed || this.#generation !== generation || this.#run) return
+    this.#rememberResumeLoad(saved)
     this.#resume = saved.kind === 'construction' || saved.kind === 'candidate'
       ? { available: true, checkpointedAt: saved.kind === 'construction' ? saved.checkpointedAt : saved.descriptor.createdAt }
       : undefined
     this.#savedConstruction = undefined
-    if (restorePreview) await this.#restoreConstructionPreview(saved, generation)
+    if (restorePreview && saved.kind === 'construction' && saved.descriptor.target === this.#target) {
+      const restored = await this.#restoreConstructionPreview(saved, generation)
+      if (!restored && !this.#closed && this.#generation === generation && !this.#run) this.#preview = undefined
+    } else if (restorePreview) this.#preview = undefined
   }
 
-  async #restoreConstructionPreview(saved: FullScanResumeLoad, generation: number): Promise<void> {
-    if (saved.kind !== 'construction' || saved.descriptor.target !== this.#target) return
-    const preview = await readConstructionPreview(saved, generation)
-    if (!preview || this.#closed || this.#generation !== generation || this.#run || saved.descriptor.target !== this.#target) return
+  async #restoreConstructionPreview(saved: FullScanResumeLoad, generation: number): Promise<boolean> {
+    if (saved.kind !== 'construction' || saved.descriptor.target !== this.#target) return false
+    const retainedFocusId = this.#preview?.focus.id
+    const preview = await readConstructionPreview(saved, generation, retainedFocusId)
+      ?? (retainedFocusId ? await readConstructionPreview(saved, generation) : undefined)
+    if (!preview || this.#closed || this.#generation !== generation || this.#run || saved.descriptor.target !== this.#target) return false
     this.#savedConstruction = saved
     this.#preview = preview
+    return true
+  }
+
+  #rememberResumeLoad(saved: FullScanResumeLoad): void {
+    this.#resumeReceipt = saved.kind === 'construction' || saved.kind === 'candidate' ? saved.receipt : undefined
+  }
+
+  async #loadResumeAfterStop(target: string, outcome: ScanOutcome): Promise<FullScanResumeLoad> {
+    if (outcome.kind === 'paused' && outcome.acknowledged && outcome.checkpointSequence !== undefined) {
+      return this.#resumeStore.loadAcknowledgedCheckpoint(target, outcome.checkpointSequence)
+    }
+    return this.#resumeStore.load(target)
   }
 
   #fail(run: ScanRun, error: string): void {
     if (this.#run !== run) return
     this.#run = undefined
-    this.#preview = undefined
-    this.#savedConstruction = undefined
+    this.#preview = run.durablePreview
+    this.#savedConstruction = run.durableConstruction
     this.#rejectPendingReveals('Scan failed')
     this.#scanStatus = { status: 'fatal-error', generation: run.generation, progress: null, totals: null, error }
     this.#startTask(this.#stopRun(run).then(async () => {
@@ -600,7 +685,12 @@ export class OrbisController {
     let rejectCancellation!: (error: Error) => void
     const canceled = new Promise<never>((_resolve, reject) => { rejectCancellation = reject })
     this.#pendingRevealCancellations.add(rejectCancellation)
-    try { return await Promise.race([run.session.resolveNode(id), canceled]) }
+    try {
+      const session = await run.sessionPromise
+      if (this.#run !== run || run.completed) throw new Error('The scan changed before the item could be revealed')
+      run.session = session
+      return await Promise.race([session.resolveNode(id), canceled])
+    }
     finally { this.#pendingRevealCancellations.delete(rejectCancellation) }
   }
 

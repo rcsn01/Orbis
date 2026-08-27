@@ -8,7 +8,10 @@ import { FullScanResumeStore } from '../src/main/full-scan-resume'
 import { IndexManifestStore } from '../src/main/index-manifest'
 import { ProgressiveScanControl, ScanCanceledError, scanFilesystem } from '../src/main/scanner'
 import { ConstructionDatabase } from '../src/main/construction-database'
-import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
+import {
+  emptyScanCounters, runWithScanDiagnostics, subscribeResumeReceiptFallbacks, subscribeScanCounters, subscribeScanDiagnostics,
+  type OrbisTimingEvent
+} from '../src/main/diagnostics'
 import type { DirectoryMetadataEntry, DirectoryMetadataSource } from '../src/main/scan-metadata'
 
 const cleanup: string[] = []
@@ -54,6 +57,69 @@ describe('resumable Orbis full scans', () => {
     try { loaded = await runWithScanDiagnostics(20, () => store.load(target)) }
     finally { unsubscribeLoadTimings(); unsubscribeLoadCounters() }
     expect(loaded).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+    if (loaded.kind !== 'construction') throw new Error('Expected a construction receipt')
+
+    const receiptEvents: OrbisTimingEvent[] = []
+    const receiptCounters = emptyScanCounters()
+    const unsubscribeReceiptTimings = subscribeScanDiagnostics((event) => { if (event.generation === 21) receiptEvents.push(event) })
+    const unsubscribeReceiptCounters = subscribeScanCounters((event) => { if (event.generation === 21) receiptCounters[event.counter] += event.value })
+    try {
+      const reused = await runWithScanDiagnostics(21, () => store.load(target, loaded.receipt))
+      expect(reused).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+    } finally { unsubscribeReceiptTimings(); unsubscribeReceiptCounters() }
+    expect(receiptCounters.resumeReceiptValidations).toBe(1)
+    expect(receiptCounters.resumeFullValidations).toBe(0)
+    expect(receiptEvents.find((event) => event.phase === 'resume-integrity-check')?.durationMs).toBe(0)
+    expect(receiptEvents.find((event) => event.phase === 'resume-foreign-key-check')?.durationMs).toBe(0)
+
+    const fallbackReasons: string[] = []
+    const fallbackCounters = emptyScanCounters()
+    const unsubscribeFallbacks = subscribeResumeReceiptFallbacks((event) => fallbackReasons.push(event.reason))
+    const unsubscribeFallbackCounters = subscribeScanCounters((event) => fallbackCounters[event.counter] += event.value)
+    let currentReceipt = loaded.receipt
+    try {
+      const mismatches = [
+        (receipt: typeof currentReceipt) => ({ ...receipt, descriptorDigest: '0'.repeat(64) }),
+        (receipt: typeof currentReceipt) => ({ ...receipt, database: { ...receipt.database, size: receipt.database.size + 1 } }),
+        (receipt: typeof currentReceipt) => ({ ...receipt, database: {
+          ...receipt.database,
+          wal: { device: '0', inode: '0', size: 0, modifiedNs: '0', changedNs: '0' },
+          shm: { device: '0', inode: '0', size: 0, modifiedNs: '0', changedNs: '0' }
+        } }),
+        (receipt: typeof currentReceipt) => ({ ...receipt, drainedThrough: receipt.drainedThrough === '0' ? '1' : '0' }),
+        (receipt: typeof currentReceipt) => ({ ...receipt, checkpointSequence: receipt.checkpointSequence! + 1 })
+      ]
+      for (const [index, mismatch] of mismatches.entries()) {
+        const fallback = await runWithScanDiagnostics(22 + index, () => store.load(target, mismatch(currentReceipt)))
+        expect(fallback).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+        if (fallback.kind !== 'construction') throw new Error('Expected a construction fallback')
+        currentReceipt = fallback.receipt
+      }
+      const sidecarRaceStore = new FullScanResumeStore(indexes, {
+        onReceiptValidationStep: async (step) => {
+          if (step === 'post-query') {
+            await writeFile(`${partialPath}-wal`, Buffer.alloc(0))
+            await writeFile(`${partialPath}-shm`, Buffer.alloc(0))
+          }
+        }
+      })
+      const sidecarRaced = await runWithScanDiagnostics(27, () => sidecarRaceStore.load(target, currentReceipt))
+      expect(sidecarRaced).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+      if (sidecarRaced.kind !== 'construction') throw new Error('Expected a sidecar-race fallback')
+      currentReceipt = sidecarRaced.receipt
+      const racedStore = new FullScanResumeStore(indexes, {
+        onReceiptValidationStep: async (step) => {
+          if (step === 'post-query') await writeFile(store.descriptorPath, `${JSON.stringify(descriptor, null, 2)}\n`)
+        }
+      })
+      const raced = await runWithScanDiagnostics(28, () => racedStore.load(target, currentReceipt))
+      expect(raced).toMatchObject({ kind: 'construction', descriptor: { scanId } })
+      await Promise.all([rm(`${partialPath}-wal`, { force: true }), rm(`${partialPath}-shm`, { force: true })])
+    } finally { unsubscribeFallbacks(); unsubscribeFallbackCounters() }
+    expect(fallbackReasons).toEqual(['descriptor-mismatch', 'database-stamp-mismatch', 'sidecar-stamp-mismatch', 'resume-row-mismatch', 'resume-row-mismatch', 'sidecar-stamp-mismatch', 'descriptor-mismatch'])
+    expect(fallbackCounters.resumeReceiptFallbacks).toBe(7)
+    expect(fallbackCounters.resumeFullValidations).toBe(7)
+
     for (const phase of ['resume-load-total', 'resume-descriptor-validation', 'resume-file-validation', 'resume-candidate-validation', 'resume-construction-validation', 'resume-integrity-check', 'resume-foreign-key-check']) {
       expect(loadEvents.filter((event) => event.phase === phase), phase).toHaveLength(1)
     }
@@ -105,8 +171,62 @@ describe('resumable Orbis full scans', () => {
     } finally { candidate.close() }
     expect(await store.load(target)).toMatchObject({ kind: 'candidate', descriptor: { scanId } })
     await rename(candidatePath, partialPath)
+    await Promise.all([writeFile(`${partialPath}-wal`, Buffer.alloc(0)), writeFile(`${partialPath}-shm`, Buffer.alloc(0))])
     expect(await store.load(target)).toMatchObject({ kind: 'candidate', candidatePath })
     await expect(access(candidatePath)).resolves.toBeUndefined()
+    await expect(access(`${partialPath}-wal`)).rejects.toThrow()
+    await expect(access(`${partialPath}-shm`)).rejects.toThrow()
+  })
+
+  it('translates structural construction recovery errors without discarding the checkpoint', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-resume-invalid-construction-'))
+    cleanup.push(directory)
+    const target = join(directory, 'target')
+    const indexes = join(directory, 'indexes')
+    await mkdir(target, { recursive: true })
+    await mkdir(indexes, { recursive: true })
+    const targetStats = await lstat(target)
+    const indexStats = await lstat(indexes)
+    const store = new FullScanResumeStore(indexes)
+    const descriptor = store.descriptor({
+      scanId: '41234567-89ab-4cde-8fab-0123456789ab', target,
+      targetDevice: String(targetStats.dev), targetInode: String(targetStats.ino),
+      indexDirectoryIdentity: `${String(indexStats.dev)}:${String(indexStats.ino)}`, startupRoot: false,
+      checkpoint: { device: String(targetStats.dev), journalUuid: 'invalid-journal', eventId: '0' }
+    })
+    const partialPath = join(indexes, descriptor.partialFile)
+    const candidatePath = join(indexes, descriptor.candidateFile)
+    const database = ConstructionDatabase.create(partialPath, {
+      scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid,
+      journalBaseline: descriptor.journalBaseline
+    })
+    const seed = database.nodeIdSeed
+    const rootId = `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update('root').update('\0').update(target).digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: rootId, parentId: null, name: 'target', path: target, kind: 'directory', ownBytes: 0, device: String(targetStats.dev), inode: String(targetStats.ino) })
+    database.checkpoint({ reason: 'startup' })
+    database.abort()
+    const invalid = new DatabaseSync(partialPath)
+    try {
+      invalid.exec(`
+        PRAGMA foreign_keys=ON;
+        BEGIN;
+        INSERT INTO hardlink_paths (parent_id, name, path_key, device, inode, allocated_bytes)
+          VALUES ('${rootId}', 'file', 'file', '${String(targetStats.dev)}', '80', 10);
+        INSERT INTO hardlink_groups (device, inode, owner_path_key, node_id, allocated_bytes)
+          VALUES ('${String(targetStats.dev)}', '80', 'file', '${rootId}', 10);
+        COMMIT;
+      `)
+    } finally { invalid.close() }
+
+    await expect(scanFilesystem({
+      generation: 2, target, indexDirectory: indexes, partialPath, publishedPath: candidatePath,
+      resumable: { descriptor, store, resume: true }
+    })).rejects.toThrow('resume-invalidated:invalid-construction-state')
+    const checkpoint = new DatabaseSync(partialPath, { readOnly: true })
+    try {
+      expect(checkpoint.prepare('SELECT phase, checkpoint_sequence AS sequence FROM scan_run').get()).toEqual({ phase: 'scanning', sequence: 1 })
+      expect(checkpoint.prepare('SELECT COUNT(*) AS count FROM hardlink_groups').get()).toEqual({ count: 1 })
+    } finally { checkpoint.close() }
   })
 
   it('rolls back an interrupted metadata batch before preserving resumable progress', async () => {

@@ -12,7 +12,7 @@ import { WorkerScanExecution, type WorkerTransport, type WorkerTransportFactory 
 import {
   emptyScanCounters, RESUME_CONTROLLER_PHASES, RESUME_SCAN_MILESTONE_PHASES, RESUME_SCAN_PHASES,
   RESUME_SCAN_WORK_PHASES, SCAN_COUNTER_NAMES, subscribeControllerDiagnostics,
-  type OrbisTimingEvent, type ScanCounterRecord
+  type OrbisTimingEvent, type ResumeReceiptFallbackReason, type ScanCounterRecord
 } from '../src/main/diagnostics'
 import { DEFAULT_METADATA_CONCURRENCY, type ScanResult } from '../src/main/scanner'
 import { createScanFixture, type ScanFixtureManifest, type ScanFixtureName, type ScanFixtureProfile } from './lib/scan-fixtures'
@@ -318,7 +318,7 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
       hardlinkPathRows: persistent.hardlinkPathRows,
       persistentTableBytes: persistent.tableBytes,
       persistentTableBytesByTable: persistent.tableBytesByTable,
-      ...(resumeScenario ? { resume: makeResumeSample(scanTimings, controllerTimings, measuredWorker.counters, resumeCompletionMs) } : {})
+      ...(resumeScenario ? { resume: makeResumeSample(scanTimings, controllerTimings, measuredWorker.counters, resumeCompletionMs, classifyResumeValidation(measuredWorker)) } : {})
     }
   } finally {
     completion.cancel()
@@ -481,6 +481,7 @@ class MeasuredWorker implements WorkerTransport {
   nodeCursorReadPageCalls = 0
   checkpointCount = 0
   counters: ScanCounterRecord = emptyScanCounters()
+  resumeReceiptFallbackReasons: readonly ResumeReceiptFallbackReason[] = []
   #startedAt = 0
   #receivedComplete = false
   #resolveBenchmarkPage: ((page: number) => void) | undefined
@@ -503,6 +504,7 @@ class MeasuredWorker implements WorkerTransport {
         readonly timings?: readonly OrbisTimingEvent[]
         readonly counters?: Partial<ScanCounterRecord>
         readonly checkpointCount?: number
+        readonly resumeReceiptFallbackReasons?: readonly ResumeReceiptFallbackReason[]
         readonly page?: number
         readonly error?: { readonly message?: string }
         readonly result?: ScanResult
@@ -524,6 +526,7 @@ class MeasuredWorker implements WorkerTransport {
         this.nativeCursorReadPageCalls = this.counters.nativePageReads
         this.nodeCursorReadPageCalls = this.counters.nodePageReads
         this.checkpointCount = Number(value.checkpointCount ?? 0)
+        this.resumeReceiptFallbackReasons = value.resumeReceiptFallbackReasons ?? []
         this.diagnosticMessageBeforeComplete = !this.#receivedComplete
         return
       }
@@ -657,7 +660,8 @@ function makeResumeSample(
   scanTimings: Readonly<Record<string, number>>,
   controllerEvents: readonly OrbisTimingEvent[],
   counters: ScanCounterRecord,
-  completionMs: number
+  completionMs: number,
+  validation: ResumeBenchmarkSample['validation']
 ): ResumeBenchmarkSample {
   const controller = timingMap(controllerEvents)
   const required = (phase: typeof RESUME_CONTROLLER_PHASES[number]): number => {
@@ -672,7 +676,7 @@ function makeResumeSample(
   }
   const firstPage = phase('resume-first-metadata-page')
   return {
-    validation: 'full',
+    validation,
     clickToPreparationMs: required('resume-click-to-preparation'),
     clickToFirstProgressMs: required('resume-click-to-first-progress'),
     clickToFirstMetadataPageMs: required('resume-click-to-first-metadata-page'),
@@ -682,6 +686,14 @@ function makeResumeSample(
     phases: Object.fromEntries(RESUME_SCAN_PHASES.map((name) => [name, phase(name)])),
     counters
   }
+}
+
+function classifyResumeValidation(worker: MeasuredWorker): ResumeBenchmarkSample['validation'] {
+  if (worker.counters.resumeReceiptFallbacks > 0 || worker.resumeReceiptFallbackReasons.length > 0) return 'receipt-fallback'
+  if (worker.counters.resumeReceiptValidations > 0 && worker.counters.resumeFullValidations > 0) throw new Error('Resume diagnostics reported both receipt and full validation')
+  if (worker.counters.resumeReceiptValidations > 0) return 'receipt'
+  if (worker.counters.resumeFullValidations > 0) return 'full'
+  throw new Error('Resume diagnostics did not classify validation')
 }
 
 function makeFixtureReport(fixture: string, manifest: FixtureReport['manifest'], samples: readonly SampleReport[]): FixtureReport {
@@ -722,7 +734,7 @@ function validateDiagnostics(worker: MeasuredWorker, controllerEvents: readonly 
   if (isResumeBenchmarkScenario(options.scenario)) {
     validateTimingSet(worker.scanTimings, RESUME_SCAN_PHASES, 'worker')
     validateTimingSet(controllerEvents, RESUME_CONTROLLER_PHASES, 'controller')
-    if (worker.counters.resumeFullValidations < 1) throw new Error('Resume diagnostics did not report a full validation')
+    classifyResumeValidation(worker)
     if (worker.counters.resumeRecoveryRoots < 1) throw new Error('Resume diagnostics did not report a recovery root')
     if (worker.counters.resumeReplayedEntries < 1) throw new Error('Resume diagnostics did not report replayed entries')
     if (!worker.diagnosticMessageBeforeComplete) throw new Error('The worker diagnostics message did not arrive before completion')

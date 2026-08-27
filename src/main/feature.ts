@@ -119,7 +119,16 @@ export class OrbisFeature implements MoirasiaFeature {
 export const feature = new OrbisFeature()
 
 function createWorkerFactory(workerPath: string, nativeAddonPath: string | undefined): WorkerTransportFactory {
-  return { create: () => nativeAddonPath ? new Worker(workerPath, { workerData: { nativeAddonPath } }) : new Worker(workerPath) }
+  const requestedDelay = Number(process.env.ORBIS_E2E_RESUME_VALIDATION_DELAY_MS)
+  const resumeValidationDelayMs = Number.isFinite(requestedDelay) && requestedDelay > 0
+    ? Math.min(30_000, Math.ceil(requestedDelay))
+    : undefined
+  const workerData = {
+    ...(nativeAddonPath ? { nativeAddonPath } : {}),
+    ...(resumeValidationDelayMs ? { resumeValidationDelayMs } : {})
+  }
+  const hasWorkerData = nativeAddonPath !== undefined || resumeValidationDelayMs !== undefined
+  return { create: () => hasWorkerData ? new Worker(workerPath, { workerData }) : new Worker(workerPath) }
 }
 
 function createWindow(ctx: FeatureContext): BrowserWindow {

@@ -34,7 +34,12 @@ describe('Orbis refresh engine', () => {
       publishedPath: join(indexes, `index-${id}.sqlite`), changeJournal: journal
     })
     expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'resume-journal', eventId: '40' } })
-    expect(await new FullScanResumeStore(indexes).load(target)).toMatchObject({ kind: 'candidate', descriptor: { scanId: id } })
+    const store = new FullScanResumeStore(indexes)
+    const loaded = await store.load(target)
+    expect(loaded).toMatchObject({ kind: 'candidate', descriptor: { scanId: id } })
+    if (loaded.kind !== 'candidate') throw new Error('Expected a candidate receipt')
+    const reused = await store.load(target, loaded.receipt)
+    expect(reused).toMatchObject({ kind: 'candidate', descriptor: { scanId: id } })
   })
 
   it('replays again after reconciliation before proposing the publication cursor', async () => {
@@ -344,11 +349,15 @@ describe('Orbis refresh engine', () => {
 
     // Run 2: the scan-start baseline is no longer verifiable (event-limit),
     // but the window since the last drain is. The saved scan must be reused.
+    const preparation: string[] = []
     const journal2: ChangeJournal = {
       captureCheckpoint: () => ({ device: String(stats.dev), journalUuid: 'w-journal', eventId: '10' }),
-      readChanges: (_target, cursor) => cursor.eventId === '10'
+      readChanges: (_target, cursor) => {
+        if (cursor.eventId === '11') preparation.push('journal-read')
+        return cursor.eventId === '10'
         ? { throughEventId: '10', events: [], requiresFullScan: true, reason: 'event-limit' }
         : { throughEventId: '11', events: [], requiresFullScan: false }
+      }
     }
     const resumeEvents: OrbisTimingEvent[] = []
     const unsubscribe = subscribeScanDiagnostics((event) => { if (event.generation === 2) resumeEvents.push(event) })
@@ -356,10 +365,11 @@ describe('Orbis refresh engine', () => {
     try {
       outcome = await refreshPersistentIndex({
         generation: 2, target, indexDirectory: indexes, partialPath, publishedPath, changeJournal: journal2,
-        resumeExpected: true
+        resumeExpected: true, onResumePreparation: (phase) => { preparation.push(phase) }
       })
     } finally { unsubscribe() }
     expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'w-journal', eventId: '11' } })
+    expect(preparation.slice(0, 6)).toEqual(['validating', 'history', 'journal-read', 'recovering', 'repairing', 'starting'])
     for (const phase of ['resume-load-total', 'resume-history-validation', 'resume-database-open', 'resume-incomplete-recovery', 'resume-semantic-totals', 'resume-checkpoint', 'resume-first-metadata-page']) {
       expect(resumeEvents.filter((event) => event.phase === phase), phase).toHaveLength(1)
     }

@@ -5,7 +5,7 @@ import {
 } from "./legacy-scanner"
 import { ProgressiveScanControl, scanFilesystemProgressive, type ProgressivePreview } from "./progressive-scanner"
 import type { DirectoryMetadataSource, FolderSizeEstimate } from "./scan-metadata"
-import type { ResumeMilestone } from './diagnostics'
+import type { ResumeMilestone, ResumePreparationPhase } from './diagnostics'
 import type { FullScanResumeDescriptor, FullScanResumeStore } from './full-scan-resume'
 
 export interface ScanOptions extends LegacyScanOptions {
@@ -19,6 +19,7 @@ export interface ScanOptions extends LegacyScanOptions {
   readonly resumable?: { readonly descriptor: FullScanResumeDescriptor; readonly store: FullScanResumeStore; readonly resume: boolean }
   readonly onCheckpoint?: (sequence: number) => void
   readonly onResumeMilestone?: (milestone: ResumeMilestone) => void
+  readonly onResumePreparation?: (phase: ResumePreparationPhase) => void | Promise<void>
   readonly onMetadataPageAccepted?: () => void
   /** Benchmark-only reference implementation; production callers must omit it. */
   readonly referenceScan?: boolean

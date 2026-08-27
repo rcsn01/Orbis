@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto'
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,7 +8,7 @@ import type {
   FocusOutcome, ResolveNodeOutcome, ScanExecution, ScanExecutionRequest, ScanOutcome, ScanSession, ScanUpdate
 } from "../src/main/scan-execution"
 import { scanFilesystem, type ProgressivePreview, type ScanResult } from "../src/main/scanner"
-import { RESUME_CONTROLLER_PHASES, subscribeControllerDiagnostics, type OrbisTimingEvent } from "../src/main/diagnostics"
+import { RESUME_CONTROLLER_PHASES, RESUME_PREPARATION_MESSAGES, RESUME_PREPARATION_PHASES, subscribeControllerDiagnostics, type OrbisTimingEvent } from "../src/main/diagnostics"
 import { ConstructionDatabase } from '../src/main/construction-database'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
 
@@ -56,6 +57,18 @@ class FakeScanExecution implements ScanExecution {
     return session
   }
   async close(): Promise<void> { if (this.#active && !this.#active.settled) await this.#active.pause() }
+}
+
+class DeferredScanExecution implements ScanExecution {
+  readonly started = testDeferred<void>()
+  readonly session = testDeferred<ScanSession>()
+  request: ScanExecutionRequest | undefined
+  start(request: ScanExecutionRequest): Promise<ScanSession> {
+    this.request = request
+    this.started.resolve()
+    return this.session.promise
+  }
+  async close(): Promise<void> { /* The test resolves the pending session before closing. */ }
 }
 
 class TestAsyncQueue<T> implements AsyncIterable<T>, AsyncIterator<T> {
@@ -400,6 +413,79 @@ describe("OrbisController", () => {
     } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
   })
 
+  it('publishes resume preparation before worker startup resolves and pauses the eventual session', async () => {
+    const target = await makeTarget('deferred-resume')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-deferred-resume-index-'))
+    const targetStats = await lstat(target.target)
+    const indexStats = await lstat(indexDirectory)
+    const store = new FullScanResumeStore(indexDirectory)
+    const descriptor = store.descriptor({
+      scanId: 'd2234567-89ab-4cde-8fab-0123456789ab', target: target.target,
+      targetDevice: String(targetStats.dev), targetInode: String(targetStats.ino),
+      indexDirectoryIdentity: `${String(indexStats.dev)}:${String(indexStats.ino)}`, startupRoot: false,
+      checkpoint: { device: String(targetStats.dev), journalUuid: 'journal', eventId: '0' }
+    })
+    const database = ConstructionDatabase.create(join(indexDirectory, descriptor.partialFile), {
+      scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid, journalBaseline: descriptor.journalBaseline
+    })
+    const rootId = `n-${createHmac('sha256', Buffer.from(database.nodeIdSeed, 'hex')).update('root').update('\0').update(target.target).digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: rootId, parentId: null, name: 'target', path: target.target, kind: 'directory', ownBytes: 8, device: String(targetStats.dev), inode: String(targetStats.ino) })
+    database.finish({ kind: 'pause' })
+    await store.publish(descriptor)
+    const execution = new DeferredScanExecution()
+    const controller = new OrbisController(execution, { indexDirectory, initialTarget: target.target })
+    try {
+      const snapshot = await controller.rescan()
+      expect(snapshot).toMatchObject({ focus: { name: 'target' }, scan: { progress: { stage: 'resuming', currentItem: 'Validating saved scan' } } })
+      await execution.started.promise
+      const session = new FakeScanSession()
+      session.begin(execution.request!, 1)
+      const pausing = controller.cancelScan()
+      execution.session.resolve(session)
+      await pausing
+      expect(session.terminated).toBe(true)
+      expect(controller.snapshot().scan.status).toBe('canceled')
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it('carries an acknowledged pause receipt into the next worker only once', async () => {
+    const target = await makeTarget('resume-receipt')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-resume-receipt-index-'))
+    const targetStats = await lstat(target.target)
+    const indexStats = await lstat(indexDirectory)
+    const store = new FullScanResumeStore(indexDirectory)
+    const descriptor = store.descriptor({
+      scanId: 'd3234567-89ab-4cde-8fab-0123456789ab', target: target.target,
+      targetDevice: String(targetStats.dev), targetInode: String(targetStats.ino),
+      indexDirectoryIdentity: `${String(indexStats.dev)}:${String(indexStats.ino)}`, startupRoot: false,
+      checkpoint: { device: String(targetStats.dev), journalUuid: 'journal', eventId: '0' }
+    })
+    const database = ConstructionDatabase.create(join(indexDirectory, descriptor.partialFile), {
+      scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid, journalBaseline: descriptor.journalBaseline
+    })
+    const rootId = `n-${createHmac('sha256', Buffer.from(database.nodeIdSeed, 'hex')).update('root').update('\0').update(target.target).digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: rootId, parentId: null, name: 'target', path: target.target, kind: 'directory', ownBytes: 8, device: String(targetStats.dev), inode: String(targetStats.ino) })
+    database.finish({ kind: 'pause' })
+    await store.publish(descriptor)
+    const workers: FakeScanSession[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await controller.rescan()
+      expect(workers[0]!.startMessage().resumeReceipt?.source).toBe('full-validation')
+      await controller.cancelScan()
+      await controller.rescan()
+      expect(workers[1]!.startMessage().resumeReceipt?.source).toBe('acknowledged-pause')
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
   it('reports generation-scoped resume milestones without exposing them as snapshots', async () => {
     const target = await makeTarget('resume-diagnostics')
     const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-resume-diagnostics-index-'))
@@ -415,7 +501,8 @@ describe("OrbisController", () => {
     const database = ConstructionDatabase.create(join(indexDirectory, descriptor.partialFile), {
       scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid, journalBaseline: descriptor.journalBaseline
     })
-    database.insertRoot({ id: 'root', parentId: null, name: 'target', path: target.target, kind: 'directory', ownBytes: 0, device: String(targetStats.dev), inode: String(targetStats.ino) })
+    const rootId = `n-${createHmac('sha256', Buffer.from(database.nodeIdSeed, 'hex')).update('root').update('\0').update(target.target).digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: rootId, parentId: null, name: 'target', path: target.target, kind: 'directory', ownBytes: 0, device: String(targetStats.dev), inode: String(targetStats.ino) })
     database.finish({ kind: 'pause' })
     await store.publish(descriptor)
     const workers: FakeScanSession[] = []
@@ -423,10 +510,20 @@ describe("OrbisController", () => {
     const unsubscribe = subscribeControllerDiagnostics((event) => events.push(event))
     const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
     try {
-      await controller.rescan()
+      const resuming = await controller.rescan()
       expect(workers[0]!.startMessage().resumeExpected).toBe(true)
+      expect(resuming).toMatchObject({ focus: { name: 'target' }, scan: { status: 'scanning', generation: 1, progress: { stage: 'resuming', currentItem: RESUME_PREPARATION_MESSAGES.validating } } })
+      const chart = resuming.chart
       workers[0]!.update({ type: 'resume-milestone', milestone: 'preparation-started' })
+      for (const phase of RESUME_PREPARATION_PHASES) {
+        workers[0]!.update({ type: 'resume-preparation', phase })
+        await new Promise((resolve) => setImmediate(resolve))
+        expect(controller.snapshot().scan.progress).toMatchObject({ stage: 'resuming', currentItem: RESUME_PREPARATION_MESSAGES[phase] })
+        expect(controller.snapshot().chart).toEqual(chart)
+      }
       workers[0]!.update({ type: 'progress', progress: { stage: 'traversing', scannedItems: 1, discoveredBytes: 0, elapsedMs: 0, currentItem: 'target' } })
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(controller.snapshot().scan.progress?.stage).toBe('traversing')
       workers[0]!.update({ type: 'resume-milestone', milestone: 'first-metadata-page' })
       workers[0]!.update({ type: 'resume-milestone', milestone: 'first-metadata-preview' })
       await new Promise((resolve) => setImmediate(resolve))
