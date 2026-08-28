@@ -222,11 +222,17 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
     if (!preparingResume) worker = created
     return created
   } }
-  let controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+  let controller: OrbisController
   if (prepareInChild) {
     prepareResumeInChild(target, indexDirectory, resumePausePage(manifest))
     preparingResume = false
-  } else if (resumeScenario) {
+    controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+    await controller.initialize()
+  } else {
+    controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+    await controller.initialize()
+  }
+  if (resumeScenario && !prepareInChild) {
     const premature = waitForCompletion(controller, options.timeoutMs)
     await controller.startScan()
     const preparationWorker = latestWorker
@@ -243,6 +249,7 @@ async function runSample(target: string, manifest: ScanFixtureManifest | LiveMan
     if (options.scenario === 'resume-unacknowledged-pause') {
       await controller.close()
       controller = new OrbisController(new WorkerScanExecution(workers), { indexDirectory, initialTarget: target })
+      await controller.initialize()
     }
   }
   const controllerTimings: OrbisTimingEvent[] = []
