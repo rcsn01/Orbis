@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createOrbisBridge, type IpcRendererLike } from '../src/preload/bridge'
+import type { LocationId } from '../src/shared/contracts'
 
-const id = 'loc-123e4567-e89b-42d3-a456-426614174000' as const
+const id = 'loc-123e4567-e89b-42d3-a456-426614174000' as LocationId
 const snapshot = {
   version: 4, committed: true, selectedLocationId: id,
   locations: [{ id, name: 'root', coverage: 'direct' }],

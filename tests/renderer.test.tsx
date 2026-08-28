@@ -3,16 +3,18 @@ import { act, cleanup, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../src/renderer/App"
-import type { OrbisSnapshot } from "../src/shared/contracts"
+import type { LocationId, OrbisSnapshot } from "../src/shared/contracts"
 
 const file = { id: "n-3", parentId: "n-1", name: "notes.txt", kind: "file" as const, sizeBytes: 2048, directChildren: 0, descendantCount: 0, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
 const folder = { id: "n-2", parentId: "n-1", name: "Documents", kind: "directory" as const, sizeBytes: 8192, directChildren: 1, descendantCount: 1, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
 const root = { id: "n-1", parentId: null, name: "fixture", kind: "directory" as const, sizeBytes: 10240, directChildren: 2, descendantCount: 2, unreadableCount: 0, scanState: "complete" as const, sizeAccuracy: "exact" as const }
-const scanning: OrbisSnapshot = { version: 3, committed: false, target: { name: "fixture", isStartup: false }, focus: root, breadcrumbs: [{ id: root.id, name: root.name }], chart: [
+const locationId = "loc-11234567-89ab-4cde-8fab-0123456789ab" as LocationId
+const otherLocationId = "loc-21234567-89ab-4cde-8fab-0123456789ab" as LocationId
+const scanning: OrbisSnapshot = { version: 4, committed: false, selectedLocationId: locationId, locations: [{ id: locationId, name: "fixture", coverage: "direct" }], target: { name: "fixture", isStartup: false }, focus: root, breadcrumbs: [{ id: root.id, name: root.name }], chart: [
   { id: folder.id, name: folder.name, kind: "directory", depth: 1, startAngle: 0, endAngle: 288, sizeBytes: folder.sizeBytes, percentage: 80, drillable: true, colorKey: "root:n-2", scanState: "complete", sizeAccuracy: "exact" },
   { id: file.id, name: file.name, kind: "file", depth: 1, startAngle: 288, endAngle: 360, sizeBytes: file.sizeBytes, percentage: 20, drillable: false, colorKey: "root:n-3", scanState: "complete", sizeAccuracy: "exact" }
-], largestItems: [folder, file], volume: { capacityBytes: 20_480, freeBytes: 10_240, scannedBytes: 10_240, unscannedBytes: 0, sizeAccuracy: "exact" }, scan: { status: "scanning", generation: 1, progress: { stage: "traversing", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "notes.txt" }, totals: null, error: null } }
-const completed: OrbisSnapshot = { ...scanning, committed: true, scan: { status: "completed", generation: 1, progress: null, totals: { scannedItems: 3, discoveredBytes: 10_240, elapsedMs: 300, skippedItems: 0, unreadableItems: 0, nestedMounts: 0, symlinks: 0, duplicateHardLinks: 0, disappearingItems: 0 }, error: null } }
+], largestItems: [folder, file], volume: { capacityBytes: 20_480, freeBytes: 10_240, scannedBytes: 10_240, unscannedBytes: 0, sizeAccuracy: "exact" }, scan: { locationId, status: "scanning", generation: 1, progress: { stage: "traversing", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "notes.txt" }, totals: null, error: null } }
+const completed: OrbisSnapshot = { ...scanning, committed: true, scan: { locationId, status: "completed", generation: 1, progress: null, totals: { scannedItems: 3, discoveredBytes: 10_240, elapsedMs: 300, skippedItems: 0, unreadableItems: 0, nestedMounts: 0, symlinks: 0, duplicateHardLinks: 0, disappearingItems: 0 }, error: null } }
 
 let publish: ((snapshot: OrbisSnapshot) => void) | undefined
 
@@ -23,7 +25,9 @@ beforeEach(() => {
   testWindow.orbis = {
     getSnapshot: vi.fn(async () => scanning),
     startScan: vi.fn(async () => scanning),
-    chooseFolder: vi.fn(async () => scanning),
+    addLocation: vi.fn(async () => scanning),
+    selectLocation: vi.fn(async () => scanning),
+    removeLocation: vi.fn(async () => scanning),
     cancelScan: vi.fn(async () => ({ ...scanning, scan: { ...scanning.scan, status: "canceled" as const, progress: null } } as OrbisSnapshot)),
     discardSavedScan: vi.fn(async () => scanning),
     rescan: vi.fn(async () => scanning),
@@ -36,6 +40,21 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); publish = undefined })
 
 describe("Orbis renderer", () => {
+  it("switches and removes saved locations through opaque ids", async () => {
+    const user = userEvent.setup()
+    const multiple = { ...completed, locations: [
+      { id: locationId, name: "fixture", coverage: "direct" as const },
+      { id: otherLocationId, name: "Archive", coverage: "ancestor" as const }
+    ] } as OrbisSnapshot
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(multiple)
+    vi.mocked(window.orbis.selectLocation).mockResolvedValueOnce({ ...multiple, selectedLocationId: otherLocationId, target: { name: "Archive", isStartup: false } })
+    render(<App />)
+    await user.selectOptions(await screen.findByRole("combobox", { name: "Saved location" }), otherLocationId)
+    expect(window.orbis.selectLocation).toHaveBeenCalledWith(otherLocationId)
+    await user.click(screen.getByRole("button", { name: "Remove location" }))
+    expect(window.orbis.removeLocation).toHaveBeenCalledWith(otherLocationId)
+  })
+
   it("shows the estimated folder size until an exact snapshot replaces it", async () => {
     const provisional: OrbisSnapshot = {
       ...scanning,
@@ -83,8 +102,8 @@ describe("Orbis renderer", () => {
 
   it("keeps saved results visible during resume preparation", async () => {
     const user = userEvent.setup()
-    const paused: OrbisSnapshot = { ...scanning, scan: { status: "canceled", generation: 1, progress: null, totals: null, error: null, resume: { available: true, checkpointedAt: "2026-01-01T00:00:00.000Z" } } }
-    const preparing: OrbisSnapshot = { ...paused, scan: { status: "scanning", generation: 2, progress: { stage: "resuming", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "Validating saved scan" }, totals: null, error: null } }
+    const paused: OrbisSnapshot = { ...scanning, scan: { locationId, status: "canceled", generation: 1, progress: null, totals: null, error: null, resume: { available: true, checkpointedAt: "2026-01-01T00:00:00.000Z" } } }
+    const preparing: OrbisSnapshot = { ...paused, scan: { locationId, status: "scanning", generation: 2, progress: { stage: "resuming", scannedItems: 2, discoveredBytes: 10_240, elapsedMs: 200, currentItem: "Validating saved scan" }, totals: null, error: null } }
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(paused)
     vi.mocked(window.orbis.rescan).mockResolvedValueOnce(preparing)
     render(<App />)

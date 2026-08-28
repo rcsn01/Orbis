@@ -129,7 +129,8 @@ describe("OrbisController", () => {
       const indexPath = firstWorkers[0]!.startMessage().publishedPath
       await first.close()
       await expect(access(indexPath)).resolves.toBeUndefined()
-      await expect(access(join(indexDirectory, "current.json"))).resolves.toBeUndefined()
+      await expect(access(join(indexDirectory, "locations.json"))).resolves.toBeUndefined()
+      await expect(access(join(indexDirectory, "current.json"))).rejects.toThrow()
 
       const restartedWorkers: FakeScanSession[] = []
       const restarted = createController({ create: () => { const worker = new FakeScanSession(); restartedWorkers.push(worker); return worker } }, { indexDirectory })
@@ -227,8 +228,8 @@ describe("OrbisController", () => {
       await secondCompleted
       expect(controller.snapshot()).toMatchObject({ committed: true, scan: { status: "completed", totals: result.totals } })
       await expect(access(originalPath)).resolves.toBeUndefined()
-      const manifest = JSON.parse(await readFile(join(indexDirectory, "current.json"), "utf8"))
-      expect(manifest.journal).toEqual({ uuid: "volume-journal", eventId: "12" })
+      const catalog = JSON.parse(await readFile(join(indexDirectory, "locations.json"), "utf8"))
+      expect(catalog.publications[0].journal).toEqual({ uuid: "volume-journal", eventId: "12" })
       await expect(access(secondStart.publishedPath)).rejects.toThrow()
     } finally {
       await controller.close()
@@ -360,8 +361,8 @@ describe("OrbisController", () => {
       await controller.startScan()
       await publish(workers[0]!, controller)
       const snapshot = await controller.chooseFolder()
-      expect(workers[1]!.startMessage().target).toBe(secondTarget.target)
-      expect(snapshot.target.name).toBe("target")
+      expect(workers[1]!.startMessage().target).toBe(await realpath(secondTarget.target))
+      expect(snapshot.target.name).toBe("target (2)")
       expect(snapshot.committed).toBe(false)
     } finally {
       await controller.close()
@@ -369,6 +370,79 @@ describe("OrbisController", () => {
       await rm(firstTarget.directory, { recursive: true, force: true })
       await rm(secondTarget.directory, { recursive: true, force: true })
     }
+  })
+
+  it("reuses a covered descendant as a boundary-safe saved location without starting a worker", async () => {
+    const target = await makeTarget("covered-descendant")
+    const child = join(target.target, "child")
+    await mkdir(child)
+    await writeFile(join(child, "inside.txt"), "inside")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-covered-index-"))
+    const workers: FakeScanSession[] = []
+    const controller = createController(
+      { create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } },
+      { indexDirectory, initialTarget: target.target, dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [child] }) } }
+    )
+    try {
+      await controller.startScan()
+      await publish(workers[0]!, controller)
+      const parentId = controller.snapshot().selectedLocationId
+      const childSnapshot = await controller.addLocation()
+      expect(workers).toHaveLength(1)
+      expect(childSnapshot).toMatchObject({ committed: true, target: { name: "child" }, focus: { name: "child", parentId: null } })
+      expect(childSnapshot.locations).toHaveLength(2)
+      expect(childSnapshot.locations.find((item) => item.id === childSnapshot.selectedLocationId)?.coverage).toBe("ancestor")
+      await expect(controller.focusNode(childSnapshot.breadcrumbs[0]!.id)).resolves.toMatchObject({ target: { name: "child" } })
+      await controller.rescan()
+      expect(workers[1]!.startMessage()).toMatchObject({ target: await realpath(target.target), active: { manifest: { target: await realpath(target.target) } } })
+      await publish(workers[1]!, controller)
+      const withoutParent = await controller.removeLocation(parentId)
+      expect(withoutParent).toMatchObject({ committed: true, target: { name: "child" }, locations: [{ coverage: "ancestor" }] })
+      expect(JSON.parse(await readFile(join(indexDirectory, "locations.json"), "utf8")).publications).toHaveLength(1)
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
+  it("scans a newly added ancestor before consolidating covered child locations", async () => {
+    const target = await makeTarget("ancestor")
+    const child = join(target.target, "child")
+    await mkdir(child)
+    await writeFile(join(child, "inside.txt"), "inside")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-ancestor-index-"))
+    const workers: FakeScanSession[] = []
+    const controller = createController(
+      { create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } },
+      { indexDirectory, initialTarget: child, dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [target.target] }) } }
+    )
+    try {
+      await controller.startScan(); await publish(workers[0]!, controller)
+      const childId = controller.snapshot().selectedLocationId
+      const oldPath = workers[0]!.startMessage().publishedPath
+      const pending = await controller.addLocation()
+      expect(workers).toHaveLength(2)
+      expect(pending).toMatchObject({ committed: false, locations: [{ coverage: "direct" }, { coverage: "none" }] })
+      await expect(access(oldPath)).resolves.toBeUndefined()
+      await publish(workers[1]!, controller)
+      await controller.selectLocation(childId)
+      expect(controller.snapshot()).toMatchObject({ committed: true, target: { name: "child" } })
+      expect(controller.snapshot().locations.find((item) => item.id === childId)?.coverage).toBe("ancestor")
+      await expect(access(oldPath)).rejects.toThrow()
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
+  it("selects an exact saved target instead of duplicating or rescanning it", async () => {
+    const target = await makeTarget("exact-location")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-exact-index-"))
+    const workers: FakeScanSession[] = []
+    const controller = createController(
+      { create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } },
+      { indexDirectory, initialTarget: target.target, dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [target.target] }) } }
+    )
+    try {
+      await controller.startScan(); await publish(workers[0]!, controller)
+      const snapshot = await controller.addLocation()
+      expect(snapshot.locations).toHaveLength(1)
+      expect(workers).toHaveLength(1)
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
   })
 
   it("keeps the previous index when a rescan publishes an invalid database", async () => {

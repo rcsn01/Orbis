@@ -7,10 +7,26 @@
 Settled terms used across the codebase. Keep these meanings stable when naming
 new symbols or writing docs.
 
-- **published index** — the immutable `index-<uuid>.sqlite` file named by
-  `indexes/current.json`. It is the committed read-model source behind
-  `DiskIndex`; it never contains pending nodes (`finalize()` throws on queued
-  work, and the resume store's `validateCandidate` rejects them).
+- **saved location** — a user-visible logical root retained in the private
+  `indexes/locations.json` catalog. Main owns its canonical path and filesystem
+  identity; renderer payloads receive only its opaque ID and path-free display
+  name.
+
+- **coverage publication** — an immutable `index-<uuid>.sqlite` file named by a
+  publication record in `indexes/locations.json`. One publication can cover
+  several saved locations and owns their shared scan revision, exclusion
+  semantics, hard-link accounting domain, and FSEvents cursor.
+
+- **published index** — a coverage publication used as a committed read-model
+  source behind `DiskIndex`; it never contains pending nodes (`finalize()`
+  throws on queued work, and the resume store's `validateCandidate` rejects
+  them). `current.json` is legacy migration input, not an active manifest.
+
+- **location view** — a boundary-restricted read adapter over one coverage
+  publication. It presents a saved descendant as the logical root, clips
+  breadcrumbs there, and rejects focus or reveal operations outside it. It
+  preserves publication-domain aggregates; it never slices or reassigns
+  hard-link ownership to claim a standalone subtree total.
 
 - **construction database** — the private worker-side SQLite file behind
   `ProgressiveScanDatabase`. It holds the in-progress scan (nodes, tasks,

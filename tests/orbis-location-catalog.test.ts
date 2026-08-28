@@ -7,13 +7,14 @@ import {
   type LocationCatalogDocument, type SavedLocationRecord
 } from '../src/main/location-catalog'
 import type { IndexManifest } from '../src/main/index-manifest'
+import type { LocationId } from '../src/shared/contracts'
 
 const roots: string[] = []
 afterEach(async () => { await Promise.all(roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
 const publicationId = '01234567-89ab-4cde-8fab-0123456789ab'
 const manifest: IndexManifest = { version: 1, publicationId, indexFile: `index-${publicationId}.sqlite`, target: '/Volumes/Data', targetDevice: '1', targetInode: '2', schemaVersion: 3, indexRevision: 1, journal: null }
 const location: SavedLocationRecord = {
-  id: 'loc-11234567-89ab-4cde-8fab-0123456789ab', target: '/Volumes/Data', targetDevice: '1', targetInode: '2',
+  id: 'loc-11234567-89ab-4cde-8fab-0123456789ab' as LocationId, target: '/Volumes/Data', targetDevice: '1', targetInode: '2',
   displayName: 'Data', publicationId
 }
 
@@ -51,12 +52,16 @@ describe('LocationCatalogStore', () => {
     expect(isLocationCatalogDocument(first)).toBe(true)
   })
 
-  it('rejects malformed files without rewriting them', async () => {
+  it('rejects malformed files without rewriting metadata or reconciling publications', async () => {
     const root = await mkdtemp(join(tmpdir(), 'orbis-locations-invalid-')); roots.push(root)
     const directory = join(root, 'indexes'); const store = new LocationCatalogStore(directory)
     await store.initialize()
+    const publication = store.paths(publicationId).indexPath
+    await writeFile(publication, 'publication')
     await writeFile(store.catalogPath, '{}')
+    await store.initialize()
     await expect(store.load()).resolves.toBeUndefined()
     expect(await readFile(store.catalogPath, 'utf8')).toBe('{}')
+    await expect(access(publication)).resolves.toBeUndefined()
   })
 })

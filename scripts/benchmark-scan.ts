@@ -347,11 +347,12 @@ async function preparePersistentBaseline(target: string, indexDirectory: string)
 async function applyRefreshScenario(target: string, indexDirectory: string, scenario: RefreshScenario, sample: number): Promise<void> {
   if (scenario === 'warm-no-change') return
   if (scenario === 'dropped-history-fallback') {
-    const manifestPath = resolve(indexDirectory, 'current.json')
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { journal?: { uuid: string; eventId: string } | null }
+    const catalogPath = resolve(indexDirectory, 'locations.json')
+    const catalog = readBenchmarkCatalog(indexDirectory)
+    const manifest = activeBenchmarkManifest(catalog)
     if (!manifest.journal) throw new Error('The benchmark baseline has no FSEvents cursor')
     manifest.journal.uuid = `benchmark-invalid-${sample}`
-    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+    await writeFile(catalogPath, `${JSON.stringify(catalog)}\n`)
     return
   }
   if (scenario === 'one-file-allocation') {
@@ -403,8 +404,25 @@ async function findFirstEntry(root: string, kind: 'file' | 'directory'): Promise
   return undefined
 }
 
+interface BenchmarkCatalog {
+  selectedLocationId: string
+  locations: Array<{ id: string; publicationId: string | null }>
+  publications: Array<{ publicationId: string; indexFile: string; journal: { uuid: string; eventId: string } | null }>
+}
+
+function readBenchmarkCatalog(indexDirectory: string): BenchmarkCatalog {
+  return JSON.parse(readFileSync(resolve(indexDirectory, 'locations.json'), 'utf8')) as BenchmarkCatalog
+}
+
+function activeBenchmarkManifest(catalog: BenchmarkCatalog): BenchmarkCatalog['publications'][number] {
+  const location = catalog.locations.find((item) => item.id === catalog.selectedLocationId)
+  const manifest = location?.publicationId ? catalog.publications.find((item) => item.publicationId === location.publicationId) : undefined
+  if (!manifest) throw new Error('The benchmark catalog has no selected publication')
+  return manifest
+}
+
 function readActiveResult(indexDirectory: string, generation: number): ScanResult {
-  const manifest = JSON.parse(readFileSync(resolve(indexDirectory, 'current.json'), 'utf8')) as { indexFile: string }
+  const manifest = activeBenchmarkManifest(readBenchmarkCatalog(indexDirectory))
   const publishedPath = resolve(indexDirectory, manifest.indexFile)
   const database = new DatabaseSync(publishedPath, { readOnly: true })
   try {

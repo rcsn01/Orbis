@@ -66,6 +66,7 @@ export class OrbisController {
   readonly #manifestStore: IndexManifestStore
   readonly #catalogStore: LocationCatalogStore
   readonly #resumeStore: FullScanResumeStore
+  readonly #explicitInitialTarget: boolean
   #initialization: Promise<void> | undefined
   #active: DiskIndex | undefined
   #activeView: LocationIndexView | undefined
@@ -102,6 +103,7 @@ export class OrbisController {
     this.#catalogStore = new LocationCatalogStore(this.indexDirectory)
     this.#artifacts = this.#catalogStore.artifacts
     this.#resumeStore = new FullScanResumeStore(this.indexDirectory)
+    this.#explicitInitialTarget = options.initialTarget !== undefined || process.env.ORBIS_SCAN_ROOT !== undefined
     this.#target = normalize(resolve(options.initialTarget ?? process.env.ORBIS_SCAN_ROOT ?? '/'))
     this.#dialog = options.dialog
     this.#shell = options.shell
@@ -127,24 +129,36 @@ export class OrbisController {
     const locations = catalog.locations.map((item) => ({ id: item.id, name: item.displayName, coverage: item.publicationId === null ? 'none' as const : this.#publication(item.publicationId)?.target === item.target ? 'direct' as const : 'ancestor' as const })) as unknown as OrbisSnapshot['locations']
     const scan = { ...this.#scanStatus, locationId: this.#run?.locationId ?? catalog.pendingScan?.locationId ?? selected.id, ...(this.#resume ? { resume: this.#resume } : {}) }
     const preview = this.#preview
-    if (preview) return { version: 4, committed: false, selectedLocationId: selected.id, locations, target: preview.target, focus: preview.focus, breadcrumbs: preview.breadcrumbs, chart: preview.chart, largestItems: preview.largestItems, volume: preview.volume, scan }
+    const activityTarget = this.#run?.target ?? catalog.pendingScan?.target
+    const previewVisible = preview && scan.locationId === selected.id && activityTarget === selected.target
+    if (previewVisible) return { version: 4, committed: false, selectedLocationId: selected.id, locations, target: { name: selected.displayName, isStartup: selected.target === '/' }, focus: preview.focus, breadcrumbs: preview.breadcrumbs, chart: preview.chart, largestItems: preview.largestItems, volume: preview.volume, scan }
     const timed = <T>(phase: string, operation: () => T): T => diagnosticGeneration === undefined ? operation() : measureController(diagnosticGeneration, phase, operation)
     const active = this.#activeView
     const focus = timed('snapshot-focus-query', () => active && this.#focusId ? active.getNode(this.#focusId) : undefined)
     const totals = this.#active ? parseTotals(this.#active.metadata.totals) : null
-    const root = active?.root
+    const root = timed('snapshot-root-query', () => active?.root)
     const volume = this.#active && active ? parseVolume(this.#active.metadata.volume, root?.sizeBytes ?? 0, active.target, root?.sizeAccuracy ?? 'partial') : emptyVolume()
     const breadcrumbs = timed('snapshot-breadcrumbs-query', () => focus && active ? active.getBreadcrumbs(focus.id) : [])
     const chart = timed('snapshot-chart-query', () => focus && active ? buildChart(active, focus, { rootTotalBytes: active.target === '/' ? volume.capacityBytes : 0 }) : [])
     const largestItems = timed('snapshot-largest-items-query', () => focus && active ? active.getLargestItems(focus.id) : [])
-    return { version: 4, committed: !!active, selectedLocationId: selected.id, locations, target: { name: root?.name ?? selected.displayName, isStartup: selected.target === '/' }, focus: focus ? toSummary(focus) : null, breadcrumbs, chart, largestItems, volume, scan: { ...scan, totals: scan.status === 'scanning' ? null : scan.totals ?? totals } }
+    const summary = focus ? toSummary(focus) : null
+    return { version: 4, committed: !!active, selectedLocationId: selected.id, locations, target: { name: root?.name ?? selected.displayName, isStartup: selected.target === '/' }, focus: summary && focus?.id === active?.rootId ? { ...summary, parentId: null } : summary, breadcrumbs, chart, largestItems, volume, scan: { ...scan, totals: scan.status === 'scanning' ? null : scan.totals ?? totals } }
   }
 
   #publication(id: string): IndexManifest | undefined { return this.#catalog?.publications.find((item) => item.publicationId === id) }
 
-  async startScan(): Promise<OrbisSnapshot> { return this.#startScanAt(this.#target) }
+  async startScan(): Promise<OrbisSnapshot> {
+    await this.initialize()
+    const location = this.#selectedLocation()
+    return this.#startScanAt(location.target)
+  }
   async rescan(): Promise<OrbisSnapshot> {
     await this.initialize()
+    const pending = this.#catalog!.pendingScan
+    if (pending) {
+      if (this.#catalog!.selectedLocationId !== pending.locationId) await this.selectLocation(pending.locationId)
+      return this.#startScanAt(pending.target)
+    }
     const location = this.#selectedLocation()
     const publication = location.publicationId ? this.#publication(location.publicationId) : undefined
     return this.#startScanAt(publication?.target ?? location.target)
@@ -155,13 +169,30 @@ export class OrbisController {
     const result = await this.#dialog.showOpenDialog({ properties: ['openDirectory'] })
     if (result.canceled || !result.filePaths[0]) return this.snapshot()
     await this.initialize()
+    if (this.#run) throw new Error('Pause the current scan before adding another location')
     const identity = await resolveTarget(result.filePaths[0])
-    if (this.#catalog!.locations.some((item) => item.target === identity.target)) throw new Error('That location is already saved')
-    const location: SavedLocationRecord = { id: createLocationId(), ...identity, displayName: uniqueDisplayName(identity.target, this.#catalog!.locations), publicationId: null }
-    this.#catalog = nextCatalog(this.#catalog!, { locations: [...this.#catalog!.locations, location], selectedLocationId: location.id })
-    await this.#catalogStore.publish(this.#catalog)
+    const existing = this.#catalog!.locations.find((item) => item.target === identity.target)
+    if (existing) {
+      if (existing.targetDevice === identity.targetDevice && existing.targetInode === identity.targetInode) return this.selectLocation(existing.id)
+      const changed = { ...existing, ...identity, publicationId: null }
+      if (this.#catalog!.pendingScan) throw new Error('Complete or discard the saved scan before scanning another location')
+      const previousFiles = new Set(this.#catalog!.publications.map((item) => item.indexFile))
+      const referenced = new Set(this.#catalog!.locations.filter((item) => item.id !== existing.id).flatMap((item) => item.publicationId ? [item.publicationId] : []))
+      const next = nextCatalog(this.#catalog!, { locations: this.#catalog!.locations.map((item) => item.id === existing.id ? changed : item), selectedLocationId: existing.id, publications: this.#catalog!.publications.filter((item) => referenced.has(item.publicationId)) })
+      await this.#catalogStore.publish(next)
+      this.#catalog = next
+      if (this.#catalogStore.lastPublicationDurable) for (const file of previousFiles) if (!this.#catalog!.publications.some((item) => item.indexFile === file)) await this.#artifacts.discardUnreferencedDatabase(join(this.indexDirectory, file)).catch(() => false)
+      await this.#selectOpenedLocation(changed)
+      return this.#startScanAt(changed.target)
+    }
+    const publicationId = await this.#coveringPublication(identity)
+    if (publicationId === null && this.#catalog!.pendingScan) throw new Error('Complete or discard the saved scan before scanning another location')
+    const location: SavedLocationRecord = { id: createLocationId(), ...identity, displayName: uniqueDisplayName(identity.target, this.#catalog!.locations), publicationId }
+    const next = nextCatalog(this.#catalog!, { locations: [...this.#catalog!.locations, location], selectedLocationId: location.id })
+    await this.#catalogStore.publish(next)
+    this.#catalog = next
     await this.#selectOpenedLocation(location)
-    if (location.publicationId === null) return this.#startScanAt(location.target)
+    if (publicationId === null) return this.#startScanAt(location.target)
     this.#emit(); return this.snapshot()
   }
 
@@ -172,7 +203,9 @@ export class OrbisController {
     const location = this.#catalog!.locations.find((item) => item.id === id)
     if (!location) throw new Error('Unknown Orbis location')
     if (this.#run && this.#run.locationId !== id) throw new Error('Pause the current scan before selecting another location')
-    this.#catalog = nextCatalog(this.#catalog!, { selectedLocationId: id }); await this.#catalogStore.publish(this.#catalog)
+    const next = nextCatalog(this.#catalog!, { selectedLocationId: id })
+    await this.#catalogStore.publish(next)
+    this.#catalog = next
     await this.#selectOpenedLocation(location)
     this.#emit(); return this.snapshot()
   }
@@ -186,8 +219,12 @@ export class OrbisController {
     const selectedLocationId = catalog.selectedLocationId === id ? locations[0]!.id : catalog.selectedLocationId
     const referenced = new Set(locations.flatMap((item) => item.publicationId ? [item.publicationId] : []))
     const publications = catalog.publications.filter((item) => referenced.has(item.publicationId))
-    this.#catalog = nextCatalog(catalog, { locations, selectedLocationId, publications }); await this.#catalogStore.publish(this.#catalog)
+    const removedFiles = catalog.publications.filter((item) => !publications.some((candidate) => candidate.publicationId === item.publicationId)).map((item) => item.indexFile)
+    const next = nextCatalog(catalog, { locations, selectedLocationId, publications })
+    await this.#catalogStore.publish(next)
+    this.#catalog = next
     await this.#selectOpenedLocation(locations.find((item) => item.id === selectedLocationId)!)
+    if (this.#catalogStore.lastPublicationDurable) for (const file of removedFiles) await this.#artifacts.discardUnreferencedDatabase(join(this.indexDirectory, file)).catch(() => false)
     this.#emit(); return this.snapshot()
   }
 
@@ -228,7 +265,9 @@ export class OrbisController {
     this.#savedConstruction = undefined
     this.#resumeReceipt = undefined
     this.#rejectPendingReveals('Saved scan discarded')
-    await this.#resumeStore.discard()
+    const pendingScanId = this.#catalog?.pendingScan?.scanId
+    await this.#resumeStore.discard(pendingScanId)
+    if (pendingScanId) await this.#clearPendingScan(pendingScanId)
     this.#resume = undefined
     if (this.#scanStatus.status === 'canceled') this.#scanStatus = { status: 'idle', generation: this.#scanStatus.generation, progress: null, totals: null, error: null }
     this.#emit()
@@ -324,57 +363,140 @@ export class OrbisController {
     this.#resumeReceipt = undefined
     this.#rejectPendingReveals('Orbis is shutting down')
     this.#focusId = undefined
-    // Preserve both possible publications if the manifest-directory sync failed.
-    if (this.#manifestDurable) {
-      await this.#manifestStore.initialize().then(() => this.#manifestStore.cleanup(this.#activeManifest?.indexFile)).catch(() => undefined)
-    }
+    // Preserve every catalog and Resume reference. If the catalog directory sync
+    // failed, retain the currently open generation as an additional recovery file.
+    if (this.#manifestDurable) await this.#artifacts.reconcile().catch(() => undefined)
+    else await this.#artifacts.reconcile({ retain: this.#activeManifest ? [this.#activeManifest.indexFile] : [] }).catch(() => undefined)
     this.#listeners.clear()
   }
 
   async #initializePersistentIndex(): Promise<void> {
     await this.#catalogStore.initialize()
     let catalog: LocationCatalogDocument | undefined = await this.#catalogStore.load()
-    const legacy = await this.#manifestStore.load()
     if (!catalog) {
-      const identity = await resolveInitialTarget(legacy?.target ?? this.#target)
+      try {
+        await lstat(this.#catalogStore.catalogPath)
+        throw new Error('Stored Orbis location catalog is invalid')
+      } catch (error) { if (!isMissingPath(error)) throw error }
+    }
+    const legacy = await this.#manifestStore.load()
+    const peek = await this.#resumeStore.peek()
+    const descriptor = peek.kind === 'construction' || peek.kind === 'candidate' || peek.kind === 'restart' ? peek.descriptor : undefined
+    if (!catalog) {
+      const identity = legacy
+        ? { target: legacy.target, targetDevice: legacy.targetDevice, targetInode: legacy.targetInode }
+        : descriptor
+          ? { target: descriptor.target, targetDevice: descriptor.targetDevice, targetInode: descriptor.targetInode }
+          : await resolveTarget(this.#target)
       catalog = createEmptyCatalog(identity)
       if (legacy) catalog = { ...catalog, locations: [{ ...catalog.locations[0]!, publicationId: legacy.publicationId }], publications: [legacy] }
-      const peek = await this.#resumeStore.peek()
-      const descriptor = peek.kind === 'construction' || peek.kind === 'candidate' || peek.kind === 'restart' ? peek.descriptor : undefined
       if (descriptor) {
-        const owner = catalog.locations[0]!
-        catalog = { ...catalog, pendingScan: { scanId: descriptor.scanId, locationId: owner.id, target: descriptor.target, targetDevice: owner.targetDevice, targetInode: owner.targetInode, basePublicationId: owner.publicationId } }
+        let owner = catalog.locations.find((item) => item.target === descriptor.target)
+        if (!owner) {
+          owner = { id: createLocationId(), target: descriptor.target, targetDevice: descriptor.targetDevice, targetInode: descriptor.targetInode, displayName: uniqueDisplayName(descriptor.target, catalog.locations), publicationId: null }
+          catalog = { ...catalog, locations: [...catalog.locations, owner], selectedLocationId: owner.id }
+        }
+        catalog = { ...catalog, pendingScan: { scanId: descriptor.scanId, locationId: owner.id, target: descriptor.target, targetDevice: descriptor.targetDevice, targetInode: descriptor.targetInode, basePublicationId: owner.publicationId } }
       }
       await this.#catalogStore.publish(catalog)
       await this.#artifacts.removeManifestMetadata().catch(() => undefined)
     }
     if (!catalog) throw new Error('Unable to initialize Orbis catalog')
     this.#catalog = catalog
-    const selected = this.#selectedLocation()
+    if (this.#explicitInitialTarget) {
+      try {
+        const explicit = await resolveTarget(this.#target)
+        let location = catalog.locations.find((item) => item.target === explicit.target || item.targetDevice === explicit.targetDevice && item.targetInode === explicit.targetInode)
+        if (!location) {
+          const publicationId = await this.#coveringPublication(explicit)
+          location = { id: createLocationId(), ...explicit, displayName: uniqueDisplayName(explicit.target, catalog.locations), publicationId }
+          catalog = nextCatalog(catalog, { locations: [...catalog.locations, location], selectedLocationId: location.id })
+        } else if (catalog.selectedLocationId !== location.id) catalog = nextCatalog(catalog, { selectedLocationId: location.id })
+        if (catalog !== this.#catalog) { await this.#catalogStore.publish(catalog); this.#catalog = catalog }
+      } catch (error) { if (!isMissingPath(error)) throw error }
+    }
+    let selected = this.#selectedLocation()
+    try {
+      const live = await lstat(selected.target)
+      if (!live.isDirectory() || live.isSymbolicLink() || String(live.dev) !== selected.targetDevice || String(live.ino) !== selected.targetInode) {
+        const locations = catalog.locations.map((item) => item.id === selected.id ? { ...item, publicationId: null } : item)
+        const referenced = new Set(locations.flatMap((item) => item.publicationId ? [item.publicationId] : []))
+        catalog = nextCatalog(catalog, { locations, publications: catalog.publications.filter((item) => referenced.has(item.publicationId)) })
+        await this.#catalogStore.publish(catalog)
+        this.#catalog = catalog
+        selected = this.#selectedLocation()
+      }
+    } catch (error) { if (!isMissingPath(error) && errorCode(error) !== 'EACCES' && errorCode(error) !== 'EPERM' && errorCode(error) !== 'EIO' && errorCode(error) !== 'ENXIO') throw error }
     this.#target = selected.target
     let saved = await this.#resumeStore.load()
+    if (saved.kind === 'candidate') {
+      const candidate = saved
+      if (catalog.publications.some((item) => item.publicationId === candidate.descriptor.scanId)) {
+        await this.#resumeStore.complete(candidate.descriptor.scanId)
+        saved = { kind: 'none' }
+      }
+    }
+    if ((saved.kind === 'construction' || saved.kind === 'candidate') && !catalog.pendingScan) {
+      let owner = catalog.locations.find((item) => item.target === saved.descriptor.target)
+      if (!owner) {
+        owner = { id: createLocationId(), target: saved.descriptor.target, targetDevice: saved.descriptor.targetDevice, targetInode: saved.descriptor.targetInode, displayName: uniqueDisplayName(saved.descriptor.target, catalog.locations), publicationId: null }
+        catalog = nextCatalog(catalog, { locations: [...catalog.locations, owner] })
+      }
+      catalog = nextCatalog(catalog, { pendingScan: { scanId: saved.descriptor.scanId, locationId: owner.id, target: saved.descriptor.target, targetDevice: saved.descriptor.targetDevice, targetInode: saved.descriptor.targetInode, basePublicationId: owner.publicationId } })
+      await this.#catalogStore.publish(catalog); this.#catalog = catalog
+    } else if (saved.kind === 'none' && catalog.pendingScan) {
+      catalog = nextCatalog(catalog, { pendingScan: null }); await this.#catalogStore.publish(catalog); this.#catalog = catalog
+    } else if (saved.kind === 'restart' && saved.reason !== 'target-unavailable') {
+      await this.#resumeStore.discard(saved.descriptor?.scanId)
+      if (catalog.pendingScan) { catalog = nextCatalog(catalog, { pendingScan: null }); await this.#catalogStore.publish(catalog); this.#catalog = catalog }
+    }
     this.#rememberResumeLoad(saved)
     if (saved.kind === 'construction' || saved.kind === 'candidate') {
       this.#resume = { available: true, checkpointedAt: saved.kind === 'construction' ? saved.checkpointedAt : saved.descriptor.createdAt }
       this.#scanStatus = { status: 'canceled', generation: 0, progress: null, totals: null, error: null }
       if (saved.kind === 'construction') await this.#restoreConstructionPreview(saved, 0)
+    } else if (saved.kind === 'restart' && saved.reason === 'target-unavailable' && saved.descriptor) {
+      this.#resume = { available: true, checkpointedAt: saved.descriptor.createdAt }
+      this.#scanStatus = { status: 'canceled', generation: 0, progress: null, totals: null, error: null }
     }
-    await this.#selectOpenedLocation(selected)
+    await this.#selectOpenedLocation(this.#selectedLocation())
+    await this.#artifacts.reconcile({ retain: this.#catalogStore.referencedIndexFiles(this.#catalog!) })
   }
 
   #selectedLocation(): SavedLocationRecord { return this.#catalog!.locations.find((item) => item.id === this.#catalog!.selectedLocationId)! }
+
+  async #coveringPublication(identity: { readonly target: string; readonly targetDevice: string; readonly targetInode: string }): Promise<string | null> {
+    const candidates = this.#catalog!.publications.filter((item) => isWithinPath(identity.target, item.target)).sort((a, b) => b.target.length - a.target.length)
+    for (const candidate of candidates) {
+      let index: DiskIndex | undefined
+      try {
+        index = new DiskIndex(join(this.indexDirectory, candidate.indexFile))
+        if (matchesManifest(index, candidate) && await targetIdentityIsCompatible(candidate) && index.openLocationView(identity.target, { device: identity.targetDevice, inode: identity.targetInode })) return candidate.publicationId
+      } catch { /* Invalid publications cannot cover a new location. */ }
+      finally { try { index?.close() } catch { /* Continue probing. */ } }
+    }
+    return null
+  }
 
   async #selectOpenedLocation(location: SavedLocationRecord): Promise<void> {
     const publications = this.#catalog!.publications.filter((item) => isWithinPath(location.target, item.target)).sort((a, b) => b.target.length - a.target.length)
     let opened: DiskIndex | undefined; let view: LocationIndexView | undefined; let manifest: IndexManifest | undefined
     for (const candidate of publications) {
-      try { const index = new DiskIndex(join(this.indexDirectory, candidate.indexFile)); const candidateView = index.openLocationView(location.target, { device: location.targetDevice, inode: location.targetInode }); if (candidateView) { opened = index; view = candidateView; manifest = candidate; break } index.close() } catch { /* Ignore invalid publication. */ }
+      try { const index = new DiskIndex(join(this.indexDirectory, candidate.indexFile)); const candidateView = matchesManifest(index, candidate) && await targetIdentityIsCompatible(candidate) ? index.openLocationView(location.target, { device: location.targetDevice, inode: location.targetInode }) : undefined; if (candidateView) { opened = index; view = candidateView; manifest = candidate; break } index.close() } catch { /* Ignore invalid publication. */ }
     }
     if (this.#active && this.#active !== opened) this.#active.close()
     this.#active = opened; this.#activeView = view; this.#activeManifest = manifest; this.#target = location.target; this.#focusId = view?.rootId
     if (manifest && location.publicationId !== manifest.publicationId) {
       const locations = this.#catalog!.locations.map((item) => item.id === location.id ? { ...item, publicationId: manifest!.publicationId } : item)
-      this.#catalog = nextCatalog(this.#catalog!, { locations }); await this.#catalogStore.publish(this.#catalog)
+      const next = nextCatalog(this.#catalog!, { locations })
+      await this.#catalogStore.publish(next)
+      this.#catalog = next
+    } else if (!manifest && location.publicationId !== null) {
+      const locations = this.#catalog!.locations.map((item) => item.id === location.id ? { ...item, publicationId: null } : item)
+      const referenced = new Set(locations.flatMap((item) => item.publicationId ? [item.publicationId] : []))
+      const next = nextCatalog(this.#catalog!, { locations, publications: this.#catalog!.publications.filter((item) => referenced.has(item.publicationId)) })
+      await this.#catalogStore.publish(next)
+      this.#catalog = next
     }
   }
 
@@ -444,7 +566,7 @@ export class OrbisController {
     const savedDescriptor = saved.kind === 'construction' || saved.kind === 'candidate' || saved.kind === 'restart' ? saved.descriptor : undefined
     if (savedDescriptor && savedDescriptor.target !== target) throw new Error('Discard the saved scan before choosing another folder')
     const publicationId = saved.kind === 'construction' || saved.kind === 'candidate' ? saved.descriptor.scanId : randomUUID()
-    const { partialPath, indexPath: publishedPath } = this.#manifestStore.paths(publicationId)
+    const { partialPath, indexPath: publishedPath } = this.#catalogStore.paths(publicationId)
     if (saved.kind !== 'construction' && saved.kind !== 'candidate') {
       await this.#artifacts.discardUnreferencedDatabase(partialPath)
       await this.#artifacts.discardUnreferencedDatabase(publishedPath)
@@ -470,8 +592,12 @@ export class OrbisController {
     this.#rejectPendingReveals('A newer scan started')
     const owner = this.#selectedLocation()
     const basePublicationId = this.#activeManifest?.publicationId ?? null
-    this.#catalog = nextCatalog(this.#catalog!, { pendingScan: { scanId: publicationId, locationId: owner.id, target, targetDevice: owner.targetDevice, targetInode: owner.targetInode, basePublicationId } })
-    await this.#catalogStore.publish(this.#catalog)
+    const resolvedScan = this.#activeManifest?.target === target
+      ? { targetDevice: this.#activeManifest.targetDevice, targetInode: this.#activeManifest.targetInode }
+      : await resolveTarget(target)
+    const catalogWithPendingScan = nextCatalog(this.#catalog!, { pendingScan: { scanId: publicationId, locationId: owner.id, target, targetDevice: resolvedScan.targetDevice, targetInode: resolvedScan.targetInode, basePublicationId } })
+    await this.#catalogStore.publish(catalogWithPendingScan)
+    this.#catalog = catalogWithPendingScan
     const sessionPromise = Promise.resolve().then(() => this.scanExecution.start({
       target, partialPath, publishedPath, indexDirectory: this.indexDirectory, startupRoot: target === '/', resumeExpected,
       ...(resumeReceipt ? { resumeReceipt } : {}),
@@ -571,11 +697,17 @@ export class OrbisController {
         await this.#artifacts.discardUnreferencedDatabase(result.publishedPath)
         return
       }
+      const pending = this.#catalog?.pendingScan
+      if (!pending || pending.scanId !== run.publicationId || pending.locationId !== run.locationId || pending.basePublicationId !== run.basePublicationId) {
+        await this.#fail(run, 'The scan no longer owns the pending catalog transaction.')
+        return
+      }
       if (refresh?.basePublicationId && refresh.basePublicationId !== this.#activeManifest?.publicationId) {
         await this.#fail(run, 'The incremental scan was based on a stale index.')
         return
       }
       let next: DiskIndex | undefined
+      let obsoleteFiles: string[] = []
       const old = this.#active
       const oldView = this.#activeView
       const oldManifest = this.#activeManifest
@@ -586,15 +718,22 @@ export class OrbisController {
         if (persistent && !await indexDirectoryIdentityIsCompatible(next, this.indexDirectory)) throw new Error('The scan worker returned an index for another index directory')
         const manifest = persistent ? manifestFor(run, next, refresh?.journal ?? null) : undefined
         if (manifest) {
+          const owner = this.#catalog!.locations.find((location) => location.id === run.locationId)
+          if (!owner || !next.openLocationView(owner.target, { device: owner.targetDevice, inode: owner.targetInode })) throw new Error('The scanned location is not present in the candidate index')
           const publications = [...this.#catalog!.publications.filter((item) => item.publicationId !== manifest.publicationId), manifest]
           const locations = this.#catalog!.locations.map((location) => {
             const view = next!.openLocationView(location.target, { device: location.targetDevice, inode: location.targetInode })
             return view ? { ...location, publicationId: manifest.publicationId } : location
           })
           const referenced = new Set(locations.flatMap((location) => location.publicationId ? [location.publicationId] : []))
-          this.#catalog = nextCatalog(this.#catalog!, { publications: publications.filter((item) => referenced.has(item.publicationId)), locations, pendingScan: null })
-          await measureControllerAsync(run.generation, 'manifest-publish', () => this.#catalogStore.publish(this.#catalog!))
+          const retainedPublications = publications.filter((item) => referenced.has(item.publicationId))
+          const retainedFiles = new Set(retainedPublications.map((item) => item.indexFile))
+          obsoleteFiles = this.#catalog!.publications.map((item) => item.indexFile).filter((file) => !retainedFiles.has(file))
+          const committedCatalog = nextCatalog(this.#catalog!, { publications: retainedPublications, locations, pendingScan: null })
+          await measureControllerAsync(run.generation, 'manifest-publish', () => this.#catalogStore.publish(committedCatalog))
+          this.#catalog = committedCatalog
           this.#manifestDurable = this.#catalogStore.lastPublicationDurable
+          run.published = true
           await this.#resumeStore.complete(run.publicationId).catch(() => false)
           this.#resume = undefined
           this.#savedConstruction = undefined
@@ -614,19 +753,22 @@ export class OrbisController {
         this.#resumeReceipt = undefined
         this.#rejectPendingReveals('Scan completed')
         this.#focusId = restoreFocus(this.#activeView ?? next, oldView, oldFocusId)
-        this.#target = next.target
+        this.#target = this.#selectedLocation().target
         this.#scanStatus = { status: 'completed', generation: run.generation, progress: null, totals: result.totals, error: null }
         const snapshot = measureController(run.generation, 'snapshot-total', () => this.#buildSnapshot(run.generation))
         this.#run = undefined
         try { await this.#estimateCache.store(next.target, estimateFromIndex(next)) } catch { /* A cache failure must not invalidate an exact index. */ }
         try { await measureControllerAsync(run.generation, 'partial-index-cleanup', () => this.#artifacts.discardUnreferencedDatabase(run.partialPath)) } catch { /* Shutdown retries owned cleanup. */ }
+        if (this.#manifestDurable) for (const file of obsoleteFiles) {
+          try { await measureControllerAsync(run.generation, 'previous-index-cleanup', () => this.#artifacts.discardUnreferencedDatabase(join(this.indexDirectory, file))) } catch { /* Later reconciliation retries cleanup. */ }
+        }
         if (old) {
           try { old.close() } catch { /* The new index remains authoritative. */ }
-          if (old.path !== next.path && (!persistent || this.#manifestDurable)) {
+          if (!persistent && old.path !== next.path) {
             try { await measureControllerAsync(run.generation, 'previous-index-cleanup', () => this.#artifacts.discardUnreferencedDatabase(old.path)) } catch { /* The new index remains authoritative. */ }
           }
-        } else if (persistent && this.#manifestDurable && oldManifest && oldManifest.indexFile !== manifest?.indexFile) {
-          try { await this.#artifacts.discardUnreferencedDatabase(join(this.indexDirectory, oldManifest.indexFile)) } catch { /* The new index remains authoritative. */ }
+        } else if (!persistent && oldManifest && oldManifest.indexFile !== manifest?.indexFile) {
+          try { await this.#artifacts.discardUnreferencedDatabase(join(this.indexDirectory, oldManifest.indexFile)) } catch { /* The reference result remains active. */ }
         }
         if (!this.#closed) measureController(run.generation, 'listener-notify', () => this.#emit(snapshot))
       } catch (error) {
@@ -639,6 +781,7 @@ export class OrbisController {
           this.#target = old?.target ?? run.target
           try { next?.close() } catch { /* Best effort while restoring the previous index. */ }
         }
+        await this.#clearPendingScan(run.publicationId).catch(() => undefined)
         await this.#artifacts.discardUnreferencedDatabase(result.publishedPath)
         this.#fail(run, error instanceof Error ? error.message : String(error))
       }
@@ -656,8 +799,9 @@ export class OrbisController {
     try {
       const nextManifest: IndexManifest = { ...manifest, journal }
       const publications = this.#catalog!.publications.map((item) => item.publicationId === nextManifest.publicationId ? nextManifest : item)
-      this.#catalog = nextCatalog(this.#catalog!, { publications, pendingScan: null })
-      await this.#catalogStore.publish(this.#catalog)
+      const committedCatalog = nextCatalog(this.#catalog!, { publications, pendingScan: null })
+      await this.#catalogStore.publish(committedCatalog)
+      this.#catalog = committedCatalog
       this.#manifestDurable = this.#catalogStore.lastPublicationDurable
       if (this.#run !== run || this.#closed) return
       this.#activeManifest = nextManifest
@@ -674,8 +818,15 @@ export class OrbisController {
     }
   }
 
+  async #clearPendingScan(scanId: string): Promise<void> {
+    if (!this.#catalog?.pendingScan || this.#catalog.pendingScan.scanId !== scanId) return
+    const next = nextCatalog(this.#catalog, { pendingScan: null })
+    await this.#catalogStore.publish(next)
+    this.#catalog = next
+  }
+
   async #removeStaleCandidate(path: string): Promise<void> {
-    await this.#artifacts.discardUnreferencedDatabase(path, { retain: this.#activeManifest ? [this.#activeManifest.indexFile] : [] })
+    await this.#artifacts.discardUnreferencedDatabase(path, { retain: this.#catalog ? this.#catalogStore.referencedIndexFiles(this.#catalog) : [] })
   }
 
   async #refreshResumeState(
@@ -728,7 +879,10 @@ export class OrbisController {
       await this.#refreshResumeState(run.generation, true)
       if (this.#closed || this.#generation !== run.generation || this.#run) return
       if (this.#resume) this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
-      else await this.#removeRunFiles(run)
+      else {
+        await this.#clearPendingScan(run.publicationId).catch(() => undefined)
+        await this.#removeRunFiles(run)
+      }
       this.#emit()
     }))
   }
@@ -759,10 +913,17 @@ export class OrbisController {
   }
 }
 
-function restoreFocus(next: DiskIndex | LocationIndexView, _previous: DiskIndex | LocationIndexView | undefined, previousFocusId: string | undefined): string {
+function restoreFocus(next: DiskIndex | LocationIndexView, previous: DiskIndex | LocationIndexView | undefined, previousFocusId: string | undefined): string {
   if (previousFocusId) {
     const stable = next.getNode(previousFocusId)
     if (stable?.kind === 'directory') return stable.id
+    let path = previous?.getNode(previousFocusId)?.path
+    while (path && isWithinPath(path, next.target)) {
+      const node = next.getNodeByPath(path)
+      if (node?.kind === 'directory') return node.id
+      if (path === next.target) break
+      path = resolve(path, '..')
+    }
   }
   return next.rootId
 }
@@ -783,6 +944,28 @@ function manifestFor(run: ScanRun, index: DiskIndex, journal: JournalCursor | nu
   }
 }
 
+
+function matchesManifest(index: DiskIndex, manifest: IndexManifest): boolean {
+  const metadata = index.metadata
+  return index.target === manifest.target
+    && metadata.schemaVersion === String(manifest.schemaVersion)
+    && metadata.indexRevision === String(manifest.indexRevision)
+    && metadata.targetDevice === manifest.targetDevice
+    && metadata.targetInode === manifest.targetInode
+    && metadata.accountingVersion === PERSISTENT_ACCOUNTING_VERSION
+    && metadata.exclusionPolicyVersion === EXCLUSION_POLICY_VERSION
+    && metadata.hardLinkOrderingVersion === HARD_LINK_ORDERING_VERSION
+}
+
+async function targetIdentityIsCompatible(manifest: IndexManifest): Promise<boolean> {
+  try {
+    const stats = await lstat(manifest.target)
+    return stats.isDirectory() && !stats.isSymbolicLink() && String(stats.dev) === manifest.targetDevice && String(stats.ino) === manifest.targetInode
+  } catch (error) {
+    const code = errorCode(error)
+    return isMissingPath(error) || code === 'EACCES' || code === 'EPERM' || code === 'EIO' || code === 'ENXIO'
+  }
+}
 
 async function indexDirectoryIdentityIsCompatible(index: DiskIndex, directory: string): Promise<boolean> {
   try {
@@ -860,13 +1043,6 @@ function isWithinPath(path: string, parent: string): boolean {
   const root = normalize(parent)
   const remainder = relative(root, child)
   return child === root || remainder !== '' && remainder !== '..' && !remainder.startsWith(`..${sep}`)
-}
-
-async function resolveInitialTarget(value: string): Promise<{ target: string; targetDevice: string; targetInode: string }> {
-  const target = normalize(resolve(value))
-  const stats = await lstat(target)
-  if (!stats.isDirectory() || stats.isSymbolicLink()) throw new Error('Choose a directory')
-  return { target, targetDevice: String(stats.dev), targetInode: String(stats.ino) }
 }
 
 async function resolveTarget(value: string): Promise<{ target: string; targetDevice: string; targetInode: string }> {

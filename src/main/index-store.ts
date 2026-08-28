@@ -203,6 +203,11 @@ export class LocationIndexView implements ChartDataSource {
     return this.#inside(node) ? node : undefined
   }
 
+  getNodeByPath(path: string): DatabaseNode | undefined {
+    const node = this.#readModel.getNodeByPath(path)
+    return this.#inside(node) ? node : undefined
+  }
+
   getChildren(id: string, limit: number): readonly DatabaseNode[] {
     if (!this.getNode(id)) return []
     return this.#readModel.getChildren(id, limit).filter((node) => this.#inside(node))

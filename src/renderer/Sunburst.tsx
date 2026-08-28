@@ -1,5 +1,6 @@
 import { useState } from "react"
 import type { ChartSegment, DirectoryScanState } from "../shared/contracts"
+import { formatBytes } from "./format-bytes"
 
 interface SunburstProps {
   readonly segments: readonly ChartSegment[]
@@ -111,13 +112,4 @@ function hash(value: string): number {
 
 function formatItemCount(value: number): string {
   return `${value.toLocaleString()} item${value === 1 ? "" : "s"}`
-}
-
-export function formatBytes(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return "0 B"
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"]
-  let amount = value
-  let unit = 0
-  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1 }
-  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unit]}`
 }

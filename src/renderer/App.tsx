@@ -7,8 +7,10 @@ import { Button } from "@moirasia/ui-react/components/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@moirasia/ui-react/components/card"
 import { Progress } from "@moirasia/ui-react/components/progress"
 import { AlertCircle, ChevronLeft, RefreshCw, Square } from "@moirasia/ui-react/lib/icons"
-import type { ChartSegment, NodeSummary, OrbisApi, OrbisSnapshot } from "../shared/contracts"
-import { Sunburst, formatBytes } from "./Sunburst"
+import type { ChartSegment, LocationId, NodeSummary, OrbisApi, OrbisSnapshot } from "../shared/contracts"
+import { formatBytes } from "./format-bytes"
+import { scanStatusPresentation } from "./scan-presentation"
+import { Sunburst } from "./Sunburst"
 
 interface SelectedNode {
   readonly id: string | null
@@ -54,6 +56,8 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
     catch (reason) { setError(message(reason)) }
   }
 
+  useEffect(() => { setSelected(undefined) }, [snapshot?.selectedLocationId])
+
   useEffect(() => {
     if (!snapshot || !selected?.id) return
     const segment = snapshot.chart.find((item) => item.id === selected.id)
@@ -69,6 +73,7 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
 
   const focus = snapshot?.focus
   const scan = snapshot?.scan
+  const selectedLocation = snapshot?.locations.find((location) => location.id === snapshot.selectedLocationId)
   const isScanning = scan?.status === "scanning"
   const diskRoot = Boolean(focus && snapshot?.target.isStartup && focus.id === snapshot.breadcrumbs[0]?.id)
   const displayTotal = useMemo(() => focus && snapshot ? (diskRoot ? snapshot.volume.capacityBytes : focus.sizeBytes) : 0, [diskRoot, focus, snapshot])
@@ -100,8 +105,10 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
   return <AppearanceScope appearance={appearance} className="orbis-feature-panel">
     {embeddedHeader && <header className="orbis-feature-panel__header"><strong>Orbis</strong><AppearanceToggle value={appearance} onChange={onAppearanceChange} /></header>}
     <DesktopPage width="full" scroll="contained" className="orbis-feature-panel__page">
-      <DesktopContentHeader title="Disk usage" description={snapshot ? `Scanning ${snapshot.target.name}` : "Read-only storage visualizer"} actions={<div className="orbis-feature-panel__actions">
-        <Button size="sm" variant="outline" onClick={() => void run(() => bridge.chooseFolder())}>Choose Folder</Button>
+      <DesktopContentHeader title="Disk usage" description={snapshot ? `${snapshot.target.name}${selectedLocation?.coverage === "ancestor" ? " · Shared parent index" : ""}` : "Read-only storage visualizer"} actions={<div className="orbis-feature-panel__actions">
+        {snapshot && <select aria-label="Saved location" value={snapshot.selectedLocationId} disabled={isScanning} onChange={(event) => void run(() => bridge.selectLocation(event.target.value as LocationId))}>{snapshot.locations.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select>}
+        <Button size="sm" variant="outline" onClick={() => void run(() => bridge.addLocation())} disabled={isScanning}>Add Folder</Button>
+        {snapshot && <Button size="sm" variant="outline" aria-label="Remove location" disabled={snapshot.locations.length <= 1 || isScanning || Boolean(scan?.resume?.available && scan.locationId === snapshot.selectedLocationId)} onClick={() => void run(() => bridge.removeLocation(snapshot.selectedLocationId))}>Remove</Button>}
         {isScanning ? <Button size="sm" variant="outline" onClick={() => void run(() => bridge.cancelScan())}><Square />Pause</Button> : <Button size="sm" onClick={() => void run(startOrRescan)}>{scan?.status === "idle" ? null : <RefreshCw />}{startOrRescanLabel}</Button>}
       </div>} />
       {error && <Alert variant="destructive" className="orbis-feature-panel__alert"><AlertCircle /><AlertTitle>Orbis could not complete that action</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
@@ -127,29 +134,11 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
 }
 
 function ScanStatus({ snapshot, onCancel, onRescan }: { readonly snapshot: OrbisSnapshot; readonly onCancel: () => void; readonly onRescan: () => void }): React.JSX.Element {
-  const progress = snapshot.scan.progress
-  const preparing = progress?.stage === "resuming"
-  const displayedBytes = scanStatusBytes(snapshot)
-  const activityText = progress ? `${progress.scannedItems.toLocaleString()} items · ${formatBytes(displayedBytes)}` : undefined
+  const presentation = scanStatusPresentation(snapshot)
   return <div className="orbis-feature-panel__scan-status" aria-live="polite">
-    <div className="orbis-feature-panel__scan-status-copy" data-committed={snapshot.committed}><strong>{snapshot.scan.status === "scanning" ? preparing ? "Preparing resume..." : progress?.stage === "indexing" ? "Building index…" : "Scanning…" : snapshot.scan.status === "completed" ? "Scan complete" : snapshot.scan.status === "canceled" ? snapshot.scan.resume?.available ? "Scan paused — progress saved" : "Scan canceled" : snapshot.scan.status === "fatal-error" ? "Scan unavailable" : "Waiting to scan"}</strong><span>{progress ? `${activityText} · ${progress.currentItem}` : snapshot.scan.totals ? `${snapshot.scan.totals.scannedItems.toLocaleString()} items · ${formatBytes(snapshot.scan.totals.discoveredBytes)} in ${(snapshot.scan.totals.elapsedMs / 1000).toFixed(1)}s` : snapshot.committed ? "Committed index" : "Live preview"}</span></div>
-    {snapshot.scan.status === "scanning" ? <><Progress value={scanProgressValue(snapshot)} max={100} className="orbis-feature-panel__scan-progress" aria-label={preparing ? "Resume preparation" : "Scan progress"} aria-valuetext={preparing ? progress?.currentItem : activityText} /><Button size="sm" variant="outline" onClick={onCancel}>Pause</Button></> : snapshot.scan.status === "canceled" ? <Button size="sm" onClick={onRescan}>{snapshot.scan.resume?.available ? "Resume" : "Rescan"}</Button> : null}
+    <div className="orbis-feature-panel__scan-status-copy" data-committed={snapshot.committed}><strong>{presentation.heading}</strong><span>{presentation.detail}</span></div>
+    {presentation.progress ? <><Progress value={presentation.progress.value} max={100} className="orbis-feature-panel__scan-progress" aria-label={presentation.progress.label} aria-valuetext={presentation.progress.valueText} /><Button size="sm" variant="outline" onClick={onCancel}>Pause</Button></> : snapshot.scan.status === "canceled" ? <Button size="sm" onClick={onRescan}>{snapshot.scan.resume?.available ? "Resume" : "Rescan"}</Button> : null}
   </div>
-}
-
-function scanStatusBytes(snapshot: OrbisSnapshot): number {
-  if (!snapshot.committed && snapshot.focus !== null) return snapshot.volume.scannedBytes
-  return snapshot.scan.progress?.discoveredBytes ?? 0
-}
-
-function scanProgressValue(snapshot: OrbisSnapshot): number {
-  if (snapshot.scan.status === "completed") return 100
-  const progress = snapshot.scan.progress
-  if (!progress) return 0
-  if (progress.stage === "resuming") return 4
-  if (progress.stage === "indexing") return 95
-  if (progress.scannedItems === 0) return 4
-  return Math.min(92, 8 + Math.log10(progress.scannedItems + 1) * 12)
 }
 
 function PermissionWarning({ snapshot, onOpen }: { readonly snapshot: OrbisSnapshot; readonly onOpen: () => void }): React.JSX.Element {

@@ -63,7 +63,6 @@ export class LocationCatalogStore {
   async initialize(): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 })
     await chmod(this.directory, 0o700)
-    await this.artifacts.reconcile()
   }
 
   paths(publicationId: string): LocationCatalogPaths {
