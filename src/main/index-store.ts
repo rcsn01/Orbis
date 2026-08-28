@@ -120,6 +120,7 @@ export class DiskIndex implements ChartDataSource {
   readonly target: string
   private readonly database: DatabaseSync
   private readonly readModel: NodeReadModel
+  private readonly locationNodeStatement: StatementSync
   #closed = false
 
   constructor(path: string) {
@@ -131,6 +132,7 @@ export class DiskIndex implements ChartDataSource {
     try {
       database.exec("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")
       this.readModel = new NodeReadModel(database, "committed")
+      this.locationNodeStatement = database.prepare(`${COMMITTED_NODE_SELECT.replace(" FROM nodes n", ", n.device, n.inode FROM nodes n")} WHERE n.path = ? AND n.kind = 'directory' AND n.device = ? AND n.inode = ?`)
       this.metadata = readMetadata(database)
       this.rootId = this.metadata.rootId ?? ""
       this.target = this.metadata.target ?? "/"
@@ -144,6 +146,14 @@ export class DiskIndex implements ChartDataSource {
   }
 
   get root(): DatabaseNode | undefined { return this.getNode(this.rootId) }
+
+  openLocationView(target: string, expected: { readonly device: string; readonly inode: string }): LocationIndexView | undefined {
+    if (!isAbsolute(target)) return undefined
+    const logicalTarget = normalize(target)
+    const row = this.locationNodeStatement.get(logicalTarget, expected.device, expected.inode) as unknown as Record<string, unknown> | undefined
+    if (!row || normalize(String(row.path)) !== logicalTarget) return undefined
+    return new LocationIndexView(logicalTarget, nodeFromRow(row), this.readModel)
+  }
 
   getNodeByPath(path: string): DatabaseNode | undefined { return this.readModel.getNodeByPath(path) }
 
@@ -168,6 +178,57 @@ export class DiskIndex implements ChartDataSource {
     if (this.#closed) return
     this.#closed = true
     this.database.close()
+  }
+}
+
+export class LocationIndexView implements ChartDataSource {
+  readonly target: string
+  readonly rootId: string
+  readonly root: DatabaseNode
+  readonly #readModel: NodeReadModel
+
+  constructor(target: string, root: DatabaseNode, readModel: NodeReadModel) {
+    this.target = target
+    this.root = root
+    this.rootId = root.id
+    this.#readModel = readModel
+  }
+
+  #inside(node: DatabaseNode | undefined): node is DatabaseNode {
+    return node !== undefined && isWithin(node.path, this.target)
+  }
+
+  getNode(id: string): DatabaseNode | undefined {
+    const node = this.#readModel.getNode(id)
+    return this.#inside(node) ? node : undefined
+  }
+
+  getChildren(id: string, limit: number): readonly DatabaseNode[] {
+    if (!this.getNode(id)) return []
+    return this.#readModel.getChildren(id, limit).filter((node) => this.#inside(node))
+  }
+
+  countChildren(id: string): number {
+    return this.getNode(id) ? this.#readModel.countChildren(id) : 0
+  }
+
+  getEstimatedRemainder(id: string): number {
+    return this.getNode(id) ? this.#readModel.getEstimatedRemainder(id) : 0
+  }
+
+  getLargestItems(id: string): readonly NodeSummary[] {
+    return this.getChildren(id, 100).map(toSummary)
+  }
+
+  getBreadcrumbs(id: string): readonly Breadcrumb[] {
+    if (!this.getNode(id)) return []
+    const breadcrumbs = this.#readModel.getBreadcrumbs(id)
+    const rootIndex = breadcrumbs.findIndex((item) => item.id === this.rootId)
+    return rootIndex < 0 ? [] : breadcrumbs.slice(rootIndex)
+  }
+
+  resolvePath(id: string): string | undefined {
+    return this.getNode(id)?.path
   }
 }
 

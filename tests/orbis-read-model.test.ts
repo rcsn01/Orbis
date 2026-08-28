@@ -136,6 +136,42 @@ describe('node read-model', () => {
     } finally { index.close() }
   })
 
+  it('opens a boundary-safe descendant location view at the public seam', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-read-model-location-'))
+    cleanup.push(directory)
+    const path = buildCommittedIndex(directory, true)
+    // A published descendant aggregate is authoritative; the view must not
+    // recompute it from whichever children happen to be visible.
+    const writable = new DatabaseSync(path)
+    try {
+      writable.prepare('UPDATE nodes SET size_bytes = ?, direct_children = ?, descendant_count = ? WHERE id = ?').run(777, 9, 12, 'n-dir')
+    } finally { writable.close() }
+
+    const index = new DiskIndex(path)
+    try {
+      const target = join(directory, 'root', 'dir')
+      const view = index.openLocationView(target, { device: '1', inode: '4' })
+      expect(view).toBeDefined()
+      expect(view).toMatchObject({ target, rootId: 'n-dir' })
+      expect(view!.root).toMatchObject({ id: 'n-dir', sizeBytes: 777, directChildren: 9, descendantCount: 12 })
+      expect(view!.getBreadcrumbs('n-dir')).toEqual([{ id: 'n-dir', name: 'dir' }])
+
+      // Ancestors and siblings belong to the publication, but not this
+      // logical root. This applies uniformly to reads and reveal paths.
+      expect(view!.getNode('n-root')).toBeUndefined()
+      expect(view!.getNode('n-small')).toBeUndefined()
+      expect(view!.getChildren('n-root', 100)).toEqual([])
+      expect(view!.countChildren('n-root')).toBe(0)
+      expect(view!.getLargestItems('n-root')).toEqual([])
+      expect(view!.resolvePath('n-small')).toBeUndefined()
+      expect(view!.resolvePath('n-dir')).toBe(target)
+
+      expect(index.openLocationView(target, { device: '1', inode: '999' })).toBeUndefined()
+      expect(index.openLocationView(target, { device: '999', inode: '4' })).toBeUndefined()
+      expect(index.openLocationView(join(directory, 'root', 'di'), { device: '1', inode: '4' })).toBeUndefined()
+    } finally { index.close() }
+  })
+
   it('fails closed on a corrupt parent chain for the committed variant', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-read-model-corrupt-'))
     cleanup.push(directory)
