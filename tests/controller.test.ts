@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto'
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { OrbisController } from "../src/main/controller"
 import type {
@@ -191,6 +191,8 @@ describe("OrbisController", () => {
         expect(restarted.snapshot().committed).toBe(false)
         await restarted.startScan()
         expect(restartedWorkers).toHaveLength(1)
+        await publish(restartedWorkers[0]!, restarted)
+        expect(restarted.snapshot().committed).toBe(true)
       } finally { await restarted.close() }
     } finally {
       await first.close()
@@ -221,6 +223,11 @@ describe("OrbisController", () => {
       const secondCompleted = new Promise<void>((resolveCompleted) => {
         const unsubscribe = controller.subscribe((snapshot) => { if (snapshot.scan.status === "completed" && snapshot.scan.generation === 2) { unsubscribe(); resolveCompleted() } })
       })
+      const candidateFile = basename(secondStart.publishedPath)
+      const scanId = candidateFile.slice('index-'.length, -'.sqlite'.length)
+      const partialFile = `index-${scanId}.partial.sqlite`
+      await writeFile(join(indexDirectory, partialFile), "saved construction")
+      await writeFile(join(indexDirectory, "scan-resume.json"), `${JSON.stringify({ scanId, partialFile, candidateFile })}\n`)
       workers[1]!.unchanged({
         journal: { uuid: "volume-journal", eventId: "12" }, totals: result.totals,
         basePublicationId: secondStart.active!.manifest.publicationId
@@ -231,6 +238,7 @@ describe("OrbisController", () => {
       const catalog = JSON.parse(await readFile(join(indexDirectory, "locations.json"), "utf8"))
       expect(catalog.publications[0].journal).toEqual({ uuid: "volume-journal", eventId: "12" })
       await expect(access(secondStart.publishedPath)).rejects.toThrow()
+      await expect(access(join(indexDirectory, "scan-resume.json"))).rejects.toThrow()
     } finally {
       await controller.close()
       await rm(indexDirectory, { recursive: true, force: true })
