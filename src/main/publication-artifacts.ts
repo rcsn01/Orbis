@@ -66,7 +66,7 @@ export class PublicationArtifacts {
       const directoriesToRemove: string[] = []
       for (const entry of entries) {
         const unlinkable = entry.isFile() || entry.isSymbolicLink()
-        if ((entry.name === 'current.json.tmp' || entry.name === 'scan-resume.json.tmp') && unlinkable) {
+        if ((entry.name === 'current.json.tmp' || entry.name === 'scan-resume.json.tmp' || entry.name === 'locations.json.tmp') && unlinkable) {
           entriesToUnlink.push(join(this.directory, entry.name))
           continue
         }
@@ -124,8 +124,8 @@ export class PublicationArtifacts {
       if (!isPublicationId(scanId) || !await safeDirectory(this.directory)) return false
       const locator = await readResumeLocator(this.resumePath)
       if (!locator || locator.scanId !== scanId) return false
-      const currentIndex = await readCurrentIndexLocator(this.manifestPath)
-      if (currentIndex === locator.candidateFile) return false
+      const retention = await this.#retention(undefined)
+      if (retention.has(locator.candidateFile)) return false
       await this.#removeDatabaseFamily(join(this.directory, locator.candidateFile))
       return true
     })
@@ -157,9 +157,9 @@ export class PublicationArtifacts {
       if (!await safeDirectory(this.directory) || expectedScanId !== undefined && !isPublicationId(expectedScanId)) return false
       const locator = await readResumeLocator(this.resumePath)
       if (!locator || expectedScanId !== undefined && locator.scanId !== expectedScanId) return false
-      const currentIndex = await readCurrentIndexLocator(this.manifestPath)
+      const retention = await this.#retention(undefined)
       await this.#removeDatabaseFamily(join(this.directory, locator.partialFile))
-      if (currentIndex !== locator.candidateFile) await this.#removeDatabaseFamily(join(this.directory, locator.candidateFile))
+      if (!retention.has(locator.candidateFile)) await this.#removeDatabaseFamily(join(this.directory, locator.candidateFile))
       const current = await readResumeLocator(this.resumePath)
       if (current?.scanId === locator.scanId) await this.#removeEntries([this.resumePath])
       await this.#removeEntries([`${this.resumePath}.tmp`])
@@ -168,11 +168,12 @@ export class PublicationArtifacts {
   }
 
   async #retention(extra: readonly string[] | undefined): Promise<Set<string>> {
-    const [current, resume] = await Promise.all([
+    const [current, resume, catalog] = await Promise.all([
       readCurrentIndexLocator(this.manifestPath),
-      readResumeLocator(this.resumePath)
+      readResumeLocator(this.resumePath),
+      readCatalogIndexLocators(join(this.directory, 'locations.json'))
     ])
-    const retained = new Set<string>()
+    const retained = new Set<string>(catalog)
     if (current) retained.add(current)
     if (resume) { retained.add(resume.partialFile); retained.add(resume.candidateFile) }
     for (const value of extra ?? []) {
@@ -225,6 +226,29 @@ async function readCurrentIndexLocator(path: string): Promise<string | undefined
   if (!value || !isPublicationId(value.publicationId)) return undefined
   const expected = `index-${value.publicationId}.sqlite`
   return value.indexFile === expected ? expected : undefined
+}
+
+async function readCatalogIndexLocators(path: string): Promise<readonly string[]> {
+  const value = await readRegularJson(path)
+  if (!value || value.version !== 1 || !Array.isArray(value.locations)) return []
+  const retained = new Set<string>()
+  const collect = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== 'object') return
+    const record = candidate as Record<string, unknown>
+    if (isPublicationId(record.publicationId)) {
+      const expected = `index-${record.publicationId}.sqlite`
+      if (record.indexFile === expected) retained.add(expected)
+    }
+    if (isPublicationId(record.scanId)) {
+      const files = publicationDatabaseFiles(record.scanId)
+      if (record.partialFile === files.partialFile) retained.add(files.partialFile)
+      if (record.candidateFile === files.candidateFile) retained.add(files.candidateFile)
+    }
+    for (const nested of Object.values(record)) collect(nested)
+  }
+  for (const location of value.locations) collect(location)
+  collect(value.pendingScan)
+  return [...retained]
 }
 
 async function readResumeLocator(path: string): Promise<RetentionLocator | undefined> {

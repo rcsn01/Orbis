@@ -54,6 +54,26 @@ describe('PublicationArtifacts', () => {
     for (const path of [orphan, `${orphan}-wal`, staging, `${staging}-journal`, reconciliation, join(indexes, 'current.json.tmp'), join(indexes, 'scan-resume.json.tmp')]) await expectMissing(path)
   })
 
+  it('retains every catalog publication and removes a stale catalog temporary file', async () => {
+    const { indexes, artifacts } = await fixture('catalog-retention')
+    const first = database(indexes, activeId)
+    const second = database(indexes, extraId)
+    const orphan = database(indexes, orphanId)
+    for (const path of [first, second, orphan]) await writeFile(path, 'data')
+    await writeFile(join(indexes, 'locations.json'), `${JSON.stringify({ version: 1, locations: [
+      { manifest: { publicationId: activeId, indexFile: `index-${activeId}.sqlite` } },
+      { manifest: { publicationId: extraId, indexFile: `index-${extraId}.sqlite` } }
+    ], pendingScan: null })}\n`)
+    await writeFile(join(indexes, 'locations.json.tmp'), 'stale')
+
+    await artifacts.reconcile()
+
+    await expect(access(first)).resolves.toBeUndefined()
+    await expect(access(second)).resolves.toBeUndefined()
+    await expectMissing(orphan)
+    await expectMissing(join(indexes, 'locations.json.tmp'))
+  })
+
   it('preserves directories that only resemble database or metadata files', async () => {
     const { indexes, artifacts } = await fixture('lookalike-directories')
     const databaseDirectory = database(indexes, orphanId)
