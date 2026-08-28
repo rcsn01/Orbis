@@ -33,7 +33,7 @@ function installApplicationMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: 'Orbis', submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { type: 'separator' }, { role: 'quit' }] },
     { label: 'File', submenu: [
-      { label: 'Choose Folder…', accelerator: 'CommandOrControl+O', click: () => void feature.chooseFolder().catch(reportMenuError) },
+      { label: 'Choose Folder…', accelerator: 'CommandOrControl+O', click: () => void feature.addLocation().catch(reportMenuError) },
       { label: 'Rescan', accelerator: 'CommandOrControl+R', click: () => void feature.rescan().catch(reportMenuError) },
       { type: 'separator' },
       { role: 'close' }

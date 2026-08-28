@@ -112,7 +112,7 @@ export class OrbisFeature implements MoirasiaFeature {
 
   setActive(_active: boolean): void { /* The shell surface owns tab state. */ }
 
-  async chooseFolder(): Promise<void> { await this.#controller?.chooseFolder() }
+  async addLocation(): Promise<void> { await this.#controller?.addLocation() }
   async rescan(): Promise<void> { await this.#controller?.rescan() }
 }
 
