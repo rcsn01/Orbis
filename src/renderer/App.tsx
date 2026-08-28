@@ -129,11 +129,27 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
 function ScanStatus({ snapshot, onCancel, onRescan }: { readonly snapshot: OrbisSnapshot; readonly onCancel: () => void; readonly onRescan: () => void }): React.JSX.Element {
   const progress = snapshot.scan.progress
   const preparing = progress?.stage === "resuming"
-  const percent = preparing ? 4 : progress && snapshot.volume.scannedBytes > 0 ? Math.min(99, progress.discoveredBytes / Math.max(progress.discoveredBytes, snapshot.volume.scannedBytes) * 100) : progress ? Math.min(95, progress.scannedItems > 0 ? 8 + Math.log10(progress.scannedItems + 1) * 12 : 4) : snapshot.scan.status === "completed" ? 100 : 0
+  const displayedBytes = scanStatusBytes(snapshot)
+  const activityText = progress ? `${progress.scannedItems.toLocaleString()} items · ${formatBytes(displayedBytes)}` : undefined
   return <div className="orbis-feature-panel__scan-status" aria-live="polite">
-    <div className="orbis-feature-panel__scan-status-copy" data-committed={snapshot.committed}><strong>{snapshot.scan.status === "scanning" ? preparing ? "Preparing resume..." : progress?.stage === "indexing" ? "Building index…" : "Scanning…" : snapshot.scan.status === "completed" ? "Scan complete" : snapshot.scan.status === "canceled" ? snapshot.scan.resume?.available ? "Scan paused — progress saved" : "Scan canceled" : snapshot.scan.status === "fatal-error" ? "Scan unavailable" : "Waiting to scan"}</strong><span>{progress ? `${progress.scannedItems.toLocaleString()} items · ${formatBytes(progress.discoveredBytes)} · ${progress.currentItem}` : snapshot.scan.totals ? `${snapshot.scan.totals.scannedItems.toLocaleString()} items · ${formatBytes(snapshot.scan.totals.discoveredBytes)} in ${(snapshot.scan.totals.elapsedMs / 1000).toFixed(1)}s` : snapshot.committed ? "Committed index" : "Live preview"}</span></div>
-    {snapshot.scan.status === "scanning" ? <><Progress value={percent} max={100} className="orbis-feature-panel__scan-progress" {...(preparing ? { "aria-label": "Resume preparation", "aria-valuetext": progress.currentItem } : {})} /><Button size="sm" variant="outline" onClick={onCancel}>Pause</Button></> : snapshot.scan.status === "canceled" ? <Button size="sm" onClick={onRescan}>{snapshot.scan.resume?.available ? "Resume" : "Rescan"}</Button> : null}
+    <div className="orbis-feature-panel__scan-status-copy" data-committed={snapshot.committed}><strong>{snapshot.scan.status === "scanning" ? preparing ? "Preparing resume..." : progress?.stage === "indexing" ? "Building index…" : "Scanning…" : snapshot.scan.status === "completed" ? "Scan complete" : snapshot.scan.status === "canceled" ? snapshot.scan.resume?.available ? "Scan paused — progress saved" : "Scan canceled" : snapshot.scan.status === "fatal-error" ? "Scan unavailable" : "Waiting to scan"}</strong><span>{progress ? `${activityText} · ${progress.currentItem}` : snapshot.scan.totals ? `${snapshot.scan.totals.scannedItems.toLocaleString()} items · ${formatBytes(snapshot.scan.totals.discoveredBytes)} in ${(snapshot.scan.totals.elapsedMs / 1000).toFixed(1)}s` : snapshot.committed ? "Committed index" : "Live preview"}</span></div>
+    {snapshot.scan.status === "scanning" ? <><Progress value={scanProgressValue(snapshot)} max={100} className="orbis-feature-panel__scan-progress" aria-label={preparing ? "Resume preparation" : "Scan progress"} aria-valuetext={preparing ? progress?.currentItem : activityText} /><Button size="sm" variant="outline" onClick={onCancel}>Pause</Button></> : snapshot.scan.status === "canceled" ? <Button size="sm" onClick={onRescan}>{snapshot.scan.resume?.available ? "Resume" : "Rescan"}</Button> : null}
   </div>
+}
+
+function scanStatusBytes(snapshot: OrbisSnapshot): number {
+  if (!snapshot.committed && snapshot.focus !== null) return snapshot.volume.scannedBytes
+  return snapshot.scan.progress?.discoveredBytes ?? 0
+}
+
+function scanProgressValue(snapshot: OrbisSnapshot): number {
+  if (snapshot.scan.status === "completed") return 100
+  const progress = snapshot.scan.progress
+  if (!progress) return 0
+  if (progress.stage === "resuming") return 4
+  if (progress.stage === "indexing") return 95
+  if (progress.scannedItems === 0) return 4
+  return Math.min(92, 8 + Math.log10(progress.scannedItems + 1) * 12)
 }
 
 function PermissionWarning({ snapshot, onOpen }: { readonly snapshot: OrbisSnapshot; readonly onOpen: () => void }): React.JSX.Element {

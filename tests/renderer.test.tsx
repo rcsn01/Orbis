@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react"
+import { act, cleanup, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../src/renderer/App"
@@ -101,6 +101,44 @@ describe("Orbis renderer", () => {
     expect(savedSegment).toBeVisible()
     publish?.(scanning)
     expect(await screen.findByText("Scanning…")).toBeVisible()
+  })
+
+  it("keeps scan status bytes and progress tied to the live preview", async () => {
+    const mismatched: OrbisSnapshot = {
+      ...scanning,
+      volume: { ...scanning.volume, scannedBytes: 128 * 1024 },
+      scan: { ...scanning.scan, progress: { ...scanning.scan.progress!, scannedItems: 400, discoveredBytes: 1_638_400 } }
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(mismatched)
+
+    render(<App />)
+    expect(await screen.findByText(/400 items · 128 KB · notes\.txt/)).toBeVisible()
+    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("128 KB")
+    const progress = screen.getByRole("progressbar", { name: "Scan progress" })
+    const progressValue = progress.getAttribute("aria-valuenow")
+    expect(progress).toHaveAttribute("aria-valuetext", "400 items · 128 KB")
+
+    const progressOnly: OrbisSnapshot = {
+      ...mismatched,
+      scan: { ...mismatched.scan, progress: { ...mismatched.scan.progress!, discoveredBytes: 2_097_152 } }
+    }
+    act(() => publish?.(progressOnly))
+    expect(screen.getByText(/400 items · 128 KB · notes\.txt/)).toBeVisible()
+    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("128 KB")
+    expect(progress).toHaveAttribute("aria-valuenow", progressValue)
+
+    const matchingPreview: OrbisSnapshot = {
+      ...progressOnly,
+      volume: { ...progressOnly.volume, scannedBytes: 2_097_152 }
+    }
+    act(() => publish?.(matchingPreview))
+    expect(screen.getByText(/400 items · 2\.0 MB · notes\.txt/)).toBeVisible()
+    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("2.0 MB")
+    expect(progress).toHaveAttribute("aria-valuenow", progressValue)
+    expect(progress).toHaveAttribute("aria-valuetext", "400 items · 2.0 MB")
+
+    act(() => publish?.({ ...matchingPreview, scan: { ...matchingPreview.scan, progress: { ...matchingPreview.scan.progress!, stage: "indexing" } } }))
+    expect(screen.getByRole("progressbar", { name: "Scan progress" })).toHaveAttribute("aria-valuenow", "95")
   })
 
   it("shows scan progress, supports keyboard segment activation, drill-down, file selection, and Finder reveal", async () => {
