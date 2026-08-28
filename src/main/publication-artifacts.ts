@@ -124,7 +124,7 @@ export class PublicationArtifacts {
       if (!isPublicationId(scanId) || !await safeDirectory(this.directory)) return false
       const locator = await readResumeLocator(this.resumePath)
       if (!locator || locator.scanId !== scanId) return false
-      const retention = await this.#retention(undefined)
+      const retention = await this.#publishedRetention()
       if (retention.has(locator.candidateFile)) return false
       await this.#removeDatabaseFamily(join(this.directory, locator.candidateFile))
       return true
@@ -157,7 +157,7 @@ export class PublicationArtifacts {
       if (!await safeDirectory(this.directory) || expectedScanId !== undefined && !isPublicationId(expectedScanId)) return false
       const locator = await readResumeLocator(this.resumePath)
       if (!locator || expectedScanId !== undefined && locator.scanId !== expectedScanId) return false
-      const retention = await this.#retention(undefined)
+      const retention = await this.#publishedRetention()
       await this.#removeDatabaseFamily(join(this.directory, locator.partialFile))
       if (!retention.has(locator.candidateFile)) await this.#removeDatabaseFamily(join(this.directory, locator.candidateFile))
       const current = await readResumeLocator(this.resumePath)
@@ -167,20 +167,29 @@ export class PublicationArtifacts {
     })
   }
 
-  async #retention(extra: readonly string[] | undefined): Promise<Set<string>> {
-    const [current, resume, catalog] = await Promise.all([
+  async #publishedRetention(): Promise<Set<string>> {
+    const [current, catalog] = await Promise.all([
       readCurrentIndexLocator(this.manifestPath),
-      readResumeLocator(this.resumePath),
-      readCatalogIndexLocators(join(this.directory, 'locations.json'))
+      readCatalogIndexLocators(join(this.directory, 'locations.json'), false)
     ])
     const retained = new Set<string>(catalog)
     if (current) retained.add(current)
-    if (resume) { retained.add(resume.partialFile); retained.add(resume.candidateFile) }
+    return retained
+  }
+
+  async #retention(extra: readonly string[] | undefined): Promise<Set<string>> {
+    const [published, resume, pending] = await Promise.all([
+      this.#publishedRetention(),
+      readResumeLocator(this.resumePath),
+      readCatalogIndexLocators(join(this.directory, 'locations.json'), true)
+    ])
+    for (const file of pending) published.add(file)
+    if (resume) { published.add(resume.partialFile); published.add(resume.candidateFile) }
     for (const value of extra ?? []) {
       const name = retainedDatabaseName(value, this.directory)
-      if (name) retained.add(name)
+      if (name) published.add(name)
     }
-    return retained
+    return published
   }
 
   #ownedDatabase(path: string): { readonly name: string; readonly path: string } | undefined {
@@ -228,26 +237,25 @@ async function readCurrentIndexLocator(path: string): Promise<string | undefined
   return value.indexFile === expected ? expected : undefined
 }
 
-async function readCatalogIndexLocators(path: string): Promise<readonly string[]> {
+async function readCatalogIndexLocators(path: string, includePending: boolean): Promise<readonly string[]> {
   const value = await readRegularJson(path)
-  if (!value || value.version !== 1 || !Array.isArray(value.locations)) return []
+  if (!value || value.version !== 1 || !Array.isArray(value.publications)) return []
   const retained = new Set<string>()
-  const collect = (candidate: unknown): void => {
-    if (!candidate || typeof candidate !== 'object') return
+  for (const candidate of value.publications) {
+    if (!candidate || typeof candidate !== 'object') continue
     const record = candidate as Record<string, unknown>
-    if (isPublicationId(record.publicationId)) {
-      const expected = `index-${record.publicationId}.sqlite`
-      if (record.indexFile === expected) retained.add(expected)
-    }
-    if (isPublicationId(record.scanId)) {
-      const files = publicationDatabaseFiles(record.scanId)
-      if (record.partialFile === files.partialFile) retained.add(files.partialFile)
-      if (record.candidateFile === files.candidateFile) retained.add(files.candidateFile)
-    }
-    for (const nested of Object.values(record)) collect(nested)
+    if (!isPublicationId(record.publicationId)) continue
+    const expected = `index-${record.publicationId}.sqlite`
+    if (record.indexFile === expected) retained.add(expected)
   }
-  for (const location of value.locations) collect(location)
-  collect(value.pendingScan)
+  if (includePending && value.pendingScan && typeof value.pendingScan === 'object') {
+    const scanId = (value.pendingScan as Record<string, unknown>).scanId
+    if (isPublicationId(scanId)) {
+      const files = publicationDatabaseFiles(scanId)
+      retained.add(files.partialFile)
+      retained.add(files.candidateFile)
+    }
+  }
   return [...retained]
 }
 

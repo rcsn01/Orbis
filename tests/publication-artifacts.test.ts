@@ -60,9 +60,9 @@ describe('PublicationArtifacts', () => {
     const second = database(indexes, extraId)
     const orphan = database(indexes, orphanId)
     for (const path of [first, second, orphan]) await writeFile(path, 'data')
-    await writeFile(join(indexes, 'locations.json'), `${JSON.stringify({ version: 1, locations: [
-      { manifest: { publicationId: activeId, indexFile: `index-${activeId}.sqlite` } },
-      { manifest: { publicationId: extraId, indexFile: `index-${extraId}.sqlite` } }
+    await writeFile(join(indexes, 'locations.json'), `${JSON.stringify({ version: 1, publications: [
+      { publicationId: activeId, indexFile: `index-${activeId}.sqlite` },
+      { publicationId: extraId, indexFile: `index-${extraId}.sqlite` }
     ], pendingScan: null })}\n`)
     await writeFile(join(indexes, 'locations.json.tmp'), 'stale')
 

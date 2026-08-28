@@ -1,38 +1,49 @@
 import { randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, open, readFile, rename, writeFile } from 'node:fs/promises'
-import { isAbsolute, join, normalize, resolve } from 'node:path'
-import type { FullScanResumeDescriptor } from './full-scan-resume'
+import { basename, isAbsolute, join, normalize, resolve } from 'node:path'
+import type { LocationId } from '../shared/contracts'
+import { isLocationId } from '../shared/contracts'
 import { isIndexManifest, type IndexManifest } from './index-manifest'
 import { isPublicationId, PublicationArtifacts, publicationDatabaseFiles } from './publication-artifacts'
 
-const LOCATION_ID = /^loc-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u
 const DECIMAL = /^(?:0|[1-9]\d*)$/u
 
 export interface SavedLocationRecord {
-  readonly id: string
+  readonly id: LocationId
   readonly target: string
   readonly targetDevice: string
   readonly targetInode: string
-  readonly manifest: IndexManifest
+  readonly displayName: string
+  readonly publicationId: string | null
 }
 
 export interface PendingScanRecord {
-  readonly id: string
+  readonly scanId: string
+  readonly locationId: LocationId
   readonly target: string
   readonly targetDevice: string
   readonly targetInode: string
-  readonly resume: FullScanResumeDescriptor
+  readonly basePublicationId: string | null
 }
 
 export interface LocationCatalogDocument {
   readonly version: 1
+  readonly revision: number
+  readonly selectedLocationId: LocationId
   readonly locations: readonly SavedLocationRecord[]
+  readonly publications: readonly IndexManifest[]
   readonly pendingScan: PendingScanRecord | null
 }
 
 export interface LocationCatalogPaths {
   readonly partialPath: string
   readonly indexPath: string
+}
+
+export interface ResolvedLocationTarget {
+  readonly target: string
+  readonly targetDevice: string
+  readonly targetInode: string
 }
 
 export class LocationCatalogStore {
@@ -62,8 +73,8 @@ export class LocationCatalogStore {
 
   async load(): Promise<LocationCatalogDocument | undefined> {
     try {
-      const stat = await lstat(this.catalogPath)
-      if (!stat.isFile() || stat.isSymbolicLink()) return undefined
+      const stats = await lstat(this.catalogPath)
+      if (!stats.isFile() || stats.isSymbolicLink()) return undefined
       const value = JSON.parse(await readFile(this.catalogPath, 'utf8')) as unknown
       return isLocationCatalogDocument(value) ? value : undefined
     } catch { return undefined }
@@ -81,88 +92,86 @@ export class LocationCatalogStore {
       const directory = await open(this.directory, 'r')
       try { await directory.sync() } finally { await directory.close() }
       this.lastPublicationDurable = true
-    } catch { /* Rename is the commit point; retain both recovery generations. */ }
+    } catch { /* The rename committed; callers retain both possible generations. */ }
   }
 
   referencedIndexFiles(document: LocationCatalogDocument): readonly string[] {
     if (!isLocationCatalogDocument(document)) throw new Error('Invalid Orbis location catalog')
-    return referencedIndexFiles(document)
-  }
-
-  build(locations: readonly SavedLocationRecord[] = [], pendingScan: PendingScanRecord | null = null): LocationCatalogDocument {
-    const document = { version: 1 as const, locations: [...locations], pendingScan }
-    if (!isLocationCatalogDocument(document)) throw new Error('Invalid Orbis location catalog')
-    return document
-  }
-
-  migrate(manifest: IndexManifest | undefined, resume: FullScanResumeDescriptor | undefined, initialTarget?: string): LocationCatalogDocument {
-    return migrateLocationCatalog(manifest, resume, initialTarget)
+    const files = new Set(document.publications.map((publication) => publication.indexFile))
+    if (document.pendingScan) {
+      const pending = publicationDatabaseFiles(document.pendingScan.scanId)
+      files.add(pending.partialFile)
+      files.add(pending.candidateFile)
+    }
+    return [...files]
   }
 }
 
-export function createLocationId(): string { return `loc-${randomUUID()}` }
+export function createLocationId(): LocationId { return `loc-${randomUUID()}` as LocationId }
 
-export function buildSavedLocation(manifest: IndexManifest, id = createLocationId()): SavedLocationRecord {
-  return { id, target: manifest.target, targetDevice: manifest.targetDevice, targetInode: manifest.targetInode, manifest }
-}
-
-export function buildPendingScan(resume: FullScanResumeDescriptor, id = createLocationId()): PendingScanRecord {
-  return { id, target: resume.target, targetDevice: resume.targetDevice, targetInode: resume.targetInode, resume }
-}
-
-export function migrateLocationCatalog(manifest?: IndexManifest, resume?: FullScanResumeDescriptor, initialTarget?: string): LocationCatalogDocument {
-  const locations = manifest && isIndexManifest(manifest) ? [buildSavedLocation(manifest)] : []
-  let pendingScan: PendingScanRecord | null = resume ? buildPendingScan(resume) : null
-  if (!pendingScan && initialTarget !== undefined && locations.length === 0) {
-    // An initial target has no durable identity yet and therefore cannot be
-    // persisted as a location. Canonicalise it here so callers can compare it.
-    canonicalPath(initialTarget)
+export function createEmptyCatalog(target: ResolvedLocationTarget): LocationCatalogDocument {
+  const location: SavedLocationRecord = {
+    id: createLocationId(), ...target, displayName: displayName(target.target), publicationId: null
   }
-  return { version: 1, locations, pendingScan }
+  return { version: 1, revision: 1, selectedLocationId: location.id, locations: [location], publications: [], pendingScan: null }
 }
 
-export function referencedIndexFiles(document: LocationCatalogDocument): readonly string[] {
-  const files = new Set<string>()
-  for (const location of document.locations) files.add(location.manifest.indexFile)
-  if (document.pendingScan) {
-    files.add(document.pendingScan.resume.partialFile)
-    files.add(document.pendingScan.resume.candidateFile)
+export function nextCatalog(document: LocationCatalogDocument, changes: Partial<Omit<LocationCatalogDocument, 'version' | 'revision'>>): LocationCatalogDocument {
+  const next: LocationCatalogDocument = { ...document, ...changes, version: 1, revision: document.revision + 1 }
+  if (!isLocationCatalogDocument(next)) throw new Error('Invalid Orbis location catalog transition')
+  return next
+}
+
+export function uniqueDisplayName(target: string, locations: readonly SavedLocationRecord[]): string {
+  const base = displayName(target)
+  const used = new Set(locations.map((location) => location.displayName))
+  if (!used.has(base)) return base
+  for (let suffix = 2; suffix < 10_000; suffix += 1) {
+    const candidate = `${base} (${suffix})`
+    if (!used.has(candidate)) return candidate
   }
-  return [...files]
+  throw new Error('Too many saved locations with the same name')
 }
 
 export function isLocationCatalogDocument(value: unknown): value is LocationCatalogDocument {
-  if (!value || typeof value !== 'object') return false
-  const document = value as Partial<LocationCatalogDocument>
-  if (document.version !== 1 || !Array.isArray(document.locations)) return false
-  if (document.pendingScan !== null && !isPending(document.pendingScan)) return false
-  const ids = new Set<string>(); const targets = new Set<string>(); const identities = new Set<string>()
-  for (const location of document.locations) {
-    if (!isSaved(location) || ids.has(location.id) || targets.has(location.target)) return false
-    const identity = `${location.targetDevice}:${location.targetInode}`
-    if (identities.has(identity)) return false
-    ids.add(location.id); targets.add(location.target); identities.add(identity)
+  if (!isRecord(value) || value.version !== 1 || !positiveInteger(value.revision)) return false
+  if (!isLocationId(value.selectedLocationId) || !Array.isArray(value.locations) || value.locations.length === 0 || !Array.isArray(value.publications)) return false
+  if (!value.locations.every(isSavedLocation) || !value.publications.every(isIndexManifest)) return false
+  const locationIds = new Set<string>()
+  const targets = new Set<string>()
+  for (const location of value.locations) {
+    if (locationIds.has(location.id) || targets.has(location.target)) return false
+    locationIds.add(location.id); targets.add(location.target)
   }
-  if (document.pendingScan && (ids.has(document.pendingScan.id) || targets.has(document.pendingScan.target) || identities.has(`${document.pendingScan.targetDevice}:${document.pendingScan.targetInode}`))) return false
+  if (!locationIds.has(value.selectedLocationId)) return false
+  const publicationIds = new Set<string>()
+  for (const publication of value.publications) {
+    if (publicationIds.has(publication.publicationId)) return false
+    publicationIds.add(publication.publicationId)
+  }
+  if (value.locations.some((location) => location.publicationId !== null && !publicationIds.has(location.publicationId))) return false
+  if (value.pendingScan !== null) {
+    if (!isPendingScan(value.pendingScan) || !locationIds.has(value.pendingScan.locationId)) return false
+    if (value.pendingScan.basePublicationId !== null && !publicationIds.has(value.pendingScan.basePublicationId)) return false
+  }
   return true
 }
 
-function isSaved(value: unknown): value is SavedLocationRecord {
-  if (!isRecord(value) || !validCommon(value) || !isIndexManifest(value.manifest)) return false
-  return value.manifest.target === value.target && value.manifest.targetDevice === value.targetDevice && value.manifest.targetInode === value.targetInode
+function isSavedLocation(value: unknown): value is SavedLocationRecord {
+  return isRecord(value) && isLocationId(value.id) && canonicalPath(value.target) !== undefined
+    && decimal(value.targetDevice) && decimal(value.targetInode)
+    && typeof value.displayName === 'string' && value.displayName.length > 0 && value.displayName.length <= 256
+    && (value.publicationId === null || isPublicationId(value.publicationId))
 }
 
-function isPending(value: unknown): value is PendingScanRecord {
-  if (!isRecord(value) || !validCommon(value) || !isRecord(value.resume)) return false
-  const resume = value.resume
-  if (resume.version !== 1 || !isPublicationId(resume.scanId)) return false
-  const files = publicationDatabaseFiles(resume.scanId)
-  return resume.partialFile === files.partialFile && resume.candidateFile === files.candidateFile && resume.target === value.target && resume.targetDevice === value.targetDevice && resume.targetInode === value.targetInode
+function isPendingScan(value: unknown): value is PendingScanRecord {
+  return isRecord(value) && isPublicationId(value.scanId) && isLocationId(value.locationId)
+    && canonicalPath(value.target) !== undefined && decimal(value.targetDevice) && decimal(value.targetInode)
+    && (value.basePublicationId === null || isPublicationId(value.basePublicationId))
 }
 
-function validCommon(value: Record<string, unknown>): boolean {
-  return typeof value.id === 'string' && LOCATION_ID.test(value.id) && typeof value.target === 'string' && canonicalPath(value.target) === value.target && decimal(value.targetDevice) && decimal(value.targetInode)
-}
+function displayName(target: string): string { return target === '/' ? '/' : basename(target) || target }
 function canonicalPath(value: unknown): string | undefined { return typeof value === 'string' && !value.includes('\0') && isAbsolute(value) && normalize(value) === value ? value : undefined }
-function decimal(value: unknown): boolean { return typeof value === 'string' && DECIMAL.test(value) && BigInt(value) <= 0xffff_ffff_ffff_ffffn }
-function isRecord(value: unknown): value is Record<string, unknown> { return !!value && typeof value === 'object' && !Array.isArray(value) }
+function decimal(value: unknown): value is string { return typeof value === 'string' && DECIMAL.test(value) && BigInt(value) <= 0xffff_ffff_ffff_ffffn }
+function positiveInteger(value: unknown): boolean { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 }
+function isRecord(value: unknown): value is Record<string, any> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
