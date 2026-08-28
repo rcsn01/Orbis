@@ -1,6 +1,6 @@
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent, type WebContents } from 'electron'
 import { sendToRenderer } from '@moirasia/desktop-shell/main'
-import { IPC, isNodeId } from '../shared/contracts'
+import { IPC, isLocationId, isNodeId, type LocationId } from '../shared/contracts'
 import type { OrbisController } from './controller'
 
 export interface OrbisIpcRegistrationOptions {
@@ -16,6 +16,10 @@ export function registerIpc(options: OrbisIpcRegistrationOptions): () => void {
   const authorize = (event: IpcMainInvokeEvent): void => {
     if (event.sender !== target || event.sender.isDestroyed()) throw new Error('Unauthorized IPC sender')
   }
+  const locationId = (value: unknown): LocationId => {
+    if (!isLocationId(value)) throw new TypeError('Invalid Orbis location id')
+    return value
+  }
   const nodeId = (value: unknown): string => {
     if (!isNodeId(value)) throw new TypeError('Invalid Orbis node id')
     return value
@@ -24,7 +28,9 @@ export function registerIpc(options: OrbisIpcRegistrationOptions): () => void {
   const handlers: Array<[string, Handler]> = [
     [IPC.getSnapshot, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.snapshot() }],
     [IPC.startScan, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.startScan() }],
-    [IPC.chooseFolder, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.chooseFolder() }],
+    [IPC.addLocation, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.addLocation() }],
+    [IPC.selectLocation, (event, id) => { authorize(event as IpcMainInvokeEvent); return options.controller.selectLocation(locationId(id)) }],
+    [IPC.removeLocation, (event, id) => { authorize(event as IpcMainInvokeEvent); return options.controller.removeLocation(locationId(id)) }],
     [IPC.cancelScan, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.cancelScan() }],
     [IPC.discardSavedScan, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.discardSavedScan() }],
     [IPC.rescan, (event) => { authorize(event as IpcMainInvokeEvent); return options.controller.rescan() }],

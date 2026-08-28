@@ -3,6 +3,14 @@ export type ScanStatus = "idle" | "scanning" | "completed" | "canceled" | "fatal
 export type NodeKind = "directory" | "file"
 export type DirectoryScanState = "queued" | "scanning" | "complete" | "unreadable"
 export type SizeAccuracy = "estimated" | "partial" | "exact"
+declare const locationIdBrand: unique symbol
+export type LocationId = string & { readonly [locationIdBrand]: true }
+
+export interface SavedLocationSummary {
+  readonly id: LocationId
+  readonly name: string
+  readonly coverage: "direct" | "ancestor" | "none"
+}
 
 export interface NodeSummary {
   readonly id: string
@@ -73,8 +81,10 @@ export interface VolumeSnapshot {
 }
 
 export interface OrbisSnapshot {
-  readonly version: 3
+  readonly version: 4
   readonly committed: boolean
+  readonly selectedLocationId: LocationId
+  readonly locations: readonly [SavedLocationSummary, ...SavedLocationSummary[]]
   readonly target: { readonly name: string; readonly isStartup: boolean }
   readonly focus: NodeSummary | null
   readonly breadcrumbs: readonly Breadcrumb[]
@@ -82,6 +92,7 @@ export interface OrbisSnapshot {
   readonly largestItems: readonly NodeSummary[]
   readonly volume: VolumeSnapshot
   readonly scan: {
+    readonly locationId: LocationId
     readonly status: ScanStatus
     readonly generation: number
     readonly progress: ProgressSnapshot | null
@@ -94,7 +105,9 @@ export interface OrbisSnapshot {
 export interface OrbisApi {
   getSnapshot(): Promise<OrbisSnapshot>
   startScan(): Promise<OrbisSnapshot>
-  chooseFolder(): Promise<OrbisSnapshot>
+  addLocation(): Promise<OrbisSnapshot>
+  selectLocation(id: LocationId): Promise<OrbisSnapshot>
+  removeLocation(id: LocationId): Promise<OrbisSnapshot>
   cancelScan(): Promise<OrbisSnapshot>
   discardSavedScan(): Promise<OrbisSnapshot>
   rescan(): Promise<OrbisSnapshot>
@@ -107,7 +120,9 @@ export interface OrbisApi {
 export const IPC = {
   getSnapshot: "orbis:get-snapshot",
   startScan: "orbis:start-scan",
-  chooseFolder: "orbis:choose-folder",
+  addLocation: "orbis:add-location",
+  selectLocation: "orbis:select-location",
+  removeLocation: "orbis:remove-location",
   cancelScan: "orbis:cancel-scan",
   discardSavedScan: "orbis:discard-saved-scan",
   rescan: "orbis:rescan",
@@ -121,23 +136,35 @@ export function isNodeId(value: unknown): value is string {
   return typeof value === "string" && /^n-[a-z0-9]+$/u.test(value) && value.length <= 80
 }
 
+export function isLocationId(value: unknown): value is LocationId {
+  return typeof value === "string" && /^loc-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)
+}
+
 export function isSizeAccuracy(value: unknown): value is SizeAccuracy {
   return value === "estimated" || value === "partial" || value === "exact"
 }
 
 export function isOrbisSnapshot(value: unknown): value is OrbisSnapshot {
-  if (!isRecord(value) || value.version !== 3 || typeof value.committed !== "boolean") return false
+  if (!isRecord(value) || value.version !== 4 || typeof value.committed !== "boolean") return false
+  if (!isLocationId(value.selectedLocationId) || !Array.isArray(value.locations) || value.locations.length === 0 || !value.locations.every(isSavedLocationSummary)) return false
+  const locationIds = new Set(value.locations.map((location: SavedLocationSummary) => location.id))
+  if (locationIds.size !== value.locations.length || !locationIds.has(value.selectedLocationId)) return false
   if (!isRecord(value.target) || typeof value.target.name !== "string" || typeof value.target.isStartup !== "boolean") return false
   if (value.focus !== null && !isNodeSummary(value.focus)) return false
   if (!Array.isArray(value.breadcrumbs) || !value.breadcrumbs.every(isBreadcrumb)) return false
   if (!Array.isArray(value.chart) || !value.chart.every(isChartSegment)) return false
   if (!Array.isArray(value.largestItems) || !value.largestItems.every(isNodeSummary)) return false
-  if (!isVolume(value.volume) || !isScan(value.scan)) return false
+  if (!isVolume(value.volume) || !isScan(value.scan) || !locationIds.has(value.scan.locationId)) return false
   return true
 }
 
+function isSavedLocationSummary(value: unknown): value is SavedLocationSummary {
+  return isRecord(value) && isLocationId(value.id) && typeof value.name === "string"
+    && (value.coverage === "direct" || value.coverage === "ancestor" || value.coverage === "none")
+}
+
 function isScan(value: unknown): boolean {
-  if (!isRecord(value)) return false
+  if (!isRecord(value) || !isLocationId(value.locationId)) return false
   const statuses: readonly ScanStatus[] = ["idle", "scanning", "completed", "canceled", "fatal-error"]
   if (!statuses.includes(value.status as ScanStatus) || !integer(value.generation) || value.generation < 0) return false
   if (value.progress !== null && !isProgress(value.progress)) return false
