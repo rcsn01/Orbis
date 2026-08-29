@@ -17,6 +17,12 @@ new symbols or writing docs.
   several saved locations and owns their shared scan revision, exclusion
   semantics, hard-link accounting domain, and FSEvents cursor.
 
+- **coverage publication access** — the process-local module that proves a
+  coverage publication can serve a saved location, owns the active published
+  index handle and location view, installs committed candidates, and owns
+  transient reference artifacts. It does not own catalog durability, scan
+  execution, Resume validation, or renderer navigation policy.
+
 - **published index** — a coverage publication used as a committed read-model
   source behind `DiskIndex`; it never contains pending nodes (`finalize()`
   throws on queued work, and the resume store's `validateCandidate` rejects
@@ -65,8 +71,17 @@ new symbols or writing docs.
   creation, private message ordering, ordered progress and previews, focus and
   live-node resolution, pause acknowledgement, termination, and stale-result
   cleanup. It ends by handing a finalized candidate or unchanged result to the
-  controller; published index validation and publication remain controller
-  responsibilities.
+  scan-run lifecycle. `CoveragePublicationAccess` validates and installs
+  completed publication candidates.
+
+- **scan run lifecycle** — the controller-side state machine above scan execution.
+  It owns run identity, the generation counter, staleness discipline, the reset
+  ritual (preview, saved construction, single-use resume receipt, pending
+  reveals), the renderer-visible scan status, the serialized start queue, and
+  sealed state. It decides when a run is terminal and hands publication outcomes
+  to injected catalog-side operations. It does not own the worker session,
+  catalog transactions, snapshot assembly, or renderer navigation policy. See
+  `ORBIS_SCAN_RUN_LIFECYCLE_PLAN.md`.
 
 - **publication-owned artifact** — a recognized direct child of the private
   indexes directory that Orbis may remove: a published index, construction

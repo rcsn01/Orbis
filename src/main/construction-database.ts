@@ -243,6 +243,7 @@ export class ConstructionDatabase implements ChartDataSource {
   readonly #onCheckpoint: ((reason: ConstructionCheckpointReason, sequence: number) => void) | undefined
   readonly #database: DatabaseSync
   readonly #insertNode: StatementSync
+  readonly #findNodeIdentity: StatementSync
   readonly #insertFileNodeBatch: StatementSync
   readonly #insertTask: StatementSync
   readonly #insertMetadata: StatementSync
@@ -439,6 +440,7 @@ export class ConstructionDatabase implements ChartDataSource {
         INSERT INTO nodes (id, parent_id, name, path, kind, own_bytes, size_bytes, device, inode, scan_state, enumeration_complete, depth)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
+      this.#findNodeIdentity = this.#database.prepare('SELECT parent_id AS parentId, name, path, kind FROM nodes WHERE id = ?')
       this.#insertFileNodeBatch = this.#database.prepare(`
         INSERT INTO nodes (id, parent_id, name, path, kind, own_bytes, size_bytes, device, inode, scan_state, enumeration_complete, depth)
         SELECT json_extract(value, '$.id'), json_extract(value, '$.parentId'), json_extract(value, '$.name'),
@@ -529,6 +531,20 @@ export class ConstructionDatabase implements ChartDataSource {
     this.#rootNodeId = node.id
     this.#insert(node, 0, "queued")
     this.#queue(node.id, node.path, 0, false)
+  }
+
+  isDuplicateChild(node: InsertNode): boolean {
+    this.#assertBuilding()
+    const pending = this.#metadataBatch.fileNodes.get(node.id)
+    const existing = pending
+      ? { parentId: pending.parentId, name: pending.name, path: pending.path, kind: 'file' as const }
+      : this.#findNodeIdentity.get(node.id) as unknown as { parentId: string | null; name: string; path: string; kind: InsertNode['kind'] } | undefined
+    if (!existing) return false
+    // Metadata can repeat across pages, so keep the first observation's
+    // accounting. A changed kind is not a repeat: it would create a row with
+    // incompatible traversal/accounting semantics under the same node ID.
+    if (existing.parentId === node.parentId && existing.name === node.name && existing.path === node.path && existing.kind === node.kind) return true
+    throw new Error(`Construction node ID collision for ${node.id}`)
   }
 
   insertChild(node: InsertNode, depth: number, focused: boolean): void {
@@ -728,6 +744,7 @@ export class ConstructionDatabase implements ChartDataSource {
 
     const { node, pathKey, linkCount } = entry.node
     const bytes = safeBytes(node.ownBytes)
+    if (this.isDuplicateChild(node)) return
     const needsHardLinkOwnership = node.kind === "file" && node.device !== "" && node.inode !== "" && linkCount !== 1
     if (needsHardLinkOwnership && node.parentId) this.insertHardLinkPath(node.parentId, node.name, pathKey, node.device, node.inode, bytes)
     let replacingOwner = false

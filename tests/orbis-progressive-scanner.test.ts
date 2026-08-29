@@ -83,6 +83,100 @@ describe('progressive Orbis scanner', () => {
     } finally { database.close() }
   })
 
+  it('ignores duplicate directory metadata names instead of failing on a duplicate node id', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-duplicate-node-id-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    await mkdir(root, { recursive: true })
+    const source: DirectoryMetadataSource = {
+      open: async (path) => {
+        let page = 0
+        return {
+          readPage: async () => {
+            if (path !== root) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
+            page += 1
+            return { entries: [metadataEntry('duplicate', 'directory')], done: page === 2, bulkEntries: 1, fallbackEntries: 0 }
+          },
+          close: async () => undefined
+        }
+      }
+    }
+
+    const result = await scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'),
+      indexDirectory: indexes, directoryMetadataSource: source
+    })
+    expect(result.totals.scannedItems).toBe(2)
+    const database = new DatabaseSync(result.publishedPath, { readOnly: true })
+    try {
+      expect(database.prepare('SELECT COUNT(*) AS count FROM nodes').get()).toEqual({ count: 2 })
+      expect(database.prepare('SELECT direct_children AS directChildren, descendant_count AS descendantCount FROM nodes WHERE parent_id IS NULL').get()).toEqual({ directChildren: 1, descendantCount: 1 })
+    } finally { database.close() }
+  })
+
+  it.each([
+    ['directory', 'file'],
+    ['file', 'directory']
+  ] as const)('rejects a same-path metadata collision that changes kind (%s to %s)', async (firstKind, secondKind) => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-kind-collision-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    await mkdir(root, { recursive: true })
+    const source: DirectoryMetadataSource = {
+      open: async (path) => {
+        let page = 0
+        return {
+          readPage: async () => {
+            if (path !== root) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
+            page += 1
+            return { entries: [metadataEntry('changing', page === 1 ? firstKind : secondKind)], done: page === 2, bulkEntries: 1, fallbackEntries: 0 }
+          },
+          close: async () => undefined
+        }
+      }
+    }
+
+    await expect(scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'),
+      indexDirectory: indexes, directoryMetadataSource: source
+    })).rejects.toThrow('Construction node ID collision')
+  })
+
+  it('deduplicates a repeated file after the metadata batch has flushed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-duplicate-file-id-'))
+    cleanup.push(directory)
+    const root = join(directory, 'root')
+    const indexes = join(directory, 'indexes')
+    await mkdir(root, { recursive: true })
+    const rootDevice = String((await lstat(root)).dev)
+    const source: DirectoryMetadataSource = {
+      open: async (path) => {
+        let page = 0
+        return {
+          readPage: async () => {
+            if (path !== root) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
+            page += 1
+            return { entries: [metadataEntry('duplicate.dat', 'file', { device: rootDevice, inode: '2', allocatedBytes: 512, linkCount: 1 })], done: page === 2, bulkEntries: 1, fallbackEntries: 0 }
+          },
+          close: async () => undefined
+        }
+      }
+    }
+
+    const result = await scanFilesystem({
+      generation: 1, target: root, partialPath: join(indexes, 'partial.sqlite'), publishedPath: join(indexes, 'index.sqlite'),
+      indexDirectory: indexes, directoryMetadataSource: source, onPreview: () => undefined
+    })
+    expect(result.totals).toMatchObject({ scannedItems: 2, discoveredBytes: 512 })
+    const database = new DatabaseSync(result.publishedPath, { readOnly: true })
+    try {
+      expect(database.prepare('SELECT COUNT(*) AS count FROM nodes').get()).toEqual({ count: 2 })
+      expect(database.prepare('SELECT direct_children AS directChildren, descendant_count AS descendantCount, size_bytes AS sizeBytes FROM nodes WHERE parent_id IS NULL').get()).toEqual({ directChildren: 1, descendantCount: 1, sizeBytes: 512 })
+    } finally { database.close() }
+  })
+
   it('persists direct directory observations without changing scan totals', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-observations-'))
     cleanup.push(directory)

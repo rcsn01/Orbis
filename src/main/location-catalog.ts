@@ -50,6 +50,9 @@ export interface CatalogScanOwnership {
   readonly scanId: string
   readonly locationId: LocationId
   readonly basePublicationId: string | null
+  /** Optional guards used when publication validation spans asynchronous filesystem probes. */
+  readonly expectedRevision?: number
+  readonly selectedLocationId?: LocationId
 }
 
 export interface CatalogCommit {
@@ -202,9 +205,14 @@ export class LocationCatalogStore {
     })
   }
 
-  async clearPendingScan(expectedScanId?: string): Promise<CatalogCommit> {
+  async clearPendingScan(
+    expectedScanId?: string,
+    guards: { readonly expectedRevision?: number; readonly selectedLocationId?: LocationId } = {}
+  ): Promise<CatalogCommit> {
     return this.#serialized(async () => {
       const document = this.current
+      if (guards.expectedRevision !== undefined && document.revision !== guards.expectedRevision) throw new Error('The pending catalog snapshot is stale')
+      if (guards.selectedLocationId !== undefined && document.selectedLocationId !== guards.selectedLocationId) throw new Error('The selected location changed while clearing the pending scan')
       if (!document.pendingScan) return { document, durability: this.#directoryDurabilityEstablished ? 'durable' : 'uncertain', cleanupPending: false }
       if (expectedScanId !== undefined && document.pendingScan.scanId !== expectedScanId) throw new Error('The scan no longer owns the pending catalog transaction')
       return this.#commit({ ...document, revision: document.revision + 1, pendingScan: null }, document)
@@ -214,6 +222,8 @@ export class LocationCatalogStore {
   async commitPublication(publication: IndexManifest, coveredLocationIds: readonly LocationId[], ownership: CatalogScanOwnership): Promise<CatalogCommit> {
     return this.#transition((document) => {
       const pending = document.pendingScan
+      if (ownership.expectedRevision !== undefined && document.revision !== ownership.expectedRevision) throw new Error('The publication catalog snapshot is stale')
+      if (ownership.selectedLocationId !== undefined && document.selectedLocationId !== ownership.selectedLocationId) throw new Error('The selected location changed during publication')
       if (!pending || pending.scanId !== publication.publicationId || pending.scanId !== ownership.scanId
         || pending.locationId !== ownership.locationId || pending.basePublicationId !== ownership.basePublicationId) throw new Error('The publication does not own the pending scan')
       const covered = new Set(coveredLocationIds)

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { describe, expect, it } from "vitest"
 import { OrbisController } from "../src/main/controller"
+import type { OrbisSnapshot } from "../src/shared/contracts"
 import type {
   FocusOutcome, ResolveNodeOutcome, ScanExecution, ScanExecutionRequest, ScanOutcome, ScanSession, ScanUpdate
 } from "../src/main/scan-execution"
@@ -534,6 +535,34 @@ describe("OrbisController", () => {
     }
   })
 
+  it("notifies the started scan exactly once before worker startup runs", async () => {
+    const target = await makeTarget("started-order")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-started-order-index-"))
+    const execution = new DeferredScanExecution()
+    const controller = new OrbisController(execution, { indexDirectory, initialTarget: target.target })
+    try {
+      const snapshots: OrbisSnapshot[] = []
+      controller.subscribe((snapshot) => snapshots.push(snapshot))
+      const started = controller.startScan()
+      await execution.started.promise
+      // The controller publishes the started scan before the queued worker
+      // startup callback runs, and that first turn carries exactly one event.
+      expect(snapshots).toHaveLength(1)
+      expect(snapshots[0]).toMatchObject({ scan: { status: "scanning", generation: 1 } })
+      const snapshot = await started
+      expect(snapshot).toMatchObject({ scan: { status: "scanning", generation: 1 } })
+      const session = new FakeScanSession()
+      session.begin(execution.request!, 1)
+      execution.session.resolve(session)
+      await controller.close()
+      expect(session.terminated).toBe(true)
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
   it('carries an acknowledged pause receipt into the next worker only once', async () => {
     const target = await makeTarget('resume-receipt')
     const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-resume-receipt-index-'))
@@ -763,6 +792,71 @@ describe("OrbisController", () => {
       await controller.revealNode(file.id)
       expect(revealed).toEqual([await realpath(join(target.target, "file.txt"))])
     } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
+  it("maps each lifecycle transition to one renderer snapshot and returns the applied state", async () => {
+    const target = await makeTarget("lifecycle-façade")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-lifecycle-façade-index-"))
+    const workers: FakeScanSession[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    const snapshots: OrbisSnapshot[] = []
+    controller.subscribe((snapshot) => snapshots.push(snapshot))
+    try {
+      const started = await controller.startScan()
+      expect(snapshots).toHaveLength(1)
+      expect(started).toEqual(snapshots[0])
+      expect(started.scan).toMatchObject({ status: "scanning", generation: 1 })
+
+      const canceled = await controller.cancelScan()
+      expect(snapshots).toHaveLength(2)
+      expect(canceled).toEqual(snapshots[1])
+      expect(canceled.scan.status).toBe("canceled")
+      expect(workers[0]!.terminated).toBe(true)
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it("keeps shutdown idempotent and makes post-shutdown subscriptions inert", async () => {
+    const target = await makeTarget("shutdown-contract")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-shutdown-contract-index-"))
+    const controller = createController({ create: () => new FakeScanSession() }, { indexDirectory, initialTarget: target.target })
+    let notifications = 0
+    controller.subscribe(() => { notifications += 1 })
+    try {
+      await controller.initialize()
+      await controller.close()
+      await controller.close()
+      const unsubscribe = controller.subscribe(() => { notifications += 1 })
+      await expect(controller.startScan()).rejects.toThrow("Orbis is shutting down")
+      unsubscribe()
+      expect(notifications).toBe(0)
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it("uses the selected target for the next run after publication", async () => {
+    const target = await makeTarget("publication-target-reset")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-publication-target-reset-index-"))
+    const workers: FakeScanSession[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await controller.startScan()
+      await publish(workers[0]!, controller)
+      expect(controller.snapshot().target.name).toBe("target")
+      await controller.rescan()
+      expect(workers[1]!.startMessage().target).toBe(await realpath(target.target))
+      await controller.cancelScan()
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
   })
 })
 

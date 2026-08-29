@@ -176,8 +176,8 @@ export class DiskIndex implements ChartDataSource {
 
   close(): void {
     if (this.#closed) return
-    this.#closed = true
     this.database.close()
+    this.#closed = true
   }
 }
 
