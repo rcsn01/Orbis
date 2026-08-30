@@ -46,6 +46,18 @@ class FakeScanSession implements ScanSession {
   }
 }
 
+class BlockingFailureSession extends FakeScanSession {
+  readonly pauseEntered = testDeferred<void>()
+  readonly releasePause = testDeferred<void>()
+
+  async pause(): Promise<ScanOutcome> {
+    this.terminated = true
+    this.pauseEntered.resolve(undefined)
+    await this.releasePause.promise
+    return this.result
+  }
+}
+
 class FakeScanExecution implements ScanExecution {
   #active: FakeScanSession | undefined
   #generation = 0
@@ -698,6 +710,133 @@ describe("OrbisController", () => {
       await failed
       for (const path of [start.partialPath, start.publishedPath]) await expectDatabaseFilesAbsent(path)
       expect(workers[0]!.terminated).toBe(true)
+    } finally {
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it('does not race a rescan with failed-run catalog cleanup', async () => {
+    const target = await makeTarget('failed-rescan-race')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-failed-rescan-race-index-'))
+    const workers: FakeScanSession[] = []
+    let created = 0
+    let failedWorker: BlockingFailureSession | undefined
+    const controller = createController({ create: () => {
+      const worker = created++ === 0 ? new BlockingFailureSession() : new FakeScanSession()
+      workers.push(worker)
+      if (worker instanceof BlockingFailureSession) failedWorker = worker
+      return worker
+    } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await controller.startScan()
+      const first = failedWorker!
+      first.fail(new Error('scan failed'))
+      await first.pauseEntered.promise
+
+      const rescanning = controller.rescan()
+      first.releasePause.resolve(undefined)
+      await expect(rescanning).resolves.toMatchObject({ scan: { status: 'scanning' } })
+      expect(workers).toHaveLength(2)
+    } finally {
+      failedWorker?.releasePause.resolve(undefined)
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it('seals cleanly while failed-run cleanup is still stopping the worker', async () => {
+    const target = await makeTarget('failed-cleanup-shutdown')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-failed-cleanup-shutdown-index-'))
+    let failedWorker: BlockingFailureSession | undefined
+    const controller = createController({ create: () => {
+      const worker = new BlockingFailureSession()
+      failedWorker = worker
+      return worker
+    } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await controller.startScan()
+      failedWorker!.fail(new Error('scan failed'))
+      await failedWorker!.pauseEntered.promise
+
+      const closing = controller.close()
+      failedWorker!.releasePause.resolve(undefined)
+      await expect(closing).resolves.toBeUndefined()
+      expect(failedWorker!.terminated).toBe(true)
+    } finally {
+      failedWorker?.releasePause.resolve(undefined)
+      await controller.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it('releases a pending owner on restart when no Resume artifact exists', async () => {
+    const target = await makeTarget('restart-without-resume')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-restart-without-resume-index-'))
+    const firstWorkers: FakeScanSession[] = []
+    const first = createController({ create: () => { const worker = new FakeScanSession(); firstWorkers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      await first.startScan()
+      await first.close()
+
+      const restartedWorkers: FakeScanSession[] = []
+      const restarted = createController({ create: () => { const worker = new FakeScanSession(); restartedWorkers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+      try {
+        await restarted.initialize()
+        const snapshot = await restarted.rescan()
+        expect(snapshot.scan.status).toBe('scanning')
+        expect(restartedWorkers).toHaveLength(1)
+      } finally { await restarted.close() }
+    } finally {
+      await first.close()
+      await rm(indexDirectory, { recursive: true, force: true })
+      await rm(target.directory, { recursive: true, force: true })
+    }
+  })
+
+  it('retains a valid saved construction after failure and restart', async () => {
+    const target = await makeTarget('failed-restart-resume')
+    const indexDirectory = await mkdtemp(join(tmpdir(), 'orbis-controller-failed-restart-resume-index-'))
+    const targetStats = await lstat(target.target)
+    const indexStats = await lstat(indexDirectory)
+    const store = new FullScanResumeStore(indexDirectory)
+    const scanId = 'd4234567-89ab-4cde-8fab-0123456789ab'
+    const descriptor = store.descriptor({
+      scanId, target: target.target, targetDevice: String(targetStats.dev), targetInode: String(targetStats.ino),
+      indexDirectoryIdentity: `${String(indexStats.dev)}:${String(indexStats.ino)}`, startupRoot: false,
+      checkpoint: { device: String(targetStats.dev), journalUuid: 'journal', eventId: '0' }
+    })
+    const database = ConstructionDatabase.create(join(indexDirectory, descriptor.partialFile), {
+      scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid, journalBaseline: descriptor.journalBaseline
+    })
+    const rootId = `n-${createHmac('sha256', Buffer.from(database.nodeIdSeed, 'hex')).update('root').update('\0').update(target.target).digest('hex').slice(0, 32)}`
+    database.insertRoot({ id: rootId, parentId: null, name: 'target', path: target.target, kind: 'directory', ownBytes: 8, device: String(targetStats.dev), inode: String(targetStats.ino) })
+    database.finish({ kind: 'pause' })
+    await store.publish(descriptor)
+
+    const workers: FakeScanSession[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target })
+    try {
+      const canceled = new Promise<void>((resolveCanceled) => {
+        const unsubscribe = controller.subscribe((snapshot) => {
+          if (snapshot.scan.status === 'canceled' && snapshot.scan.generation === 1) { unsubscribe(); resolveCanceled() }
+        })
+      })
+      const resuming = await controller.rescan()
+      expect(resuming).toMatchObject({ focus: { name: 'target' }, scan: { status: 'scanning' } })
+      workers[0]!.fail(new Error('scan failed after checkpoint'))
+      await canceled
+      expect(controller.snapshot()).toMatchObject({ scan: { resume: { available: true } }, focus: { name: 'target' } })
+      await controller.close()
+
+      const restarted = createController({ create: () => new FakeScanSession() }, { indexDirectory, initialTarget: target.target })
+      try {
+        await restarted.initialize()
+        expect(restarted.snapshot()).toMatchObject({ scan: { status: 'canceled', resume: { available: true } }, focus: { name: 'target' } })
+      } finally { await restarted.close() }
     } finally {
       await controller.close()
       await rm(indexDirectory, { recursive: true, force: true })

@@ -179,6 +179,7 @@ export class ScanRunLifecycle {
   #activeTarget: string
   #pendingRevealCancellations = new Set<(error: Error) => void>()
   #pendingTasks = new Set<Promise<void>>()
+  #pendingFailureCleanup: Promise<void> | undefined
   #queue: Promise<void> = Promise.resolve()
   #listeners = new Set<(transition: ScanLifecycleTransition) => void>()
 
@@ -317,6 +318,8 @@ export class ScanRunLifecycle {
   async #startScanSerial(target: string): Promise<ScanLifecycleState> {
     if (this.#sealed) throw new Error('Orbis is shutting down')
     await this.#deps.ensureInitialized()
+    await this.#awaitFailureCleanup()
+    if (this.#sealed) throw new Error('Orbis is shutting down')
     if (this.#run && this.#run.target !== target) throw new Error('Pause and discard the saved scan before choosing another folder')
     const previous = this.#run
     if (previous?.completed) await Promise.allSettled([...this.#pendingTasks])
@@ -400,6 +403,8 @@ export class ScanRunLifecycle {
 
   async #pauseSerial(): Promise<ScanLifecycleState> {
     if (this.#sealed) return this.state
+    await this.#awaitFailureCleanup()
+    if (this.#sealed) return this.state
     const run = this.#run
     if (!run) return this.state
     if (run.completed) {
@@ -426,6 +431,8 @@ export class ScanRunLifecycle {
   }
 
   async #discardSerial(): Promise<ScanLifecycleState> {
+    if (this.#sealed) return this.state
+    await this.#awaitFailureCleanup()
     if (this.#sealed) return this.state
     const run = this.#run
     const changed =
@@ -575,7 +582,7 @@ export class ScanRunLifecycle {
     this.#savedConstruction = run.durableConstruction
     this.#rejectPendingReveals('Scan failed')
     this.#scanStatus = { status: 'fatal-error', generation: run.generation, progress: null, totals: null, error }
-    this.#track(this.#stopRun(run).then(async () => {
+    const cleanup = this.#stopRun(run).then(async () => {
       await this.#refreshResumeState(run.generation, true)
       if (this.#sealed || this.#generation !== run.generation || this.#run) return
       if (this.#resume) this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
@@ -585,7 +592,12 @@ export class ScanRunLifecycle {
         await this.#deps.discardUnreferencedDatabase(run.publishedPath)
       }
       this.#notify('failed', run.generation)
-    }))
+    }).catch(() => undefined)
+    this.#pendingFailureCleanup = cleanup
+    void cleanup.then(() => {
+      if (this.#pendingFailureCleanup === cleanup) this.#pendingFailureCleanup = undefined
+    })
+    this.#track(cleanup)
   }
 
   // --- resume state ----------------------------------------------------------------------
@@ -630,6 +642,11 @@ export class ScanRunLifecycle {
   }
 
   // --- helpers ---------------------------------------------------------------------------
+
+  async #awaitFailureCleanup(): Promise<void> {
+    const cleanup = this.#pendingFailureCleanup
+    if (cleanup) await cleanup
+  }
 
   async #stopRun(run: LifecycleRun): Promise<ScanOutcome> {
     try {
