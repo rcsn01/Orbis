@@ -70,6 +70,18 @@ export interface NativeMetadataAddon {
 
 export type NativeOrbisAddon = Partial<NativeMetadataAddon> & Record<string, unknown>
 
+export type NativeAddonLoadStatus = "not-requested" | "loaded" | "load-failed" | "unknown"
+export type NativeAddonCapability = "unknown" | "available" | "missing" | "disabled"
+
+export interface NativeAddonStatus {
+  readonly loadStatus: NativeAddonLoadStatus
+  readonly journalCapability: NativeAddonCapability
+  readonly metadataCapability: NativeAddonCapability
+  readonly errorCode?: string
+}
+
+export type NativeAddonProbe = (status: NativeAddonStatus) => void
+
 export class NodeDirectoryMetadataSource implements DirectoryMetadataSource {
   readonly #fileSystem: ScanFileSystem & { opendir?: (path: string) => Promise<NodeDirectoryHandle> }
   readonly #metadataMapper: OrderedConcurrentMapper
@@ -223,26 +235,56 @@ export function decodeNativePage(page: NativeMetadataPage): DirectoryMetadataPag
   return { entries, done: Boolean(page.done), bulkEntries, fallbackEntries }
 }
 
-export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, _fileSystem: ScanFileSystem, metadataConcurrency: number, target: string): DirectoryMetadataSource | undefined {
+export function createDirectoryMetadataSource(addon: NativeMetadataAddon | undefined, _fileSystem: ScanFileSystem, metadataConcurrency: number,
+  target: string, probe?: NativeAddonProbe): DirectoryMetadataSource | undefined {
   if (!addon || process.env.ORBIS_DISABLE_BULK_METADATA === "1") return undefined
-  return new BulkExactMetadataSource(addon.openMetadataTree(target), target, metadataConcurrency)
+  try { return new BulkExactMetadataSource(addon.openMetadataTree(target), target, metadataConcurrency) }
+  catch (error) {
+    emitNativeProbe(probe, { loadStatus: "loaded", journalCapability: "unknown", metadataCapability: "missing", ...errorCode(error) })
+    return undefined
+  }
 }
 
-export async function loadNativeMetadataAddon(path: string | undefined): Promise<NativeMetadataAddon | undefined> {
-  if (process.env.ORBIS_DISABLE_BULK_METADATA === "1") return undefined
-  const addon = await loadNativeOrbisAddon(path)
-  return addon && typeof addon.openMetadataTree === "function" ? addon as NativeMetadataAddon : undefined
+export async function loadNativeMetadataAddon(path: string | undefined, probe?: NativeAddonProbe): Promise<NativeMetadataAddon | undefined> {
+  const addon = await loadNativeOrbisAddon(path, probe)
+  return addon && process.env.ORBIS_DISABLE_BULK_METADATA !== "1" && typeof addon.openMetadataTree === "function"
+    ? addon as NativeMetadataAddon : undefined
 }
 
-export async function loadNativeOrbisAddon(path: string | undefined): Promise<NativeOrbisAddon | undefined> {
-  if (!path) return undefined
+export async function loadNativeOrbisAddon(path: string | undefined, probe?: NativeAddonProbe): Promise<NativeOrbisAddon | undefined> {
+  if (!path) {
+    emitNativeProbe(probe, {
+      loadStatus: "not-requested", journalCapability: "unknown",
+      metadataCapability: process.env.ORBIS_DISABLE_BULK_METADATA === "1" ? "disabled" : "unknown"
+    })
+    return undefined
+  }
   try {
     const require = createRequire(import.meta.url)
     const loaded = require(path) as NativeOrbisAddon & { default?: NativeOrbisAddon }
-    return loaded.default ?? loaded
-  } catch {
+    const addon = loaded.default ?? loaded
+    emitNativeProbe(probe, {
+      loadStatus: "loaded",
+      journalCapability: typeof addon.captureVolumeCheckpoint === "function" && typeof addon.readChanges === "function" ? "available" : "missing",
+      metadataCapability: process.env.ORBIS_DISABLE_BULK_METADATA === "1" ? "disabled" : typeof addon.openMetadataTree === "function" ? "available" : "missing"
+    })
+    return addon
+  } catch (error) {
+    emitNativeProbe(probe, {
+      loadStatus: "load-failed", journalCapability: "missing",
+      metadataCapability: process.env.ORBIS_DISABLE_BULK_METADATA === "1" ? "disabled" : "missing", ...errorCode(error)
+    })
     return undefined
   }
+}
+
+function emitNativeProbe(probe: NativeAddonProbe | undefined, status: NativeAddonStatus): void {
+  try { probe?.(status) } catch { /* Diagnostics must never affect scanning. */ }
+}
+
+function errorCode(error: unknown): { readonly errorCode?: string } {
+  const value = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+  return typeof value === "string" && /^[A-Za-z0-9._-]{1,64}$/u.test(value) ? { errorCode: value } : {}
 }
 
 interface NodeDirectoryHandle {

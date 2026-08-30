@@ -1,4 +1,4 @@
-import type { OrbisSnapshot } from "../shared/contracts"
+import type { OrbisSnapshot, VolumeSnapshot } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
 
 export interface ScanStatusPresentation {
@@ -45,9 +45,19 @@ function scanStatusHeading(snapshot: OrbisSnapshot): string {
   return "Waiting to scan"
 }
 
-function scanStatusBytes(snapshot: OrbisSnapshot): number {
-  if (!snapshot.committed && snapshot.focus !== null) return snapshot.volume.scannedBytes
-  return snapshot.scan.progress?.discoveredBytes ?? 0
+export function displayedVolume(snapshot: OrbisSnapshot): VolumeSnapshot {
+  const scannedBytes = scanStatusBytes(snapshot)
+  const unscannedBytes = snapshot.target.isStartup
+    ? Math.max(0, snapshot.volume.capacityBytes - snapshot.volume.freeBytes - scannedBytes)
+    : snapshot.volume.unscannedBytes
+  return { ...snapshot.volume, scannedBytes, unscannedBytes }
+}
+
+export function scanStatusBytes(snapshot: OrbisSnapshot): number {
+  const progress = snapshot.scan.progress
+  const liveProgress = !snapshot.committed && progress !== null
+    && (progress.stage === "traversing" || progress.stage === "indexing")
+  return liveProgress ? Math.max(snapshot.volume.scannedBytes, progress.discoveredBytes) : snapshot.volume.scannedBytes
 }
 
 function scanProgressValue(snapshot: OrbisSnapshot): number {

@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FSEVENT_FLAGS, type ChangeJournal } from '../src/main/change-journal'
 import type { IndexManifest } from '../src/main/index-manifest'
 import { createResumeJournalDrain, refreshPersistentIndex, type RefreshRequest } from '../src/main/refresh-engine'
@@ -270,7 +270,83 @@ describe('Orbis refresh engine', () => {
     expect(rows(outcome.result.publishedPath)).toEqual(rows(fresh.publishedPath))
   })
 
-  it('bounds resume-invalidated restarts and then fails via the reconciliation retry cap', async () => {
+  it('preserves a resumable construction when a scheduled journal drain is invalidated', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    try {
+      const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-resume-invalidation-'))
+      cleanup.push(directory)
+      const target = join(directory, 'target')
+      const indexes = join(directory, 'indexes')
+      await mkdir(target, { recursive: true })
+      await mkdir(indexes, { recursive: true })
+      const file = join(target, 'file')
+      await writeFile(file, 'value')
+      const targetStats = await lstat(target, { bigint: true })
+      const fileStats = await lstat(file, { bigint: true })
+      let historyUnavailable = true
+      const journal: ChangeJournal = {
+        captureCheckpoint: () => ({ device: String(targetStats.dev), journalUuid: 'invalidation-journal', eventId: '10' }),
+        readChanges: (_target, cursor) => historyUnavailable
+          ? { throughEventId: cursor.eventId, events: [], requiresFullScan: true, reason: 'kernel-dropped' }
+          : { throughEventId: cursor.eventId, events: [], requiresFullScan: false }
+      }
+      const metadataSource = {
+        open: async () => {
+          let read = false
+          return {
+            readPage: async () => {
+              if (read) return { entries: [], done: true, bulkEntries: 0, fallbackEntries: 0 }
+              read = true
+              vi.setSystemTime(30_001)
+              return {
+                entries: [{ name: 'file', kind: 'file' as const, device: String(fileStats.dev), inode: String(fileStats.ino),
+                  allocatedBytes: Number(fileStats.blocks ?? 0) * 512, mountPoint: false }],
+                done: true, bulkEntries: 1, fallbackEntries: 0
+              }
+            },
+            close: async () => undefined
+          }
+        },
+        close: async () => undefined
+      }
+      const id = '7a234567-89ab-4cde-8fab-0123456789ab'
+      const partialPath = join(indexes, `index-${id}.partial.sqlite`)
+      const publishedPath = join(indexes, `index-${id}.sqlite`)
+      const request = {
+        generation: 1, target, indexDirectory: indexes, partialPath, publishedPath,
+        changeJournal: journal, directoryMetadataSource: metadataSource
+      }
+
+      await expect(refreshPersistentIndex(request)).rejects.toThrow('resume-invalidated:kernel-dropped')
+      const store = new FullScanResumeStore(indexes)
+      const saved = await store.load(target)
+      expect(saved.kind).toBe('construction')
+      if (saved.kind !== 'construction') throw new Error('Expected a construction resume state')
+      expect(saved.drainedThrough).toBe('10')
+      expect(saved.checkpointSequence).toBeGreaterThan(1)
+      const partialInode = (await lstat(partialPath)).ino
+      const database = new DatabaseSync(partialPath, { readOnly: true })
+      try { expect(database.prepare('SELECT phase FROM scan_run WHERE singleton = 1').get()).toEqual({ phase: 'paused' }) }
+      finally { database.close() }
+      await expect(access(publishedPath)).rejects.toThrow()
+
+      await expect(refreshPersistentIndex({ ...request, generation: 2 })).rejects.toThrow('resume-history-unavailable:kernel-dropped')
+      const stillSaved = await store.load(target)
+      expect(stillSaved.kind).toBe('construction')
+      if (stillSaved.kind !== 'construction') throw new Error('Expected the paused construction to remain resumable')
+      expect((await lstat(partialPath)).ino).toBe(partialInode)
+
+      historyUnavailable = false
+      const outcome = await refreshPersistentIndex({ ...request, generation: 3 })
+      expect(outcome).toMatchObject({ kind: 'candidate', strategy: 'full', journal: { uuid: 'invalidation-journal', eventId: '10' } })
+      expect((await lstat(publishedPath)).ino).toBe(partialInode)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves the construction instead of retrying a resume-invalidated drain', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'orbis-refresh-resume-bounded-'))
     cleanup.push(directory)
     const target = join(directory, 'target')
@@ -291,8 +367,10 @@ describe('Orbis refresh engine', () => {
     await expect(refreshPersistentIndex({
       generation: 1, target, indexDirectory: indexes, partialPath: join(indexes, `index-${id}.partial.sqlite`),
       publishedPath: join(indexes, `index-${id}.sqlite`), changeJournal: journal
-    })).rejects.toThrow('Unable to close the full-scan FSEvents window: kernel-dropped')
-    expect(reads).toBe(4)
+    })).rejects.toThrow('resume-invalidated:kernel-dropped')
+    expect(reads).toBe(1)
+    const saved = await new FullScanResumeStore(indexes).load(target)
+    expect(saved.kind).toBe('construction')
   })
 
   it('advances only the manifest cursor when no target events exist', async () => {

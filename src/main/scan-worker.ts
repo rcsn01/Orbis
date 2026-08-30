@@ -7,6 +7,7 @@ import {
   type OrbisTimingEvent, type ResumePreparationPhase, type ResumeReceiptFallbackReason, type ScanCounterRecord
 } from "./diagnostics"
 import type { WorkerMessage, WorkerStartMessage } from './scan-execution-protocol'
+import type { NativeAddonStatus } from './scan-metadata'
 
 if (!parentPort) throw new Error("Orbis scan worker requires a parent port")
 const port = parentPort
@@ -60,6 +61,7 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
   let firstMetadataPage = false
   let firstMetadataPreview = false
   let acceptedPages = 0
+  let lastNativeAddonStatus: string | undefined
   const postResumeMilestone = (milestone: 'preparation-started' | 'first-metadata-page' | 'first-metadata-preview'): void => {
     if (active === run) port.postMessage({ type: 'resume-milestone', generation: message.generation, requestId: run.lastRequestId, milestone })
   }
@@ -80,7 +82,17 @@ async function execute(message: WorkerStartMessage, run: NonNullable<typeof acti
       ...(message.active ? { active: message.active } : {}),
       signal: run.abort.signal, control: run.control,
       ...nativeAddonPath(), ...referenceScan(),
-      onCheckpoint: (sequence) => { run.checkpointSequence = sequence; run.checkpointCount += 1 },
+      onCheckpointNotice: (notice) => {
+        run.checkpointSequence = notice.sequence
+        run.checkpointCount = notice.count
+        if (active === run) port.postMessage({ type: 'checkpoint', generation: message.generation, requestId: run.lastRequestId, checkpoint: notice })
+      },
+      onNativeAddonStatus: (status: NativeAddonStatus) => {
+        const serialized = JSON.stringify(status)
+        if (serialized === lastNativeAddonStatus) return
+        lastNativeAddonStatus = serialized
+        if (active === run) port.postMessage({ type: 'native-addon-status', generation: message.generation, requestId: run.lastRequestId, status })
+      },
       onResumeMilestone: (milestone) => {
         if (milestone === 'first-metadata-page') firstMetadataPage = true
         postResumeMilestone(milestone)

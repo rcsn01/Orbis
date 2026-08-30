@@ -15,7 +15,7 @@ import { isPublicationId, PublicationArtifacts, publicationDatabaseFiles } from 
 
 export const FULL_SCAN_CONSTRUCTION_VERSION = 1
 // Version 1 used `traversing`; version 2 owns explicit lifecycle phases.
-export const FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION = 3
+export const FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION = 4
 const SUPPORTED_CONSTRUCTION_SCHEMA_VERSIONS = new Set([FULL_SCAN_CONSTRUCTION_SCHEMA_VERSION])
 export const SCAN_RESUME_FILE = 'scan-resume.json'
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER)

@@ -1,9 +1,11 @@
 import { BrowserWindow, dialog, shell, type WebContents } from 'electron'
+import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { validateFeatureResources, type EmbeddedFeatureSurface, type FeatureContext, type MoirasiaFeature } from '@moirasia/desktop-shell/feature'
 import { desktopWindowChromeOptions, neutralWindowBackground, registerProductAppearance } from '@moirasia/desktop-shell/main'
 import { OrbisController } from './controller'
 import { WorkerScanExecution, type WorkerTransportFactory } from './scan-execution'
+import { ScanFailureDiagnosticsStore } from './scan-failure-diagnostics'
 import { registerIpc } from './ipc'
 
 export class OrbisFeature implements MoirasiaFeature {
@@ -25,7 +27,8 @@ export class OrbisFeature implements MoirasiaFeature {
     const dataDirectory = ctx.paths.dataDirectory
     if (!workerPath || !dataDirectory) throw new Error('Orbis feature resources are incomplete')
 
-    const controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, nativeAddonPath)), {
+    const diagnostics = new ScanFailureDiagnosticsStore(join(dataDirectory, 'indexes'))
+    const controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, nativeAddonPath), { diagnostics }), {
       dataDirectory,
       ...(process.env.ORBIS_SCAN_ROOT ? { initialTarget: process.env.ORBIS_SCAN_ROOT } : {}),
       ...(ctx.mode === 'standalone'

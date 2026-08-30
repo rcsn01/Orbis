@@ -2,7 +2,7 @@
 
 ## Stage 1 instrumentation
 
-Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and retains the aggregate-fallback counter as a legacy compatibility field. The validator also accepts the old optional aggregate-fallback phase, but new reports never emit it. Schema-7 reports below are historical artifacts.
+Stage 1 records the current resume path before validation and recovery are optimized. Report schema 8 separates enclosing phases, nested work, elapsed milestones, and retains the aggregate-fallback counter as a legacy compatibility field. The validator also accepts the old optional aggregate-fallback phase, but new reports never emit it. Schema-7 reports below are historical artifacts. The Stage 1–5 measurements in this document predate construction schema 4's retention-based replay. They remain useful as historical benchmark records, but their scoped-deletion and bounded-repair descriptions are not the current recovery contract; see `../architecture/orbis-progressive-scanning.md` for current resume behavior.
 
 ### Timing interpretation
 
@@ -97,7 +97,7 @@ The requested one-sample schema-7 checks also passed on the dirty tree. They cla
 
 These small runs validate report shape and lifecycle counters, not performance.
 
-## Stage 5 bounded aggregate results
+## Historical Stage 5 bounded aggregate results
 
 Stage 5 uses one prepared direct-child equation update per affected directory, in descending depth order. A scoped equation mismatch aborts the recovery transaction; resume never runs a global aggregate rebuild.
 

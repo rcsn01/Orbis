@@ -38,11 +38,11 @@ function snapshot(input: {
 }
 
 describe("scan status presentation", () => {
-  it("uses preview bytes for visible and accessible activity while a live preview exists", () => {
+  it("uses live traversal bytes for visible and accessible activity while a preview exists", () => {
     expect(scanStatusPresentation(snapshot({ previewBytes: 128 * 1024 }))).toEqual({
       heading: "Scanning…",
-      detail: "400 items · 128 KB · notes.txt",
-      progress: { value: 8 + Math.log10(401) * 12, label: "Scan progress", valueText: "400 items · 128 KB" }
+      detail: "400 items · 1.6 MB · notes.txt",
+      progress: { value: 8 + Math.log10(401) * 12, label: "Scan progress", valueText: "400 items · 1.6 MB" }
     })
   })
 

@@ -1,7 +1,8 @@
 import type { ProgressSnapshot } from '../shared/contracts'
 import type { OrbisTimingEvent, ResumeMilestone, ResumePreparationPhase, ResumeReceiptFallbackReason, ScanCounterRecord } from './diagnostics'
 import type { JournalCursor } from './index-manifest'
-import type { FolderSizeEstimate } from './scan-metadata'
+import type { FolderSizeEstimate, NativeAddonStatus } from './scan-metadata'
+import type { ConstructionCheckpointNotice } from './construction-database'
 import type { ProgressivePreview, ScanResult, ScanTotals } from './scanner'
 import type { ActivePersistentIndex } from './refresh-engine'
 import type { ResumeValidationReceipt } from './full-scan-resume'
@@ -31,6 +32,8 @@ export interface WorkerProgressMessage { readonly type: 'progress'; readonly gen
 export interface WorkerPreviewMessage { readonly type: 'preview'; readonly generation: number; readonly requestId: number; readonly preview: ProgressivePreview }
 export interface WorkerResumeMilestoneMessage { readonly type: 'resume-milestone'; readonly generation: number; readonly requestId: number; readonly milestone: ResumeMilestone }
 export interface WorkerResumePreparationMessage { readonly type: 'resume-preparation'; readonly generation: number; readonly requestId: number; readonly phase: ResumePreparationPhase }
+export interface WorkerCheckpointMessage { readonly type: 'checkpoint'; readonly generation: number; readonly requestId: number; readonly checkpoint: ConstructionCheckpointNotice }
+export interface WorkerNativeAddonStatusMessage { readonly type: 'native-addon-status'; readonly generation: number; readonly requestId: number; readonly status: NativeAddonStatus }
 export interface WorkerResolvedNodeMessage { readonly type: 'resolved-node'; readonly generation: number; readonly requestId: number; readonly path: string | null }
 export interface WorkerFocusAcceptedMessage { readonly type: 'focus-accepted'; readonly generation: number; readonly requestId: number; readonly accepted: boolean }
 export interface WorkerCompleteMessage {
@@ -59,4 +62,4 @@ export interface WorkerDiagnosticsMessage {
   readonly counters: ScanCounterRecord
   readonly resumeReceiptFallbackReasons?: readonly ResumeReceiptFallbackReason[]
 }
-export type WorkerResultMessage = WorkerProgressMessage | WorkerPreviewMessage | WorkerResumeMilestoneMessage | WorkerResumePreparationMessage | WorkerResolvedNodeMessage | WorkerFocusAcceptedMessage | WorkerCompleteMessage | WorkerUnchangedMessage | WorkerCanceledMessage | WorkerPausedMessage | WorkerErrorMessage | WorkerDiagnosticsMessage
+export type WorkerResultMessage = WorkerProgressMessage | WorkerPreviewMessage | WorkerResumeMilestoneMessage | WorkerResumePreparationMessage | WorkerCheckpointMessage | WorkerNativeAddonStatusMessage | WorkerResolvedNodeMessage | WorkerFocusAcceptedMessage | WorkerCompleteMessage | WorkerUnchangedMessage | WorkerCanceledMessage | WorkerPausedMessage | WorkerErrorMessage | WorkerDiagnosticsMessage

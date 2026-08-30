@@ -12,12 +12,13 @@ import {
   type ConstructionInput,
   type ConstructionPage,
   type ConstructionPageResult,
+  type ConstructionCheckpointNotice,
   type DirectoryTask
 } from "./construction-database"
 import type { FullScanResumeDescriptor, FullScanResumeStore } from './full-scan-resume'
 import {
   createDirectoryMetadataSource, loadNativeMetadataAddon, NodeDirectoryMetadataSource,
-  type DirectoryMetadataCursor, type DirectoryMetadataSource, type FolderSizeEstimate
+  type DirectoryMetadataCursor, type DirectoryMetadataSource, type FolderSizeEstimate, type NativeAddonProbe
 } from "./scan-metadata"
 import {
   DEFAULT_METADATA_CONCURRENCY, STARTUP_EXCLUSIONS, ScanCanceledError,
@@ -50,6 +51,13 @@ export interface ProgressivePreview {
   readonly volume: VolumeSnapshot
 }
 
+export class ResumeJournalInvalidatedError extends Error {
+  constructor(readonly reason: string) {
+    super(`resume-invalidated:${reason}`)
+    this.name = 'ResumeJournalInvalidatedError'
+  }
+}
+
 export interface ProgressiveScanOptions extends ScanOptions {
   readonly control: ProgressiveScanControl
   readonly resumable?: {
@@ -62,6 +70,8 @@ export interface ProgressiveScanOptions extends ScanOptions {
   readonly directoryMetadataSource?: DirectoryMetadataSource
   readonly nativeAddonPath?: string
   readonly onCheckpoint?: (sequence: number) => void
+  readonly onCheckpointNotice?: (notice: ConstructionCheckpointNotice) => void
+  readonly onNativeAddonStatus?: NativeAddonProbe
   readonly onResumeMilestone?: (milestone: ResumeMilestone) => void
   readonly onResumePreparation?: (phase: ResumePreparationPhase) => void | Promise<void>
   readonly onMetadataPageAccepted?: () => void
@@ -125,7 +135,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
   const fileSystem = options.fileSystem ?? nativeFileSystem
   const metadataConcurrency = resolveConcurrency(options.metadataConcurrency)
   const metadataBatchSize = resolveMetadataBatchSize(options.metadataBatchSize)
-  const nativeAddon = await loadNativeMetadataAddon(options.nativeAddonPath)
+  const nativeAddon = await loadNativeMetadataAddon(options.nativeAddonPath, options.onNativeAddonStatus)
   const nodeMetadataSource = new NodeDirectoryMetadataSource(fileSystem, metadataConcurrency)
   let bulkMetadataSource = options.directoryMetadataSource
   const startedAt = Date.now()
@@ -193,7 +203,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     throw error
   }
 
-  bulkMetadataSource ??= createDirectoryMetadataSource(nativeAddon, fileSystem, metadataConcurrency, preflight.target)
+  bulkMetadataSource ??= createDirectoryMetadataSource(nativeAddon, fileSystem, metadataConcurrency, preflight.target, options.onNativeAddonStatus)
 
   let rootId = ''
   let activeElapsedBefore = 0
@@ -205,7 +215,10 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     if (options.resumable?.resume) {
       await options.onResumePreparation?.('recovering')
       database = measureScan('resume-database-open', () => ConstructionDatabase.openResumable(options.partialPath, {
-        candidatePath: options.publishedPath, onCheckpoint: (_reason, sequence) => options.onCheckpoint?.(sequence)
+        candidatePath: options.publishedPath, onCheckpoint: (notice: ConstructionCheckpointNotice) => {
+          options.onCheckpointNotice?.(notice)
+          options.onCheckpoint?.(notice.sequence)
+        }
       }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
@@ -234,7 +247,10 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       database = measureScan('database-create', () => ConstructionDatabase.create(options.partialPath, {
         scanId: descriptor.scanId, journalDevice: descriptor.journalDevice, journalUuid: descriptor.journalUuid,
         journalBaseline: descriptor.journalBaseline, candidatePath: options.publishedPath,
-        onCheckpoint: (_reason, sequence) => options.onCheckpoint?.(sequence)
+        onCheckpoint: (notice: ConstructionCheckpointNotice) => {
+          options.onCheckpointNotice?.(notice)
+          options.onCheckpoint?.(notice.sequence)
+        }
       }))
       key = Buffer.from(database.nodeIdSeed, 'hex')
       rootId = nodeId('root', preflight.target)
@@ -270,7 +286,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       let journalDrain: ConstructionCheckpointRequest['journalDrain']
       if (drainDue && options.drainResumeJournal) {
         const drain = options.drainResumeJournal(database.drainedThrough)
-        if (drain.restartReason) throw new Error(`resume-invalidated:${drain.restartReason}`)
+        if (drain.restartReason) throw new ResumeJournalInvalidatedError(drain.restartReason)
         journalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
         lastJournalDrainAt = now
       }
@@ -328,7 +344,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
           throwIfCanceled(options.signal)
           const task = read.task
           if (!read.ok) {
-            const delta = workTimings.aggregation.measure(() => database!.accept({ kind: 'unreadable', taskId: task.id, disappearing: isDisappearing(read.error) }))
+            const delta = workTimings.aggregation.measure(() => database!.accept({ kind: 'unreadable', taskId: task.id, disappearing: isDisappearing(read.error), enumerationEpoch: task.enumerationEpoch }))
             addConstructionTotals(totals, delta)
             const firstResumePage = reportAcceptedMetadataPage()
             checkpointDue()
@@ -361,11 +377,13 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
     let finalJournalDrain: ConstructionCheckpointRequest['journalDrain']
     if (options.resumable && options.drainResumeJournal) {
       const drain = options.drainResumeJournal(database.drainedThrough)
-      if (drain.restartReason) throw new Error(`resume-invalidated:${drain.restartReason}`)
+      if (drain.restartReason) throw new ResumeJournalInvalidatedError(drain.restartReason)
       finalJournalDrain = { scopes: drain.scopes, throughEventId: drain.throughEventId }
     }
     const root = database.getNode(rootId)
     if (!root || root.scanState !== "complete" && root.scanState !== "unreadable") throw new Error("Progressive scan root did not reach a terminal state")
+    const finalSemantic = database.semanticTotals()
+    rebaseConstructionTotals(totals, finalSemantic, Boolean(options.resumable))
     reporter.progress(displayName(preflight.target), true, "indexing")
     if (options.resumable) {
       const dirtyScopes = [...new Set([...database.dirtyScopes, ...(finalJournalDrain?.scopes ?? [])])].sort()
@@ -443,10 +461,12 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
             ...(journalDrain ? { journalDrain } : {})
           })
           void result
+        } else if (error instanceof ResumeJournalInvalidatedError) {
+          // The failed drain never advanced the watermark. Preserve all
+          // committed traversal work at the last trusted cursor so a later
+          // Resume can validate the missing history before continuing.
+          failedDatabase.finish({ kind: 'pause', activeElapsedDeltaMs: Math.max(0, Date.now() - lastCheckpointAt) })
         } else {
-          if (error instanceof Error && error.message.startsWith('resume-invalidated:') && options.drainResumeJournal) {
-            try { options.drainResumeJournal(failedDatabase.drainedThrough) } catch { /* The original invalidation remains authoritative. */ }
-          }
           failedDatabase.finish({ kind: 'unexpected-failure', cause: error })
         }
       } catch { failedDatabase.abort() }
@@ -575,7 +595,7 @@ function normalizeConstructionPage(
     entries.push({ kind: 'node', node: { node, pathKey: relative(preflight.target, path), ...(entry.linkCount === undefined ? {} : { linkCount: entry.linkCount }) } })
   }
   return {
-    taskId: task.id, depth: task.depth, focused, entriesRead: task.entriesRead, done: page.done, entries,
+    taskId: task.id, depth: task.depth, focused, entriesRead: task.entriesRead, enumerationEpoch: task.enumerationEpoch, done: page.done, entries,
     bulkMetadataEntries: page.bulkEntries, fallbackMetadataEntries: page.fallbackEntries
   }
 }
@@ -591,6 +611,21 @@ function addConstructionTotals(totals: ReturnType<typeof mutableTotals>, delta: 
   totals.duplicateHardLinks += delta.duplicateHardLinks
   totals.bulkMetadataEntries += delta.bulkMetadataEntries
   totals.fallbackMetadataEntries += delta.fallbackMetadataEntries
+}
+
+function rebaseConstructionTotals(totals: ReturnType<typeof mutableTotals>, semantic: ReturnType<ConstructionDatabase['semanticTotals']>, includeMetadataCounters: boolean): void {
+  totals.scannedItems = semantic.scannedItems
+  totals.discoveredBytes = semantic.discoveredBytes
+  totals.skippedItems = semantic.skippedItems
+  totals.unreadableItems = semantic.unreadableItems
+  totals.disappearingItems = semantic.disappearingItems
+  totals.symlinks = semantic.symlinks
+  totals.nestedMounts = semantic.nestedMounts
+  totals.duplicateHardLinks = semantic.duplicateHardLinks
+  if (includeMetadataCounters) {
+    totals.bulkMetadataEntries = semantic.bulkMetadataEntries
+    totals.fallbackMetadataEntries = semantic.fallbackMetadataEntries
+  }
 }
 
 // Gives TypeScript a named structural type for preflight data without exporting private paths.
@@ -658,8 +693,7 @@ class PreviewReporter {
     this.#lastPreview = now
     const breadcrumbs = database.getBreadcrumbs(focus.id)
     const rootId = breadcrumbs[0]?.id ?? focus.id
-    const root = database.getNode(rootId)
-    const scannedBytes = root?.confirmedBytes ?? focus.confirmedBytes
+    const scannedBytes = database.semanticTotals().discoveredBytes
     const unscannedBytes = volume.target === "/" ? Math.max(0, volume.capacityBytes - volume.freeBytes - scannedBytes) : 0
     onPreview({
       generation: this.options.generation, revision: database.revision, committed: false,

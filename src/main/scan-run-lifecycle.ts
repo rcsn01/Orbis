@@ -8,6 +8,7 @@ import type { PendingScanRecord } from './location-catalog'
 import type { FolderSizeEstimate } from './scan-metadata'
 import type { ProgressivePreview, ScanTotals } from './scanner'
 import type { ScanExecution, ScanOutcome, ScanSession } from './scan-execution'
+import type { PublicationSettlement, SettlementResult, SettlementStaleReason } from './publication-settlement'
 
 /**
  * The scan run lifecycle: the controller-side state machine above scan execution.
@@ -90,29 +91,7 @@ export interface ScanRunContext {
 export type CompletedOutcome = Extract<ScanOutcome, { readonly kind: 'completed' }>
 export type UnchangedOutcome = Extract<ScanOutcome, { readonly kind: 'unchanged' }>
 
-export interface ScanPublishedResult {
-  readonly kind: 'published'
-  readonly totals: ScanTotals
-  readonly activeTarget: string
-  readonly warnings: readonly string[]
-}
-
-export interface ScanStalePublicationResult {
-  readonly kind: 'stale'
-  readonly reason: 'stale-base-publication' | 'stale-install'
-  readonly candidateDisposition: 'discarded' | 'catalog-owned' | 'cleanup-pending'
-}
-
-export interface ScanStaleBasePublicationResult {
-  readonly kind: 'stale'
-  readonly reason: 'stale-base-publication'
-  readonly candidateDisposition: 'discarded' | 'catalog-owned' | 'cleanup-pending'
-}
-
-export type CompletedPublicationResult = ScanPublishedResult | ScanStalePublicationResult
-export type UnchangedPublicationResult = ScanPublishedResult | ScanStaleBasePublicationResult
-
-const STALE_PUBLICATION_MESSAGES: Readonly<Record<ScanStalePublicationResult['reason'], string>> = Object.freeze({
+const STALE_PUBLICATION_MESSAGES: Readonly<Record<SettlementStaleReason, string>> = Object.freeze({
   'stale-base-publication': 'The incremental scan was based on a stale index.',
   'stale-install': 'The scan result became stale before publication.'
 })
@@ -139,8 +118,7 @@ export interface ScanLifecycleDependencies {
   readonly createPublicationId: () => string
   readonly runPaths: (publicationId: string) => { readonly partialPath: string; readonly publishedPath: string }
   readonly beginScan: (record: PendingScanRecord, previousScanId: string | undefined, guards: ScanStartGuards) => Promise<void>
-  readonly publishCompleted: (run: ScanRunContext, outcome: CompletedOutcome) => Promise<CompletedPublicationResult>
-  readonly publishUnchanged: (run: ScanRunContext, outcome: UnchangedOutcome) => Promise<UnchangedPublicationResult>
+  readonly settlement: PublicationSettlement
   readonly clearPendingScan: (scanId: string) => Promise<void>
   readonly discardUnreferencedDatabase: (path: string) => Promise<void>
   readonly pendingScanId: () => string | undefined
@@ -179,7 +157,7 @@ export class ScanRunLifecycle {
   #activeTarget: string
   #pendingRevealCancellations = new Set<(error: Error) => void>()
   #pendingTasks = new Set<Promise<void>>()
-  #pendingFailureCleanup: Promise<void> | undefined
+  #pendingTerminalCleanup: Promise<void> | undefined
   #queue: Promise<void> = Promise.resolve()
   #listeners = new Set<(transition: ScanLifecycleTransition) => void>()
 
@@ -318,7 +296,7 @@ export class ScanRunLifecycle {
   async #startScanSerial(target: string): Promise<ScanLifecycleState> {
     if (this.#sealed) throw new Error('Orbis is shutting down')
     await this.#deps.ensureInitialized()
-    await this.#awaitFailureCleanup()
+    await this.#awaitTerminalCleanup()
     if (this.#sealed) throw new Error('Orbis is shutting down')
     if (this.#run && this.#run.target !== target) throw new Error('Pause and discard the saved scan before choosing another folder')
     const previous = this.#run
@@ -403,7 +381,7 @@ export class ScanRunLifecycle {
 
   async #pauseSerial(): Promise<ScanLifecycleState> {
     if (this.#sealed) return this.state
-    await this.#awaitFailureCleanup()
+    await this.#awaitTerminalCleanup()
     if (this.#sealed) return this.state
     const run = this.#run
     if (!run) return this.state
@@ -425,6 +403,13 @@ export class ScanRunLifecycle {
       ? { available: true, checkpointedAt: saved.kind === 'construction' ? saved.checkpointedAt : saved.descriptor.createdAt }
       : undefined
     await this.#restoreConstructionPreview(saved, run.generation)
+    if (this.#resume === undefined) {
+      // The pause could not claim a resume: no construction or candidate
+      // survived the stop, so nothing may resume this run. Release its
+      // catalog transaction and run files before reporting the pause, or
+      // the next scan cannot begin ("Another Orbis scan owns the catalog").
+      await this.#releaseDeadRun(run)
+    }
     this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
     this.#notify('paused', run.generation)
     return this.state
@@ -432,7 +417,7 @@ export class ScanRunLifecycle {
 
   async #discardSerial(): Promise<ScanLifecycleState> {
     if (this.#sealed) return this.state
-    await this.#awaitFailureCleanup()
+    await this.#awaitTerminalCleanup()
     if (this.#sealed) return this.state
     const run = this.#run
     const changed =
@@ -466,7 +451,11 @@ export class ScanRunLifecycle {
       run.session = session
       run.resumeMilestones?.mark(run.generation, 'resume-click-to-session')
     } catch (error) {
-      if (this.#run === run && !this.#sealed) await this.#dispatchOutcome(run, { kind: 'failed', error: error instanceof Error ? error : new Error(String(error)) })
+      if (this.#run === run && !this.#sealed) {
+        const failure = error instanceof Error ? error : new Error(String(error))
+        void Promise.resolve(this.#deps.scanExecution.recordFailure?.(run.generation, { kind: 'worker-transport', code: failureCode(failure), lifecycleStage: 'starting' })).catch(() => undefined)
+        await this.#dispatchOutcome(run, { kind: 'failed', error: failure })
+      }
       return
     }
     if (this.#run !== run || this.#sealed || run.completed) {
@@ -504,58 +493,51 @@ export class ScanRunLifecycle {
   }
 
   async #dispatchOutcome(run: LifecycleRun, outcome: ScanOutcome): Promise<void> {
-    if (outcome.kind === 'completed') {
+    if (outcome.kind === 'completed' || outcome.kind === 'unchanged') {
       run.completed = true
-      await this.#publishCompletedRun(run, outcome)
-    } else if (outcome.kind === 'unchanged') {
-      run.completed = true
-      await this.#publishUnchangedRun(run, outcome)
+      await this.#settleRun(run, outcome)
     } else if (outcome.kind === 'canceled' || outcome.kind === 'paused') {
       this.#run = undefined
       this.#preview = undefined
       this.#savedConstruction = undefined
       this.#rejectPendingReveals('Scan paused')
       this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
-      await this.#refreshResumeState(run.generation, true, { target: run.target, outcome })
-      this.#notify('paused', run.generation)
+      // The run ended from the worker side. Its terminal transition — the
+      // resume load, the no-proof release, and the paused notification — runs
+      // as tracked terminal cleanup, so a following command cannot begin
+      // against the dead run's catalog record or files.
+      const cleanup = (async () => {
+        await this.#refreshResumeState(run.generation, true, { target: run.target, outcome })
+        if (this.#sealed || this.#generation !== run.generation || this.#run) return
+        if (this.#resume === undefined) await this.#releaseDeadRun(run)
+        this.#notify('paused', run.generation)
+      })().catch(() => undefined)
+      this.#registerTerminalCleanup(cleanup)
+      await cleanup
     } else {
-      this.#failRun(run, outcome.error.message)
+      // WorkerScanSession records the concrete worker failure before settling;
+      // do not replace it with a generic lifecycle error here.
+      this.#failRun(run, outcome.error.message, 'worker-error', false)
     }
   }
 
-  async #publishCompletedRun(run: LifecycleRun, outcome: CompletedOutcome): Promise<void> {
-    if (this.#run !== run || this.#sealed) {
-      await this.#deps.discardUnreferencedDatabase(outcome.result.publishedPath)
-      return
-    }
-    let result: CompletedPublicationResult
+  async #settleRun(run: LifecycleRun, outcome: CompletedOutcome | UnchangedOutcome): Promise<void> {
+    if (outcome.kind === 'completed') {
+      if (this.#run !== run || this.#sealed) {
+        await this.#deps.discardUnreferencedDatabase(outcome.result.publishedPath)
+        return
+      }
+    } else if (this.#run !== run || this.#sealed) return
+    let result: SettlementResult
     try {
-      result = await this.#deps.publishCompleted(run, outcome)
+      result = await this.#deps.settlement.settle(run, outcome)
     } catch (error) {
-      await this.#deps.clearPendingScan(run.publicationId).catch(() => undefined)
-      this.#failRun(run, error instanceof Error ? error.message : String(error))
+      if (outcome.kind === 'completed') await this.#deps.clearPendingScan(run.publicationId).catch(() => undefined)
+      this.#failRun(run, error instanceof Error ? error.message : String(error), 'publication-error')
       return
     }
     if (result.kind === 'stale') {
-      this.#failRun(run, STALE_PUBLICATION_MESSAGES[result.reason])
-      return
-    }
-    run.published = true
-    if (this.#run !== run || this.#sealed) return
-    this.#applyCompleted(run, result.totals, result.activeTarget)
-  }
-
-  async #publishUnchangedRun(run: LifecycleRun, outcome: UnchangedOutcome): Promise<void> {
-    if (this.#run !== run || this.#sealed) return
-    let result: UnchangedPublicationResult
-    try {
-      result = await this.#deps.publishUnchanged(run, outcome)
-    } catch (error) {
-      this.#failRun(run, error instanceof Error ? error.message : String(error))
-      return
-    }
-    if (result.kind === 'stale') {
-      this.#failRun(run, STALE_PUBLICATION_MESSAGES[result.reason])
+      this.#failRun(run, STALE_PUBLICATION_MESSAGES[result.reason], 'publication-stale')
       return
     }
     run.published = true
@@ -575,13 +557,16 @@ export class ScanRunLifecycle {
     this.#notify('completed', run.generation)
   }
 
-  #failRun(run: LifecycleRun, error: string): void {
+  #failRun(run: LifecycleRun, error: string, kind: string = 'lifecycle-error', recordDiagnostic = true): void {
     if (this.#run !== run) return
     this.#run = undefined
     this.#preview = run.durablePreview
     this.#savedConstruction = run.durableConstruction
     this.#rejectPendingReveals('Scan failed')
     this.#scanStatus = { status: 'fatal-error', generation: run.generation, progress: null, totals: null, error }
+    if (recordDiagnostic) void Promise.resolve(this.#deps.scanExecution.recordFailure?.(run.generation, {
+      kind, lifecycleStage: 'failed', code: failureCode(error)
+    })).catch(() => undefined)
     const cleanup = this.#stopRun(run).then(async () => {
       await this.#refreshResumeState(run.generation, true)
       if (this.#sealed || this.#generation !== run.generation || this.#run) return
@@ -593,11 +578,7 @@ export class ScanRunLifecycle {
       }
       this.#notify('failed', run.generation)
     }).catch(() => undefined)
-    this.#pendingFailureCleanup = cleanup
-    void cleanup.then(() => {
-      if (this.#pendingFailureCleanup === cleanup) this.#pendingFailureCleanup = undefined
-    })
-    this.#track(cleanup)
+    this.#registerTerminalCleanup(cleanup)
   }
 
   // --- resume state ----------------------------------------------------------------------
@@ -643,9 +624,32 @@ export class ScanRunLifecycle {
 
   // --- helpers ---------------------------------------------------------------------------
 
-  async #awaitFailureCleanup(): Promise<void> {
-    const cleanup = this.#pendingFailureCleanup
+  async #awaitTerminalCleanup(): Promise<void> {
+    const cleanup = this.#pendingTerminalCleanup
     if (cleanup) await cleanup
+  }
+
+  /** Tracks a dead run's terminal cleanup so later commands await it before starting. */
+  #registerTerminalCleanup(cleanup: Promise<void>): void {
+    this.#pendingTerminalCleanup = cleanup
+    void cleanup.then(() => {
+      if (this.#pendingTerminalCleanup === cleanup) this.#pendingTerminalCleanup = undefined
+    })
+    this.#track(cleanup)
+  }
+
+  /**
+   * Releases a dead run's catalog transaction and run files when no resume
+   * proof may claim them. Best effort: an absent or replaced record is
+   * tolerated, discard failures defer to startup reconciliation, and the
+   * reference check keeps any file a live descriptor still needs.
+   */
+  async #releaseDeadRun(run: LifecycleRun): Promise<void> {
+    await this.#deps.clearPendingScan(run.publicationId).catch(() => undefined)
+    try {
+      await this.#deps.discardUnreferencedDatabase(run.partialPath)
+      await this.#deps.discardUnreferencedDatabase(run.publishedPath)
+    } catch { /* Startup reconciliation retries cleanup. */ }
   }
 
   async #stopRun(run: LifecycleRun): Promise<ScanOutcome> {
@@ -690,6 +694,11 @@ export class ScanRunLifecycle {
       try { listener(transition) } catch { /* A controller listener must not break the lifecycle. */ }
     }
   }
+}
+
+function failureCode(error: unknown): string | undefined {
+  const value = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{1,64}$/u.test(value) ? value : undefined
 }
 
 function previewNode(preview: ProgressivePreview, id: string): { readonly id: string; readonly kind: 'directory' | 'file' } | undefined {

@@ -34,7 +34,7 @@ export async function readConstructionPreview(
     if (!root || root.kind !== 'directory') return undefined
     const volume = await readVolume(target)
     if (!volume) return undefined
-    const scannedBytes = root.confirmedBytes
+    const scannedBytes = source.semanticScannedBytes()
     const unscannedBytes = target === '/' ? Math.max(0, volume.capacityBytes - volume.freeBytes - scannedBytes) : 0
     const rootTotalBytes = focus.id === rootId && target === '/' ? volume.capacityBytes : 0
     return {
@@ -76,6 +76,7 @@ interface ConstructionDatabase extends ChartDataSource {
   getBreadcrumbs(id: string): readonly Breadcrumb[]
   getLargestItems(id: string): readonly NodeSummary[]
   resolvePath(id: string): string | undefined
+  semanticScannedBytes(): number
   close(): void
 }
 
@@ -201,6 +202,12 @@ class ConstructionPreviewDatabase implements ConstructionDatabase {
   resolvePath(id: string): string | undefined {
     const path = this.getNode(id)?.path
     return path && isAbsolute(path) && isWithinPath(path, this.target) ? path : undefined
+  }
+
+  semanticScannedBytes(): number {
+    const row = this.database.prepare('SELECT COALESCE(SUM(own_bytes), 0) AS bytes FROM nodes').get() as { bytes?: unknown } | undefined
+    const bytes = Number(row?.bytes ?? 0)
+    return Number.isFinite(bytes) && bytes >= 0 ? bytes : 0
   }
 
   close(): void {

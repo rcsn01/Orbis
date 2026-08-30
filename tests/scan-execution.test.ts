@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { describe, expect, it } from 'vitest'
 import {
   WorkerScanExecution, type ScanExecutionRequest, type ScanUpdate, type WorkerTransport
@@ -5,6 +8,7 @@ import {
 import type { WorkerStartMessage } from '../src/main/scan-execution-protocol'
 import type { ResumeValidationReceipt } from '../src/main/full-scan-resume'
 import type { ProgressivePreview, ScanResult } from '../src/main/scanner'
+import { ScanFailureDiagnosticsStore } from '../src/main/scan-failure-diagnostics'
 
 class FakeWorker implements WorkerTransport {
   readonly messages: unknown[] = []
@@ -94,6 +98,25 @@ describe('WorkerScanExecution', () => {
     await expect(session.result).resolves.toMatchObject({ kind: 'completed', result: { target: '/tmp/one' } })
     await consume
     expect(updates).toEqual(['progress', 'preview-2'])
+  })
+
+  it('persists typed checkpoint and native diagnostics while rejecting stale messages', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-scan-diagnostics-'))
+    try {
+      const worker = new FakeWorker()
+      const diagnostics = new ScanFailureDiagnosticsStore(directory)
+      const execution = new WorkerScanExecution({ create: () => worker }, { diagnostics })
+      const session = await execution.start({ ...request('diagnostics'), resumeExpected: true })
+      const start = worker.startMessage()
+      worker.emit({ type: 'checkpoint', generation: start.generation, requestId: start.requestId, checkpoint: { sequence: 4, reason: 'scheduled', phase: 'scanning', count: 2 } })
+      worker.emit({ type: 'native-addon-status', generation: start.generation, requestId: start.requestId, status: { loadStatus: 'loaded', journalCapability: 'missing', metadataCapability: 'available' } })
+      worker.emit({ type: 'checkpoint', generation: start.generation + 1, requestId: start.requestId, checkpoint: { sequence: 99, reason: 'pause', phase: 'paused', count: 99 } })
+      worker.emit({ type: 'error', generation: start.generation, requestId: start.requestId, error: { message: 'worker failed', code: 'EIO' } })
+      await expect(session.result).resolves.toMatchObject({ kind: 'failed' })
+      const document = await diagnostics.read()
+      expect(document.activeRun).toBeUndefined()
+      expect(document.lastFailure).toMatchObject({ kind: 'worker-error', code: 'EIO', latestCheckpoint: { sequence: 4 }, nativeAddon: { metadataCapability: 'available' } })
+    } finally { await rm(directory, { recursive: true, force: true }) }
   })
 
   it('copies a resume receipt into the worker start message', async () => {

@@ -13,6 +13,7 @@ import { IncrementalFallbackError, replaceIndexSubtrees } from './persistent-ind
 import { publicationIdFromDatabaseFile } from './publication-artifacts'
 import { loadNativeOrbisAddon } from './scan-metadata'
 import { ScanCanceledError, STARTUP_EXCLUSIONS, scanFilesystem, type ScanOptions, type ScanResult, type ScanTotals } from './scanner'
+import { ResumeJournalInvalidatedError } from './progressive-scanner'
 
 export interface ActivePersistentIndex {
   readonly manifest: IndexManifest
@@ -55,7 +56,7 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
   if (request.referenceScan === true) {
     return { kind: 'candidate', strategy: 'full', result: await scanFilesystem(request), journal: null }
   }
-  const addon = request.changeJournal ? undefined : await loadNativeOrbisAddon(request.nativeAddonPath)
+  const addon = request.changeJournal ? undefined : await loadNativeOrbisAddon(request.nativeAddonPath, request.onNativeAddonStatus)
   const journal = request.changeJournal ?? createChangeJournal(nativeChangeJournalAddon(addon))
   const activeCursor = request.active?.manifest.journal
   if (request.resumeExpected) await request.onResumePreparation?.('validating')
@@ -103,7 +104,8 @@ async function refreshPersistentIndexImpl(request: RefreshRequest): Promise<Refr
       ...(request.directoryMetadataSource ? { directoryMetadataSource: request.directoryMetadataSource } : {}),
       ...(request.fileSystem ? { fileSystem: request.fileSystem } : {}),
       ...(request.metadataConcurrency !== undefined ? { metadataConcurrency: request.metadataConcurrency } : {}),
-      ...(request.signal ? { signal: request.signal } : {})
+      ...(request.signal ? { signal: request.signal } : {}),
+      ...(request.onNativeAddonStatus ? { onNativeAddonStatus: request.onNativeAddonStatus } : {})
     }))
     try {
       throwIfCanceled(request.signal)
@@ -154,7 +156,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
           } : {}) })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (resumable && message.startsWith('resume-invalidated:')) {
+    if (resumable && !(error instanceof ResumeJournalInvalidatedError) && message.startsWith('resume-invalidated:')) {
       await resumeStore.discard(resumable.descriptor.scanId)
       recordScanCounter('fullScanRetries')
       return fullRefresh(request, journal, message.slice('resume-invalidated:'.length), raceRetry, resumeRestarts + 1)
@@ -231,7 +233,8 @@ async function reconcileFullCandidate(request: RefreshRequest, result: ScanResul
     ...(request.directoryMetadataSource ? { directoryMetadataSource: request.directoryMetadataSource } : {}),
     ...(request.fileSystem ? { fileSystem: request.fileSystem } : {}),
     ...(request.metadataConcurrency !== undefined ? { metadataConcurrency: request.metadataConcurrency } : {}),
-    ...(request.signal ? { signal: request.signal } : {})
+    ...(request.signal ? { signal: request.signal } : {}),
+    ...(request.onNativeAddonStatus ? { onNativeAddonStatus: request.onNativeAddonStatus } : {})
   })
   try {
     const volume = await volumeFor(request.target)
@@ -307,9 +310,11 @@ async function prepareResumableFullScan(request: RefreshRequest, journal: Change
     await request.onResumePreparation?.('history')
     const history = measureScan('resume-history-validation', () => journal.readChanges(request.target, store.cursor(loaded.descriptor, loaded.drainedThrough), MAX_EVENTS, HISTORY_TIMEOUT_MS))
     if (history.requiresFullScan) {
-      await store.discard(loaded.descriptor.scanId)
-      const fresh = await createResumableFullScan(request, journal, store)
-      return fresh ? { ...fresh, expiredReason: `resume-expired:${history.reason ?? 'history-unavailable'}` } : undefined
+      // The construction is still valid, but its uncheckpointed history is
+      // not currently readable. Keep the descriptor and let the caller retry
+      // once the journal window is trustworthy instead of silently restarting
+      // from an empty database.
+      throw new Error(`resume-history-unavailable:${history.reason ?? 'history-unavailable'}`)
     }
     return loaded.kind === 'candidate'
       ? { descriptor: loaded.descriptor, partialPath: joinOwned(store.directory, loaded.descriptor.partialFile), candidatePath: loaded.candidatePath, candidate: loaded.candidatePath, resume: true }

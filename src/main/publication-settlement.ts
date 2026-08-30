@@ -1,21 +1,21 @@
-import { randomUUID } from 'node:crypto'
-import type { CompletedOutcome, CompletedPublicationResult, ScanLifecycleDependencies, ScanLifecycleResumePort, ScanRunContext, ScanStartContext, ScanStartGuards, UnchangedOutcome, UnchangedPublicationResult } from './scan-run-lifecycle'
-import { readConstructionPreview, resolveConstructionNodePath } from './construction-preview'
-import { createControllerTimingMilestones, measureControllerAsync } from './diagnostics'
-import type { CoveragePublicationAccess, InstalledLocationAccess } from './coverage-publication-access'
+import type { CompletedOutcome, ScanRunContext, UnchangedOutcome } from './scan-run-lifecycle'
+import { measureControllerAsync } from './diagnostics'
+import type { CoveragePublicationAccess, InstalledLocationAccess, PublicationCandidateDisposition } from './coverage-publication-access'
 import type { FullScanResumeStore } from './full-scan-resume'
 import type { IndexManifest } from './index-manifest'
-import type { LocationCatalogStore, PendingScanRecord } from './location-catalog'
+import type { LocationCatalogStore } from './location-catalog'
 import type { PublicationArtifacts } from './publication-artifacts'
-import { resolveTarget, validateRevealPath } from './scan-target'
 import type { FolderSizeEstimate } from './scan-metadata'
-import type { ScanExecution } from './scan-execution'
+import type { ScanTotals } from './scanner'
 
 /**
- * Production adapters that satisfy the scan-run lifecycle's dependency ports
- * with the location catalog, coverage publication access, the resume store, and
- * the estimate cache. Catalog mutations stay behind these injected operations —
- * candidate 3's future territory.
+ * Publication settlement: the catalog-side conversion of a terminal scan run's
+ * outcome into an immutable publication. It owns stale-base checks, coverage
+ * publication candidate installation, the post-commit best-effort ritual
+ * (Resume retirement, focus restore, estimate-cache store, run-file discard),
+ * and the single stale-result vocabulary shared with the scan run lifecycle.
+ * It does not own the lifecycle's run identity, worker session, renderer
+ * navigation policy, or catalog record creation.
  */
 
 export interface ScanLifecycleFocusPort {
@@ -27,55 +27,53 @@ export interface ScanLifecycleFocusPort {
   restore(access: InstalledLocationAccess, previousFocusId?: string, previousFocusPath?: string): string
 }
 
-export interface ScanLifecycleAdapterInputs {
-  readonly indexDirectory: string
-  readonly scanExecution: ScanExecution
-  readonly ensureInitialized: () => Promise<void>
-  readonly resumeStore: FullScanResumeStore
+export interface SettlementInputs {
   readonly catalogStore: LocationCatalogStore
   readonly coverageAccess: CoveragePublicationAccess
+  readonly resumeStore: FullScanResumeStore
   readonly estimateCache: { load(target: string): Promise<FolderSizeEstimate | undefined>; store(target: string, estimate: FolderSizeEstimate): Promise<void> }
   readonly artifacts: PublicationArtifacts
   readonly focus: ScanLifecycleFocusPort
 }
 
-export function createScanLifecycleDependencies(inputs: ScanLifecycleAdapterInputs): ScanLifecycleDependencies {
+export type SettlementStaleReason = 'stale-base-publication' | 'stale-install'
+
+/**
+ * An unchanged outcome can only go stale through its base publication; the
+ * `stale-install` reason is exclusive to completed candidates. That guarantee
+ * used to be type-enforced by separate result unions and is now an
+ * implementation invariant of this module.
+ */
+export interface SettlementStaleResult {
+  readonly kind: 'stale'
+  readonly reason: SettlementStaleReason
+  readonly candidateDisposition: PublicationCandidateDisposition
+}
+
+export interface SettlementPublishedResult {
+  readonly kind: 'published'
+  readonly totals: ScanTotals
+  readonly activeTarget: string
+  readonly warnings: readonly string[]
+}
+
+export type SettlementResult = SettlementPublishedResult | SettlementStaleResult
+
+/**
+ * Commit-point contract: every failure that happens before the durable catalog
+ * commit (`publishAndInstall` or `advancePublication`) rejects and rejects the
+ * whole settlement. Once the durable commit has passed, the residual work is
+ * best-effort only: its failures degrade into `warnings` and never reverse a
+ * `published` result.
+ */
+export interface PublicationSettlement {
+  settle(run: ScanRunContext, outcome: CompletedOutcome | UnchangedOutcome): Promise<SettlementResult>
+}
+
+export function createPublicationSettlement(inputs: SettlementInputs): PublicationSettlement {
   const { catalogStore, coverageAccess, resumeStore, estimateCache, artifacts, focus } = inputs
 
-  const resume: ScanLifecycleResumePort = {
-    peek: () => resumeStore.peek(),
-    load: (expectedTarget) => resumeStore.load(expectedTarget),
-    loadAcknowledgedCheckpoint: (expectedTarget, checkpointSequence) => resumeStore.loadAcknowledgedCheckpoint(expectedTarget, checkpointSequence),
-    discard: (expectedScanId) => resumeStore.discard(expectedScanId),
-    removeDescriptor: () => resumeStore.removeDescriptor()
-  }
-
-  const prepareStartContext = async (target: string): Promise<ScanStartContext> => {
-    const catalog = catalogStore.current
-    const installed = coverageAccess.current()
-    const installedPublication = installed?.publication()
-    const resolved = installedPublication?.target === target ? undefined : await resolveTarget(target)
-    const identity = installedPublication?.target === target
-      ? { targetDevice: installedPublication.targetDevice, targetInode: installedPublication.targetInode }
-      : { targetDevice: resolved!.targetDevice, targetInode: resolved!.targetInode }
-    return {
-      identity,
-      ownerId: catalog.selectedLocationId,
-      basePublicationId: installedPublication?.publicationId ?? null,
-      initialEstimate: installed?.publicationTarget === target ? installed.estimate : await estimateCache.load(target),
-      active: installed?.publicationTarget === target && installedPublication ? { manifest: installedPublication, path: installed.artifactPath } : undefined,
-      guards: { expectedRevision: catalog.revision, selectedLocationId: catalog.selectedLocationId }
-    }
-  }
-
-  const beginScan = async (record: PendingScanRecord, previousScanId: string | undefined, guards: ScanStartGuards): Promise<void> => {
-    const document = catalogStore.current
-    if (document.revision !== guards.expectedRevision) throw new Error('The pending catalog snapshot is stale')
-    if (document.selectedLocationId !== guards.selectedLocationId) throw new Error('The selected location changed while the scan was starting')
-    await catalogStore.beginScan(record, previousScanId)
-  }
-
-  const publishCompleted = (run: ScanRunContext, outcome: CompletedOutcome): Promise<CompletedPublicationResult> => {
+  const settleCompleted = (run: ScanRunContext, outcome: CompletedOutcome): Promise<SettlementResult> => {
     return measureControllerAsync(run.generation, 'publication-total', async () => {
       const refresh = outcome.refresh
       const before = coverageAccess.current()
@@ -107,7 +105,7 @@ export function createScanLifecycleDependencies(inputs: ScanLifecycleAdapterInpu
     })
   }
 
-  const publishUnchanged = async (run: ScanRunContext, outcome: UnchangedOutcome): Promise<UnchangedPublicationResult> => {
+  const settleUnchanged = async (run: ScanRunContext, outcome: UnchangedOutcome): Promise<SettlementResult> => {
     const active = coverageAccess.current()
     const manifest = active?.publication()
     if (!active || !manifest || active.publicationTarget !== run.target || manifest.publicationId !== outcome.basePublicationId) {
@@ -133,28 +131,7 @@ export function createScanLifecycleDependencies(inputs: ScanLifecycleAdapterInpu
   }
 
   return {
-    indexDirectory: inputs.indexDirectory,
-    scanExecution: inputs.scanExecution,
-    resume,
-    ensureInitialized: inputs.ensureInitialized,
-    prepareStartContext,
-    createPublicationId: () => randomUUID(),
-    runPaths: (publicationId) => {
-      const { partialPath, indexPath } = catalogStore.paths(publicationId)
-      return { partialPath, publishedPath: indexPath }
-    },
-    beginScan,
-    publishCompleted,
-    publishUnchanged,
-    clearPendingScan: async (scanId) => { await catalogStore.clearPendingScan(scanId) },
-    discardUnreferencedDatabase: async (path) => { await artifacts.discardUnreferencedDatabase(path) },
-    pendingScanId: () => {
-      try { return catalogStore.current.pendingScan?.scanId } catch { return undefined }
-    },
-    readConstructionPreview,
-    resolveConstructionNodePath,
-    validateRevealPath,
-    createMilestones: () => createControllerTimingMilestones()
+    settle: (run, outcome) => outcome.kind === 'completed' ? settleCompleted(run, outcome) : settleUnchanged(run, outcome)
   }
 }
 

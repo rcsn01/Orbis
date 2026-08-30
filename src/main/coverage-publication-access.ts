@@ -59,6 +59,8 @@ export interface TransientReferenceCandidate {
 
 export type PublicationCandidate = PersistentPublicationCandidate | TransientReferenceCandidate
 
+export type PublicationCandidateDisposition = 'discarded' | 'catalog-owned' | 'cleanup-pending'
+
 export type PublicationInstallResult =
   | {
       readonly kind: 'installed'
@@ -70,7 +72,7 @@ export type PublicationInstallResult =
     }
   | {
       readonly kind: 'stale'
-      readonly candidateDisposition: 'discarded' | 'catalog-owned' | 'cleanup-pending'
+      readonly candidateDisposition: PublicationCandidateDisposition
     }
 
 export interface CoveragePublicationAccess {

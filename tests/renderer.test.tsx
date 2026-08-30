@@ -131,19 +131,19 @@ describe("Orbis renderer", () => {
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(mismatched)
 
     render(<App />)
-    expect(await screen.findByText(/400 items · 128 KB · notes\.txt/)).toBeVisible()
-    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("128 KB")
+    expect(await screen.findByText(/400 items · 1\.6 MB · notes\.txt/)).toBeVisible()
+    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("1.6 MB")
     const progress = screen.getByRole("progressbar", { name: "Scan progress" })
     const progressValue = progress.getAttribute("aria-valuenow")
-    expect(progress).toHaveAttribute("aria-valuetext", "400 items · 128 KB")
+    expect(progress).toHaveAttribute("aria-valuetext", "400 items · 1.6 MB")
 
     const progressOnly: OrbisSnapshot = {
       ...mismatched,
       scan: { ...mismatched.scan, progress: { ...mismatched.scan.progress!, discoveredBytes: 2_097_152 } }
     }
     act(() => publish?.(progressOnly))
-    expect(screen.getByText(/400 items · 128 KB · notes\.txt/)).toBeVisible()
-    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("128 KB")
+    expect(screen.getByText(/400 items · 2\.0 MB · notes\.txt/)).toBeVisible()
+    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("2.0 MB")
     expect(progress).toHaveAttribute("aria-valuenow", progressValue)
 
     const matchingPreview: OrbisSnapshot = {

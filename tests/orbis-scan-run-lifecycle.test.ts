@@ -5,15 +5,14 @@ import { afterEach, describe, expect, it } from "vitest"
 import {
   ScanRunLifecycle,
   type CompletedOutcome,
-  type CompletedPublicationResult,
   type ScanLifecycleDependencies,
   type ScanLifecycleState,
   type ScanLifecycleTransition,
   type ScanRunContext,
   type ScanStartGuards,
-  type UnchangedOutcome,
-  type UnchangedPublicationResult
+  type UnchangedOutcome
 } from "../src/main/scan-run-lifecycle"
+import type { SettlementResult } from "../src/main/publication-settlement"
 import type { FullScanResumeDescriptor, FullScanResumeLoad, FullScanResumePeek, ResumeValidationReceipt } from "../src/main/full-scan-resume"
 import { RESUME_PREPARATION_MESSAGES, createControllerTimingMilestones } from "../src/main/diagnostics"
 import type { PendingScanRecord } from "../src/main/location-catalog"
@@ -204,8 +203,7 @@ interface Harness {
     readonly resumeLoad: Array<string | undefined>
     readonly resumeCheckpointLoad: Array<{ target: string; sequence: number }>
     readonly resumeRemoveDescriptor: number
-    readonly publishCompleted: Array<{ run: ScanRunContext; outcome: CompletedOutcome }>
-    readonly publishUnchanged: Array<{ run: ScanRunContext; outcome: UnchangedOutcome }>
+    readonly settle: Array<{ run: ScanRunContext; outcome: CompletedOutcome | UnchangedOutcome }>
     readonly validated: Array<{ path: string; target: string }>
   }
   readonly config: {
@@ -220,8 +218,7 @@ interface Harness {
     prepareError: Error | undefined
     prepareGate: Promise<void> | undefined
     prepareEntered: Promise<void>
-    publishCompleted: ((run: ScanRunContext, outcome: CompletedOutcome) => Promise<CompletedPublicationResult>) | undefined
-    publishUnchanged: ((run: ScanRunContext, outcome: UnchangedOutcome) => Promise<UnchangedPublicationResult>) | undefined
+    settle: ((run: ScanRunContext, outcome: CompletedOutcome | UnchangedOutcome) => Promise<SettlementResult>) | undefined
     validateRevealPathGate: Promise<void> | undefined
     pendingScanId: string | undefined
   }
@@ -246,8 +243,7 @@ function createHarness(initialTarget = TARGET, options: HarnessOptions = {}): Ha
     resumeLoad: [] as Array<string | undefined>,
     resumeCheckpointLoad: [] as Array<{ target: string; sequence: number }>,
     resumeRemoveDescriptor: 0,
-    publishCompleted: [] as Harness["calls"]["publishCompleted"],
-    publishUnchanged: [] as Harness["calls"]["publishUnchanged"],
+    settle: [] as Harness["calls"]["settle"],
     validated: [] as Harness["calls"]["validated"]
   }
   const prepareEntered = testDeferred<void>()
@@ -263,8 +259,7 @@ function createHarness(initialTarget = TARGET, options: HarnessOptions = {}): Ha
     prepareError: undefined,
     prepareGate: undefined,
     prepareEntered: prepareEntered.promise,
-    publishCompleted: undefined,
-    publishUnchanged: undefined,
+    settle: undefined,
     validateRevealPathGate: undefined,
     pendingScanId: undefined
   }
@@ -321,17 +316,13 @@ function createHarness(initialTarget = TARGET, options: HarnessOptions = {}): Ha
       calls.beginScan.push({ record, previousScanId, guards })
       if (config.beginScanError) throw config.beginScanError
     },
-    publishCompleted: async (run, outcome) => {
-      events.push("publish:completed")
-      calls.publishCompleted.push({ run, outcome })
-      if (config.publishCompleted) return config.publishCompleted(run, outcome)
-      return { kind: "published", totals: TOTALS, activeTarget: run.target, warnings: [] }
-    },
-    publishUnchanged: async (run, outcome) => {
-      events.push("publish:unchanged")
-      calls.publishUnchanged.push({ run, outcome })
-      if (config.publishUnchanged) return config.publishUnchanged(run, outcome)
-      return { kind: "published", totals: TOTALS, activeTarget: run.target, warnings: [] }
+    settlement: {
+      settle: async (run, outcome) => {
+        events.push(outcome.kind === "completed" ? "publish:completed" : "publish:unchanged")
+        calls.settle.push({ run, outcome })
+        if (config.settle) return config.settle(run, outcome)
+        return { kind: "published", totals: TOTALS, activeTarget: run.target, warnings: [] }
+      }
     },
     clearPendingScan: async (scanId) => { calls.clearPendingScan.push(scanId) },
     discardUnreferencedDatabase: async (path) => { calls.discarded.push(path) },
@@ -462,6 +453,23 @@ describe("ScanRunLifecycle", () => {
     await harness.lifecycle.seal()
   })
 
+  it("keeps a journal-invalidated worker failure resumable", async () => {
+    const harness = createHarness()
+    const { session } = await startScan(harness)
+    const discardedBeforeFailure = harness.calls.discarded.length
+    harness.config.load = makeConstructionLoad(TARGET)
+    harness.config.constructionPreview = makePreview(1, 1)
+    session.fail(new Error("resume-invalidated:kernel-dropped"))
+
+    await waitFor(() => harness.lifecycle.state.scanStatus.status === "canceled")
+    expect(harness.lifecycle.state.resume).toMatchObject({ available: true })
+    expect(harness.lifecycle.state.preview).toBeDefined()
+    expect(harness.calls.clearPendingScan).toHaveLength(0)
+    expect(harness.calls.discarded).toHaveLength(discardedBeforeFailure)
+    expect(harness.transitions.some((transition) => transition.kind === "failed")).toBe(true)
+    await harness.lifecycle.seal()
+  })
+
   it("discards a superseded run's updates, outcomes, and uncommitted candidates", async () => {
     let stubborn: StubbornSession | undefined
     const harness = createHarness(TARGET, {
@@ -487,7 +495,7 @@ describe("ScanRunLifecycle", () => {
     stubborn!.complete(makeScanResult(staleCandidate))
     await waitFor(() => harness.calls.discarded.includes(staleCandidate))
     expect(harness.transitions.length).toBe(transitionCount)
-    expect(harness.calls.publishCompleted).toHaveLength(0)
+    expect(harness.calls.settle).toHaveLength(0)
     void first
     await harness.lifecycle.seal()
   })
@@ -509,7 +517,7 @@ describe("ScanRunLifecycle", () => {
     const lateCandidate = "/indexes/index-late.sqlite"
     stubborn!.complete(makeScanResult(lateCandidate))
     await waitFor(() => harness.calls.discarded.includes(lateCandidate))
-    expect(harness.calls.publishCompleted).toHaveLength(0)
+    expect(harness.calls.settle).toHaveLength(0)
     expect(harness.lifecycle.state.scanStatus.status).toBe("canceled")
     expect(harness.transitions.filter((transition) => transition.kind === "paused")).toHaveLength(1)
     await harness.lifecycle.seal()
@@ -622,6 +630,30 @@ describe("ScanRunLifecycle", () => {
     await harness.lifecycle.seal()
   })
 
+  it("releases the pending catalog record when a pause cannot claim a resume", async () => {
+    const harness = createHarness()
+    const { session } = await startScan(harness)
+    // A long-running scan stops without a clean-pause proof, and the
+    // authoritative loader finds no resumable construction. The scan then ends
+    // as "canceled" — and the pending catalog record for its dead run must be
+    // released, or the next Rescan fails with "Another Orbis scan owns the
+    // catalog".
+    harness.config.load = { kind: "none" }
+    session.settleWith({ kind: "paused", acknowledged: false })
+    await waitFor(() => harness.calls.resumeLoad.length === 1)
+    const state = await harness.lifecycle.pauseScan()
+    expect(state.scanStatus.status).toBe("canceled")
+    expect(state.resume).toBeUndefined()
+    expect(harness.calls.clearPendingScan).toEqual([harness.calls.beginScan[0]!.record.scanId])
+    // The release also retires the dead run's files, not just the record.
+    const scanId = harness.calls.beginScan[0]!.record.scanId
+    expect(harness.calls.discarded).toEqual(expect.arrayContaining([
+      join(harness.indexDirectory, `index-${scanId}.partial.sqlite`),
+      join(harness.indexDirectory, `index-${scanId}.sqlite`)
+    ]))
+    await harness.lifecycle.seal()
+  })
+
   it("serializes pause behind an in-flight start preparation", async () => {
     const harness = createHarness()
     const gate = testDeferred<void>()
@@ -664,8 +696,8 @@ describe("ScanRunLifecycle", () => {
     const { session } = await startScan(harness)
     session.complete(makeScanResult("/indexes/index-new.sqlite"))
     await waitFor(() => harness.transitions.some((transition) => transition.kind === "completed"))
-    expect(harness.calls.publishCompleted).toHaveLength(1)
-    expect(harness.calls.publishCompleted[0]!.run).toMatchObject({
+    expect(harness.calls.settle).toHaveLength(1)
+    expect(harness.calls.settle[0]!.run).toMatchObject({
       generation: 1, locationId: "loc-owner", target: TARGET, basePublicationId: null
     })
     const state = harness.lifecycle.state
@@ -680,13 +712,13 @@ describe("ScanRunLifecycle", () => {
   it("waits for a pending publication before starting the next run", async () => {
     const harness = createHarness()
     const gate = testDeferred<void>()
-    harness.config.publishCompleted = async (run) => {
+    harness.config.settle = async (run) => {
       await gate.promise
       return { kind: "published", totals: TOTALS, activeTarget: run.target, warnings: [] }
     }
     const { session } = await startScan(harness)
     session.complete(makeScanResult("/indexes/index-a.sqlite"))
-    await waitFor(() => harness.calls.publishCompleted.length === 1)
+    await waitFor(() => harness.calls.settle.length === 1)
     const second = harness.lifecycle.startScan({ target: TARGET })
     await new Promise((resolve) => setImmediate(resolve))
     await new Promise((resolve) => setImmediate(resolve))
@@ -706,13 +738,13 @@ describe("ScanRunLifecycle", () => {
   it("never applies a publication that resolves after seal", async () => {
     const harness = createHarness()
     const gate = testDeferred<void>()
-    harness.config.publishCompleted = async (run) => {
+    harness.config.settle = async (run) => {
       await gate.promise
       return { kind: "published", totals: TOTALS, activeTarget: run.target, warnings: [] }
     }
     const { session } = await startScan(harness)
     session.complete(makeScanResult("/indexes/index-sealed.sqlite"))
-    await waitFor(() => harness.calls.publishCompleted.length === 1)
+    await waitFor(() => harness.calls.settle.length === 1)
     const sealing = harness.lifecycle.seal()
     gate.resolve()
     await sealing
@@ -725,7 +757,7 @@ describe("ScanRunLifecycle", () => {
     const harness = createHarness()
     const { session } = await startScan(harness)
     const scanId = harness.calls.beginScan[0]!.record.scanId
-    harness.config.publishCompleted = async () => ({ kind: "stale", reason: "stale-install", candidateDisposition: "discarded" })
+    harness.config.settle = async () => ({ kind: "stale", reason: "stale-install", candidateDisposition: "discarded" })
     session.complete(makeScanResult("/indexes/index-a.sqlite"))
     await waitFor(() => harness.lifecycle.state.scanStatus.status === "fatal-error")
     expect(harness.lifecycle.state.scanStatus.error).toBe("The scan result became stale before publication.")
@@ -745,7 +777,7 @@ describe("ScanRunLifecycle", () => {
     const scanId = harness.calls.beginScan[0]!.record.scanId
     const loadGate = testDeferred<void>()
     harness.config.loadGate = loadGate.promise
-    harness.config.publishCompleted = async () => { throw new Error("install failed") }
+    harness.config.settle = async () => { throw new Error("install failed") }
     session.complete(makeScanResult("/indexes/index-b.sqlite"))
     await waitFor(() => harness.lifecycle.state.scanStatus.status === "fatal-error")
     // The direct clear happened synchronously, before the failure was observable.
@@ -760,7 +792,7 @@ describe("ScanRunLifecycle", () => {
     const { session } = await startScan(harness)
     const loadGate = testDeferred<void>()
     harness.config.loadGate = loadGate.promise
-    harness.config.publishUnchanged = async () => { throw new Error("retirement failed") }
+    harness.config.settle = async () => { throw new Error("retirement failed") }
     session.unchanged({ journal: { uuid: "journal", eventId: "12" }, totals: TOTALS, basePublicationId: "base-id" })
     await waitFor(() => harness.lifecycle.state.scanStatus.status === "fatal-error")
     expect(harness.lifecycle.state.scanStatus.error).toBe("retirement failed")
@@ -774,17 +806,20 @@ describe("ScanRunLifecycle", () => {
     await harness.lifecycle.seal()
   })
 
-  it("dispatches an unchanged outcome through the unchanged publication operation and applies the result", async () => {
+  it("dispatches an unchanged outcome through the settlement seam and applies the result", async () => {
     const harness = createHarness()
     const { session } = await startScan(harness)
-    harness.config.publishUnchanged = async (run) => {
-      expect(harness.calls.publishUnchanged).toHaveLength(1)
+    harness.config.settle = async (run, outcome) => {
+      if (outcome.kind !== "unchanged") throw new Error("unexpected outcome kind")
+      expect(harness.calls.settle).toHaveLength(1)
       expect(run.generation).toBe(1)
       return { kind: "published", totals: TOTALS, activeTarget: "/next", warnings: ["cleanup"] }
     }
     session.unchanged({ journal: { uuid: "journal", eventId: "12" }, totals: TOTALS, basePublicationId: "base-id" })
     await waitFor(() => harness.lifecycle.state.scanStatus.status === "completed")
-    expect(harness.calls.publishUnchanged[0]!.outcome.journal).toEqual({ uuid: "journal", eventId: "12" })
+    expect(harness.calls.settle[0]!.outcome.kind).toBe("unchanged")
+    expect(harness.calls.settle[0]!.outcome.kind === "unchanged"
+      && harness.calls.settle[0]!.outcome.journal).toEqual({ uuid: "journal", eventId: "12" })
     expect(harness.lifecycle.state.scanStatus.totals).toEqual(TOTALS)
     expect(harness.lifecycle.state.activeTarget).toBe("/next")
     expect(harness.transitions.filter((transition) => transition.kind === "completed")).toHaveLength(1)

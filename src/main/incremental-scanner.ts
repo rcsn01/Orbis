@@ -4,6 +4,7 @@ import type { ChangeEvent } from './change-journal'
 import { FSEVENT_FLAGS } from './change-journal'
 import { STARTUP_EXCLUSIONS, scanFilesystem, type ScanOptions } from './scanner'
 import type { SubtreeReplacement } from './persistent-index-database'
+import type { NativeAddonProbe } from './scan-metadata'
 
 export type DirtyScopePlan =
   | { readonly kind: 'incremental'; readonly scopes: readonly string[] }
@@ -18,6 +19,7 @@ export interface DirtyScopeOptions {
 }
 
 export interface ReplacementScanOptions extends Pick<ScanOptions, 'generation' | 'indexDirectory' | 'nativeAddonPath' | 'directoryMetadataSource' | 'fileSystem' | 'metadataConcurrency' | 'signal'> {
+  readonly onNativeAddonStatus?: NativeAddonProbe
   readonly scopes: readonly string[]
 }
 
@@ -80,7 +82,8 @@ export async function scanReplacementScopes(options: ReplacementScanOptions): Pr
         ...(options.directoryMetadataSource ? { directoryMetadataSource: options.directoryMetadataSource } : {}),
         ...(options.fileSystem ? { fileSystem: options.fileSystem } : {}),
         ...(options.metadataConcurrency !== undefined ? { metadataConcurrency: options.metadataConcurrency } : {}),
-        ...(options.signal ? { signal: options.signal } : {})
+        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.onNativeAddonStatus ? { onNativeAddonStatus: options.onNativeAddonStatus } : {})
       })
       replacements.push({ path, indexPath: result.publishedPath })
     }

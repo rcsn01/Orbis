@@ -66,7 +66,7 @@ export class PublicationArtifacts {
       const directoriesToRemove: string[] = []
       for (const entry of entries) {
         const unlinkable = entry.isFile() || entry.isSymbolicLink()
-        if ((entry.name === 'current.json.tmp' || entry.name === 'scan-resume.json.tmp' || entry.name === 'locations.json.tmp') && unlinkable) {
+        if ((entry.name === 'current.json.tmp' || entry.name === 'scan-resume.json.tmp' || entry.name === 'locations.json.tmp' || entry.name === 'scan-diagnostics.json.tmp') && unlinkable) {
           entriesToUnlink.push(join(this.directory, entry.name))
           continue
         }

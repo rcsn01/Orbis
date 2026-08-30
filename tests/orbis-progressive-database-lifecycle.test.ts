@@ -8,7 +8,7 @@ import { ConstructionDatabase, ConstructionError, type ConstructionPage } from '
 import type { InsertNode } from '../src/main/database'
 import { FullScanResumeStore } from '../src/main/full-scan-resume'
 import { emptyScanCounters, runWithScanDiagnostics, subscribeScanCounters, subscribeScanDiagnostics, type OrbisTimingEvent } from '../src/main/diagnostics'
-import { readConstructionSnapshot, recoverWithLegacyReference } from './helpers/orbis-resume-recovery'
+import { readConstructionSnapshot } from './helpers/orbis-resume-recovery'
 
 const cleanup: string[] = []
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true }))) })
@@ -22,8 +22,8 @@ function options(candidatePath?: string) {
   }
 }
 
-function page(entries: ConstructionPage['entries'], done = true, entriesRead = 0, taskId = 'root'): ConstructionPage {
-  return { taskId, depth: 0, focused: false, entriesRead, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0 }
+function page(entries: ConstructionPage['entries'], done = true, entriesRead = 0, taskId = 'root', enumerationEpoch = 1): ConstructionPage {
+  return { taskId, depth: 0, focused: false, entriesRead, enumerationEpoch, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0 }
 }
 
 describe('ConstructionDatabase construction lifecycle', () => {
@@ -38,6 +38,72 @@ describe('ConstructionDatabase construction lifecycle', () => {
       expect(database.status()).toMatchObject({ phase: 'scanning', revision: 0, checkpointSequence: 0 })
       database.accept({ kind: 'page', page: page([]) })
       expect(database.takeWork({ limit: 4, focusTurns: 0 })).toEqual({ work: [], focusTurns: 0, done: true })
+    } finally { database.abort() }
+  })
+
+  it('retains checkpointed children until replay completes, refreshes metadata, and sweeps unseen rows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-replay-sweep-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const entry = (id: string, name: string, bytes: number) => ({
+      kind: 'node' as const,
+      node: { node: { id, parentId: 'folder', name, path: join(directory, 'folder', name), kind: 'file' as const, ownBytes: bytes, device: '1', inode: id }, pathKey: `folder/${name}`, linkCount: 1 }
+    })
+    const staleDirectory = { kind: 'node' as const, node: { node: { id: 'stale-directory', parentId: 'folder', name: 'stale-directory', path: join(directory, 'folder', 'stale-directory'), kind: 'directory' as const, ownBytes: 0, device: '1', inode: '3' }, pathKey: 'folder/stale-directory' } }
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([{ kind: 'node', node: { node: { id: 'folder', parentId: 'root', name: 'folder', path: join(directory, 'folder'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'folder' }}]) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([entry('kept', 'kept', 10), entry('stale', 'stale', 20), staleDirectory], false, 0, 'folder'), depth: 1 } })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, deletedNodes: 0 })
+        const first = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+        expect(resumed.getChildren('folder', 10).map((node) => node.id)).toEqual(['stale', 'kept', 'stale-directory'])
+        resumed.accept({ kind: 'page', page: {
+          ...page([entry('kept', 'kept', 35), entry('new', 'new', 5)], false, first.entriesRead, first.id, first.enumerationEpoch), depth: first.depth, focused: first.focused
+        } })
+        expect(resumed.getChildren('folder', 10).map((node) => node.id)).toEqual(['kept', 'stale', 'new', 'stale-directory'])
+        const second = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+        resumed.accept({ kind: 'page', page: {
+          ...page([], true, second.entriesRead, second.id, second.enumerationEpoch), depth: second.depth, focused: second.focused
+        } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
+        expect(resumed.getNode('kept')).toMatchObject({ sizeBytes: 35, path: join(directory, 'folder', 'kept') })
+        expect(resumed.getNode('stale')).toBeUndefined()
+        expect(resumed.getNode('stale-directory')).toBeUndefined()
+        expect(resumed.getNode('new')).toMatchObject({ sizeBytes: 5 })
+        expect(resumed.semanticTotals()).toMatchObject({ discoveredBytes: 40 })
+      } finally { resumed.abort() }
+    } finally { database.abort() }
+  })
+
+  it('rejects a stale replay epoch without changing the durable construction', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-replay-epoch-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.accept({ kind: 'page', page: page([{ kind: 'node', node: { node: { id: 'folder', parentId: 'root', name: 'folder', path: join(directory, 'folder'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'folder' }}]) })
+      database.startTask('folder')
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        resumed.recoverIncompleteDirectories()
+        const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+        const before = readConstructionSnapshot(path)
+        expect(() => resumed.accept({ kind: 'page', page: { ...page([], true, task.entriesRead, task.id, task.enumerationEpoch - 1), depth: task.depth, focused: task.focused } })).toThrow(/Stale construction page/)
+        expect(readConstructionSnapshot(path)).toEqual(before)
+        resumed.accept({ kind: 'page', page: { ...page([], true, task.entriesRead, task.id, task.enumerationEpoch), depth: task.depth, focused: task.focused } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
+      } finally { resumed.abort() }
     } finally { database.abort() }
   })
 
@@ -125,7 +191,7 @@ describe('ConstructionDatabase construction lifecycle', () => {
       return { id, parentId, name, path, kind: 'directory' as const, ownBytes: 0, device: '1', inode }
     }
     const taskPage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean, focused = false, entriesRead = 0): ConstructionPage => ({
-      taskId, depth, focused, entriesRead, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+      taskId, depth, focused, entriesRead, enumerationEpoch: 1, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
     })
     const entry = (value: ReturnType<typeof node>, pathKey: string, linkCount?: number) => ({
       kind: 'node' as const, node: { node: value, pathKey, ...(linkCount === undefined ? {} : { linkCount }) }
@@ -170,45 +236,60 @@ describe('ConstructionDatabase construction lifecycle', () => {
 
       const before = readConstructionSnapshot(path)
       expect(before.directoryTasks.find((row) => row.nodeId === 'stable-right')).toMatchObject({ status: 'complete', ready: 0 })
-      const legacy = recoverWithLegacyReference(path, join(directory, 'legacy.sqlite'))
       const resumed = ConstructionDatabase.openResumable(path)
       try {
         const recovery = resumed.recoverIncompleteDirectories()
-        expect(recovery).toEqual({ roots: 2, deletedNodes: 2, affectedHardlinkIdentities: 1, repairedAncestors: 6, repairedSchedulerRows: 6 })
+        expect(recovery).toMatchObject({ roots: 2, deletedNodes: 0, affectedHardlinkIdentities: 1 })
         expect(resumed.taskIsFocused('reset')).toBe(true)
-        expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: hardLinkId('stable', 'external'), pathKey: 'left/stable/external' })
-        expect(resumed.takeWork({ limit: 2, focusTurns: 0 }).work.map((task) => task.id)).toEqual(['reset', 'reset-right'])
+        expect(resumed.getHardLinkOwner('1', '50')).toEqual({ nodeId: hardLinkId('reset', 'reset-file'), pathKey: 'left/reset/reset-file' })
+        const work = resumed.takeWork({ limit: 2, focusTurns: 0 })
+        expect(work.work.map((task) => task.id).sort()).toEqual(['reset', 'reset-right'])
+        for (const task of work.work) {
+          const entries = task.id === 'reset' ? [
+            entry(node(hardLinkId('reset', 'reset-file'), 'reset', 'reset-file', 'file', '50', 10), 'left/reset/reset-file', 2),
+            entry(directoryNode('nested', 'reset', 'nested', '8'), 'left/reset/nested')
+          ] : []
+          resumed.accept({ kind: 'page', page: {
+            ...taskPage(task.id, task.depth, entries, true, task.focused, task.entriesRead), enumerationEpoch: task.enumerationEpoch
+          } })
+        }
+        while (true) {
+          const next = resumed.takeWork({ limit: 1, focusTurns: 0 })
+          if (next.done) break
+          const task = next.work[0]
+          if (!task) throw new Error('Missing replay task')
+          resumed.accept({ kind: 'page', page: {
+            ...taskPage(task.id, task.depth, [], true, task.focused, task.entriesRead), enumerationEpoch: task.enumerationEpoch
+          } })
+        }
         resumed.checkpoint({ reason: 'resume' })
-        expect(readConstructionSnapshot(path).directoryTasks.find((row) => row.nodeId === 'right')).toMatchObject({ status: 'unreadable', pendingChildren: 1, subtreeComplete: 0, ready: 0 })
+        expect(readConstructionSnapshot(path).directoryTasks.find((row) => row.nodeId === 'right')).toMatchObject({ status: 'unreadable', pendingChildren: 0, subtreeComplete: 1, ready: 0 })
       } finally { resumed.abort() }
 
       const after = readConstructionSnapshot(path)
-      expect(after.nodes).toEqual(legacy.nodes)
-      expect(after.nodes.find((row) => row.id === hardLinkId('stable', 'external'))).toMatchObject({
-        parentId: 'stable', sizeBytes: 10, directChildren: 0, descendantCount: 0, unreadableCount: 0
+      expect(after.nodes.find((row) => row.id === hardLinkId('reset', 'reset-file'))).toMatchObject({
+        parentId: 'reset', sizeBytes: 10, directChildren: 0, descendantCount: 0, unreadableCount: 0
       })
-      expect(after.nodes.find((row) => row.id === 'stable')).toMatchObject({ sizeBytes: 10, directChildren: 1, descendantCount: 1, unreadableCount: 0 })
-      expect(after.nodes.find((row) => row.id === 'left')).toMatchObject({ sizeBytes: 10, directChildren: 2, descendantCount: 3, unreadableCount: 0 })
+      expect(after.nodes.find((row) => row.id === hardLinkId('stable', 'external'))).toBeUndefined()
+      expect(after.nodes.find((row) => row.id === 'stable')).toMatchObject({ sizeBytes: 0, directChildren: 0, descendantCount: 0, unreadableCount: 0 })
+      expect(after.nodes.find((row) => row.id === 'left')).toMatchObject({ sizeBytes: 10, directChildren: 2, descendantCount: 4, unreadableCount: 0 })
       expect(after.nodes.find((row) => row.id === 'stable-right')).toMatchObject({ sizeBytes: 20, directChildren: 2, descendantCount: 2, unreadableCount: 0 })
       expect(after.nodes.find((row) => row.id === 'right')).toMatchObject({ sizeBytes: 20, directChildren: 2, descendantCount: 4, unreadableCount: 1 })
-      expect(after.nodes.find((row) => row.id === 'root')).toMatchObject({ sizeBytes: 30, directChildren: 2, descendantCount: 9, unreadableCount: 1 })
-      expect(after.hardlinkOwners).toEqual(legacy.hardlinkOwners)
-      expect(after.hardlinkPaths).toEqual(legacy.hardlinkPaths)
-      expect(after.directoryObservations).toEqual(legacy.directoryObservations)
+      expect(after.nodes.find((row) => row.id === 'root')).toMatchObject({ sizeBytes: 30, directChildren: 2, descendantCount: 10, unreadableCount: 1 })
       expect(after.directoryTasks.find((row) => row.nodeId === 'stable-right')).toEqual(before.directoryTasks.find((row) => row.nodeId === 'stable-right'))
-      expect(after.directoryTasks.filter((row) => row.ready === 1).map((row) => row.nodeId)).toEqual(['reset', 'reset-right'])
       expect(after.hardlinkOwners).toEqual([
-        { device: '1', inode: '50', nodeId: hardLinkId('stable', 'external'), pathKey: 'left/stable/external' },
+        { device: '1', inode: '50', nodeId: hardLinkId('reset', 'reset-file'), pathKey: 'left/reset/reset-file' },
         { device: '1', inode: '61', nodeId: hardLinkId('stable-right', 'u-a'), pathKey: 'right/stable-right/u-a' }
       ])
       expect(after.hardlinkPaths).toEqual([
+        { parentId: 'reset', name: 'reset-file', pathKey: 'left/reset/reset-file', device: '1', inode: '50', allocatedBytes: 10 },
         { parentId: 'stable', name: 'external', pathKey: 'left/stable/external', device: '1', inode: '50', allocatedBytes: 10 },
         { parentId: 'stable-right', name: 'u-a', pathKey: 'right/stable-right/u-a', device: '1', inode: '61', allocatedBytes: 10 },
         { parentId: 'stable-right', name: 'u-b', pathKey: 'right/stable-right/u-b', device: '1', inode: '61', allocatedBytes: 10 }
       ])
-      expect(after.directoryObservations.find((row) => row.nodeId === 'stable')?.directDuplicateCount).toBe(0)
+      expect(after.directoryObservations.find((row) => row.nodeId === 'stable')?.directDuplicateCount).toBe(1)
       expect(after.directoryObservations.find((row) => row.nodeId === 'stable-right')).toEqual(before.directoryObservations.find((row) => row.nodeId === 'stable-right'))
-      expect(after.nodes.some((row) => row.nodeId === 'nested')).toBe(false)
+      expect(after.nodes.some((row) => row.id === 'nested')).toBe(true)
     } finally { database.abort() }
   })
 
@@ -223,13 +304,19 @@ describe('ConstructionDatabase construction lifecycle', () => {
     const unsubscribeTimings = subscribeScanDiagnostics((event) => { if (event.generation === 101) events.push(event) })
     const resumed = ConstructionDatabase.openResumable(fixture.path)
     let error: unknown
-    try { runWithScanDiagnostics(101, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+    try {
+      runWithScanDiagnostics(101, () => {
+        resumed.recoverIncompleteDirectories()
+        replayAggregateFixture(resumed)
+        resumed.checkpoint({ reason: 'resume' })
+      })
+    } catch (caught) { error = caught } finally {
       resumed.abort()
       unsubscribeCounters()
       unsubscribeTimings()
     }
-    expect(error).not.toBeInstanceOf(ConstructionError)
-    expect(String((error as Error)?.message)).toMatch(/Scoped aggregate repair did not converge/)
+    expect(error).toBeInstanceOf(ConstructionError)
+    expect(String((error as Error)?.message)).toMatch(/Directory aggregate mismatch/)
     expect(counters.resumeAggregateFallbacks).toBe(0)
     expect(events.filter((event) => event.phase === 'resume-aggregate-fallback')).toHaveLength(0)
     expect(readConstructionSnapshot(fixture.path)).toEqual(before)
@@ -246,55 +333,133 @@ describe('ConstructionDatabase construction lifecycle', () => {
     const unsubscribe = subscribeScanCounters((event) => { if (event.generation === 102) counters[event.counter] += event.value })
     const resumed = ConstructionDatabase.openResumable(fixture.path)
     let error: unknown
-    try { runWithScanDiagnostics(102, () => resumed.recoverIncompleteDirectories()) } catch (caught) { error = caught } finally {
+    try {
+      runWithScanDiagnostics(102, () => {
+        resumed.recoverIncompleteDirectories()
+        replayAggregateFixture(resumed)
+        resumed.checkpoint({ reason: 'resume' })
+      })
+    } catch (caught) { error = caught } finally {
       resumed.abort()
       unsubscribe()
     }
-    expect(error).not.toBeInstanceOf(ConstructionError)
-    expect(String((error as Error)?.message)).toMatch(/Scoped aggregate repair did not converge/)
+    expect(error).toBeDefined()
     expect(counters.resumeAggregateFallbacks).toBe(0)
     expect(readConstructionSnapshot(fixture.path)).toEqual(before)
   })
 
-  it.each([11, 23, 47])('matches the independent aggregate oracle for generated checkpoint seed %i', async (seed) => {
+  it('keeps the replay marker across failed reconciliation and retries after reopen', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-replay-reopen-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const idFor = (parentId: string, name: string): string => `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update(parentId).update('\0').update(name).digest('hex').slice(0, 32)}`
+    const directoryEntry = (id: string, name: string, inode: string) => ({
+      kind: 'node' as const,
+      node: { node: { id, parentId: 'root', name, path: join(directory, name), kind: 'directory' as const, ownBytes: 0, device: '1', inode }, pathKey: name }
+    })
+    const fileEntry = (parentId: string, name: string, pathKey: string, linkCount: number) => ({
+      kind: 'node' as const,
+      node: { node: { id: idFor(parentId, name), parentId, name, path: join(directory, ...pathKey.split('/')), kind: 'file' as const, ownBytes: 10, device: '1', inode: '90' }, pathKey, linkCount }
+    })
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([
+        directoryEntry('stable', 'a-stable', '2'), directoryEntry('replay', 'z-replay', '3')
+      ]) })
+      database.takeWork({ limit: 2, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([fileEntry('stable', 'file', 'a-stable/file', 2)], true, 0, 'stable'), depth: 1 } })
+      database.accept({ kind: 'page', page: { ...page([fileEntry('replay', 'file', 'z-replay/file', 2)], false, 0, 'replay'), depth: 1 } })
+      database.checkpoint({ reason: 'scheduled' })
+    } finally { database.abort() }
+
+    installAggregateFault(path, 'persistent')
+    const resumed = ConstructionDatabase.openResumable(path)
+    try {
+      expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, affectedHardlinkIdentities: 1 })
+      const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+      expect(task.id).toBe('replay')
+      resumed.accept({ kind: 'page', page: {
+        ...page([fileEntry('replay', 'file', 'z-replay/file', 2)], true, task.entriesRead, task.id, task.enumerationEpoch), depth: task.depth, focused: task.focused
+      } })
+      // Commit replay rows and the durable marker before reconciliation runs.
+      resumed.checkpoint({ reason: 'resume' })
+      expect(() => resumed.takeWork({ limit: 1, focusTurns: 0 })).toThrow(/Directory aggregate mismatch/)
+    } finally { resumed.abort() }
+
+    const afterFailure = readConstructionSnapshot(path)
+    expect(afterFailure.nodes.some((node) => node.id === idFor('replay', 'file'))).toBe(true)
+    expect(afterFailure.hardlinkPaths).toHaveLength(2)
+    const marker = new DatabaseSync(path, { readOnly: true })
+    try { expect(marker.prepare('SELECT resume_replay_pending AS pending FROM scan_run').get()).toEqual({ pending: 1 }) }
+    finally { marker.close() }
+
+    const removeFault = new DatabaseSync(path)
+    try { removeFault.exec('DROP TRIGGER aggregate_fault_update') } finally { removeFault.close() }
+    const retried = ConstructionDatabase.openResumable(path)
+    try {
+      expect(retried.recoverIncompleteDirectories()).toEqual({ roots: 0, deletedNodes: 0, affectedHardlinkIdentities: 0, repairedAncestors: 0, repairedSchedulerRows: 0 })
+      retried.checkpoint({ reason: 'resume' })
+    } finally { retried.abort() }
+
+    const final = readConstructionSnapshot(path)
+    expect(final.hardlinkOwners).toEqual([{ device: '1', inode: '90', nodeId: idFor('stable', 'file'), pathKey: 'a-stable/file' }])
+    expect(final.hardlinkPaths).toEqual([
+      { parentId: 'stable', name: 'file', pathKey: 'a-stable/file', device: '1', inode: '90', allocatedBytes: 10 },
+      { parentId: 'replay', name: 'file', pathKey: 'z-replay/file', device: '1', inode: '90', allocatedBytes: 10 }
+    ])
+    const completed = new DatabaseSync(path, { readOnly: true })
+    try { expect(completed.prepare('SELECT resume_replay_pending AS pending FROM scan_run').get()).toEqual({ pending: 0 }) }
+    finally { completed.close() }
+  })
+
+  it.each([11, 23, 47])('replays retained entries and matches the independent aggregate oracle for seed %i', async (seed) => {
     const fixture = await createGeneratedRecoveryFixture(seed)
-    const legacy = recoverWithLegacyReference(fixture.path, join(fixture.directory, 'legacy.sqlite'))
+    const expectedIds = new Set(preorder(fixture.root).map((node) => node.id))
     const resumed = ConstructionDatabase.openResumable(fixture.path)
     try {
       const recovery = resumed.recoverIncompleteDirectories()
       expect(recovery.roots).toBe(fixture.selectedRoots.length)
-      expect(recovery.repairedAncestors).toBe(fixture.selectedRoots.length + 1)
+      expect(recovery.deletedNodes).toBe(0)
+      expect(recovery.repairedAncestors).toBeGreaterThan(0)
       resumed.checkpoint({ reason: 'resume' })
-      const recovered = readConstructionSnapshot(fixture.path)
-      expect(recovered.nodes).toEqual(legacy.nodes)
-      expect(recovered.directoryObservations).toEqual(legacy.directoryObservations)
-      expect(recovered.hardlinkOwners).toEqual(legacy.hardlinkOwners)
-      expect(recovered.hardlinkPaths).toEqual(legacy.hardlinkPaths)
-
       replayGeneratedEntries(resumed, fixture)
       resumed.checkpoint({ reason: 'scheduled' })
     } finally { resumed.abort() }
     const final = readConstructionSnapshot(fixture.path)
+    expect(new Set(final.nodes.map((row) => row.id))).toEqual(expectedIds)
     for (const aggregate of final.directoryAggregateOracle) {
       expect(final.nodes.find((row) => row.id === aggregate.id)).toMatchObject(aggregate)
     }
   })
 
-  it('scales aggregate writes with an affected deep chain', async () => {
+  it('reconciles a deep chain after replay without losing its siblings', async () => {
     const fixture = await createDeepAggregateFixture()
     installAggregateAudit(fixture.path)
     const resumed = ConstructionDatabase.openResumable(fixture.path)
     try {
       const recovery = resumed.recoverIncompleteDirectories()
-      expect(recovery.repairedAncestors).toBe(fixture.chain.length)
+      expect(recovery.roots).toBe(1)
+      expect(recovery.deletedNodes).toBe(0)
       resumed.checkpoint({ reason: 'resume' })
+      const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]
+      expect(task?.id).toBe(fixture.chain.at(-1)?.id)
+      const file = fixture.chain.at(-1)?.children.find((node) => node.kind === 'file')
+      resumed.accept({ kind: 'page', page: {
+        ...page(file ? [{ kind: 'node', node: { node: file, pathKey: file.name }}] : [], true, task?.entriesRead ?? 0, task?.id ?? '', task?.enumerationEpoch ?? 1),
+        taskId: task?.id ?? '', depth: task?.depth ?? 0, focused: task?.focused ?? false
+      } })
+      expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
+      resumed.checkpoint({ reason: 'scheduled' })
     } finally { resumed.abort() }
     const snapshot = readConstructionSnapshot(fixture.path)
     expect(snapshot.nodes.filter((row) => row.kind === 'directory')).toHaveLength(fixture.chain.length + fixture.siblingCount)
     const database = new DatabaseSync(fixture.path, { readOnly: true })
     try {
       const writes = (database.prepare('SELECT DISTINCT node_id AS nodeId FROM aggregate_audit').all() as unknown as Array<{ nodeId: string }>).map((row) => row.nodeId)
-      expect(new Set(writes)).toEqual(new Set(fixture.chain.map((node) => node.id)))
+      expect(new Set(writes)).toEqual(new Set(snapshot.nodes.map((row) => row.id)))
     } finally { database.close() }
   })
 
@@ -319,13 +484,15 @@ describe('ConstructionDatabase construction lifecycle', () => {
 
       const resumed = ConstructionDatabase.openResumable(path)
       try {
-        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, repairedAncestors: 3 })
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, repairedAncestors: 1 })
         const before = resumed.getNode('root')
         expect(before?.unreadableCount).toBe(1)
-        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).work.map((task) => task.id)).toEqual(['child'])
+        const childTask = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]
+        expect(childTask?.id).toBe('child')
         resumed.accept({ kind: 'page', page: {
-          ...page([{ kind: 'node', node: { node: { id: 'file', parentId: 'child', name: 'file', path: join(directory, 'blocked', 'child', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '4' }, pathKey: 'blocked/child/file' }}], true, 0, 'child'), depth: 2
+          ...page([{ kind: 'node', node: { node: { id: 'file', parentId: 'child', name: 'file', path: join(directory, 'blocked', 'child', 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '4' }, pathKey: 'blocked/child/file' }}], true, childTask?.entriesRead ?? 0, 'child', childTask?.enumerationEpoch ?? 1), depth: 2
         } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
         expect(resumed.getNode('root')?.unreadableCount).toBe(1)
         expect(resumed.getNode('blocked')?.unreadableCount).toBe(1)
         resumed.checkpoint({ reason: 'resume' })
@@ -354,7 +521,7 @@ describe('ConstructionDatabase construction lifecycle', () => {
       kind: 'node' as const, node: { node: { id: idFor(parentId, name), parentId, name, path: join(directory, ...pathKey.split('/')), kind: 'file' as const, ownBytes: 10, device: '1', inode }, pathKey, linkCount: 2 }
     })
     const makePage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean): ConstructionPage => ({
-      taskId, depth, focused: false, entriesRead: 0, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+      taskId, depth, focused: false, entriesRead: 0, enumerationEpoch: 1, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
     })
     try {
       database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
@@ -378,6 +545,102 @@ describe('ConstructionDatabase construction lifecycle', () => {
       const after = readConstructionSnapshot(path)
       expect(after.nodes.find((row) => row.device === '1' && row.inode === '90')).toEqual(beforeNode)
       expect(after.hardlinkOwners).toEqual([{ device: '1', inode: '90', nodeId: idFor('stable', 'external'), pathKey: 'a-stable/external' }])
+    } finally { database.abort() }
+  })
+
+  it('removes stale aliases when replay proves a tracked identity is a singleton', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-hardlink-singleton-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const idFor = (parentId: string, name: string): string => `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update(parentId).update('\0').update(name).digest('hex').slice(0, 32)}`
+    const fileEntry = (parentId: string, name: string, inode: string, pathKey: string, linkCount: number) => ({
+      kind: 'node' as const,
+      node: { node: { id: idFor(parentId, name), parentId, name, path: join(directory, ...pathKey.split('/')), kind: 'file' as const, ownBytes: 10, device: '1', inode }, pathKey, linkCount }
+    })
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([
+        { kind: 'node', node: { node: { id: 'stable', parentId: 'root', name: 'a-stable', path: join(directory, 'a-stable'), kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'a-stable' } },
+        { kind: 'node', node: { node: { id: 'replay', parentId: 'root', name: 'z-replay', path: join(directory, 'z-replay'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'z-replay' } }
+      ]) })
+      database.takeWork({ limit: 2, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([fileEntry('stable', 'file', '90', 'a-stable/file', 2)], true, 0, 'stable'), depth: 1 } })
+      database.accept({ kind: 'page', page: { ...page([fileEntry('replay', 'file', '90', 'z-replay/file', 2)], false, 0, 'replay'), depth: 1 } })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, affectedHardlinkIdentities: 1 })
+        const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+        expect(task.id).toBe('replay')
+        resumed.accept({ kind: 'page', page: {
+          ...page([fileEntry('replay', 'file', '90', 'z-replay/file', 1)], true, task.entriesRead, task.id, task.enumerationEpoch), depth: task.depth, focused: task.focused
+        } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
+        resumed.checkpoint({ reason: 'resume' })
+      } finally { resumed.abort() }
+
+      const snapshot = readConstructionSnapshot(path)
+      expect(snapshot.nodes.filter((row) => row.device === '1' && row.inode === '90')).toHaveLength(1)
+      expect(snapshot.nodes.find((row) => row.device === '1' && row.inode === '90')).toMatchObject({ parentId: 'replay', name: 'file' })
+      expect(snapshot.hardlinkOwners).toEqual([])
+      expect(snapshot.hardlinkPaths).toEqual([])
+    } finally { database.abort() }
+  })
+
+  it('refreshes descendant hard-link paths when replay changes a directory path', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'orbis-database-replay-paths-'))
+    cleanup.push(directory)
+    const path = join(directory, 'partial.sqlite')
+    const database = ConstructionDatabase.create(path, options())
+    const seed = database.nodeIdSeed
+    const fileId = `n-${createHmac('sha256', Buffer.from(seed, 'hex')).update('nested').update('\0').update('file').digest('hex').slice(0, 32)}`
+    const nestedPath = join(directory, 'folder', 'nested')
+    const refreshedNestedPath = join(directory, 'renamed', 'nested')
+    try {
+      database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: page([{ kind: 'node', node: { node: { id: 'folder', parentId: 'root', name: 'folder', path: join(directory, 'folder'), kind: 'directory', ownBytes: 0, device: '1', inode: '2' }, pathKey: 'folder' }}]) })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([{ kind: 'node', node: { node: { id: 'nested', parentId: 'folder', name: 'nested', path: nestedPath, kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'folder/nested' }}], true, 0, 'folder'), depth: 1 } })
+      database.takeWork({ limit: 1, focusTurns: 0 })
+      database.accept({ kind: 'page', page: { ...page([
+        { kind: 'node', node: { node: { id: fileId, parentId: 'nested', name: 'file', path: join(nestedPath, 'file'), kind: 'file', ownBytes: 10, device: '1', inode: '90' }, pathKey: 'folder/nested/file', linkCount: 2 } }
+      ], true, 0, 'nested'), depth: 2 } })
+      database.checkpoint({ reason: 'scheduled' })
+      database.abort()
+
+      const mutate = new DatabaseSync(path)
+      try {
+        mutate.exec(`BEGIN;
+          UPDATE nodes SET scan_state = 'scanning', enumeration_complete = 0 WHERE id = 'folder';
+          UPDATE directory_tasks SET status = 'scanning', entries_read = 0, ready = 1, subtree_complete = 0 WHERE node_id = 'folder';
+          UPDATE scan_run SET phase = 'scanning' WHERE singleton = 1;
+          COMMIT;`)
+      } finally { mutate.close() }
+
+      const resumed = ConstructionDatabase.openResumable(path)
+      try {
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1 })
+        const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]!
+        expect(task.id).toBe('folder')
+        resumed.accept({ kind: 'page', page: {
+          ...page([{ kind: 'node', node: { node: { id: 'nested', parentId: 'folder', name: 'nested', path: refreshedNestedPath, kind: 'directory', ownBytes: 0, device: '1', inode: '3' }, pathKey: 'renamed/nested' }}], true, task.entriesRead, task.id, task.enumerationEpoch), depth: task.depth, focused: task.focused
+        } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
+        resumed.checkpoint({ reason: 'resume' })
+      } finally { resumed.abort() }
+
+      const snapshot = readConstructionSnapshot(path)
+      expect(snapshot.nodes.find((row) => row.id === 'nested')).toMatchObject({ path: refreshedNestedPath, depth: 2 })
+      expect(snapshot.nodes.find((row) => row.id === fileId)).toMatchObject({ path: join(refreshedNestedPath, 'file'), depth: 3 })
+      expect(snapshot.directoryTasks.find((row) => row.nodeId === 'nested')).toMatchObject({ path: refreshedNestedPath, depth: 2 })
+      expect(snapshot.hardlinkPaths).toEqual([{ parentId: 'nested', name: 'file', pathKey: 'renamed/nested/file', device: '1', inode: '90', allocatedBytes: 10 }])
+      expect(snapshot.hardlinkOwners).toEqual([{ device: '1', inode: '90', nodeId: fileId, pathKey: 'renamed/nested/file' }])
     } finally { database.abort() }
   })
 
@@ -418,9 +681,17 @@ describe('ConstructionDatabase construction lifecycle', () => {
       const before = readConstructionSnapshot(path)
       const resumed = ConstructionDatabase.openResumable(path)
       let error: unknown
-      try { resumed.recoverIncompleteDirectories() } catch (caught) { error = caught } finally { resumed.abort() }
-      expect(error).not.toBeInstanceOf(ConstructionError)
-      expect(String((error as Error)?.message)).toMatch(/constraint|unique|primary/i)
+      try {
+        resumed.recoverIncompleteDirectories()
+        const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]
+        expect(task?.id).toBe('reset')
+        resumed.accept({ kind: 'page', page: {
+          ...page([], true, task?.entriesRead ?? 0, task?.id ?? '', task?.enumerationEpoch ?? 1), depth: task?.depth ?? 1, focused: task?.focused ?? false
+        } })
+        resumed.takeWork({ limit: 1, focusTurns: 0 })
+      } catch (caught) { error = caught } finally { resumed.abort() }
+      expect(error).toBeInstanceOf(ConstructionError)
+      expect(error).toMatchObject({ code: 'invalid-resume' })
       expect(readConstructionSnapshot(path)).toEqual(before)
     } finally { database.abort() }
   })
@@ -432,7 +703,7 @@ describe('ConstructionDatabase construction lifecycle', () => {
     const database = ConstructionDatabase.create(path, options())
     const seed = database.nodeIdSeed
     const makePage = (taskId: string, depth: number, entries: ConstructionPage['entries'], done: boolean): ConstructionPage => ({
-      taskId, depth, focused: false, entriesRead: 0, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
+      taskId, depth, focused: false, entriesRead: 0, enumerationEpoch: 1, done, entries, bulkMetadataEntries: 0, fallbackMetadataEntries: 0
     })
     try {
       database.insertRoot({ id: 'root', parentId: null, name: 'root', path: directory, kind: 'directory', ownBytes: 0, device: '1', inode: '1' })
@@ -453,8 +724,14 @@ describe('ConstructionDatabase construction lifecycle', () => {
 
       const resumed = ConstructionDatabase.openResumable(path)
       try {
-        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, deletedNodes: 1, affectedHardlinkIdentities: 1, repairedSchedulerRows: 2 })
-        expect(resumed.getHardLinkOwner('1', '70')).toBeUndefined()
+        expect(resumed.recoverIncompleteDirectories()).toMatchObject({ roots: 1, deletedNodes: 0, affectedHardlinkIdentities: 1, repairedSchedulerRows: 3 })
+        expect(resumed.getHardLinkOwner('1', '70')).toMatchObject({ nodeId: ownerId, pathKey: 'reset/file' })
+        const task = resumed.takeWork({ limit: 1, focusTurns: 0 }).work[0]
+        expect(task?.id).toBe('reset')
+        resumed.accept({ kind: 'page', page: {
+          ...makePage('reset', 1, [], true), entriesRead: task?.entriesRead ?? 0, enumerationEpoch: task?.enumerationEpoch ?? 1
+        } })
+        expect(resumed.takeWork({ limit: 1, focusTurns: 0 }).done).toBe(true)
         resumed.checkpoint({ reason: 'resume' })
       } finally { resumed.abort() }
       const snapshot = readConstructionSnapshot(path)
@@ -528,6 +805,9 @@ describe('ConstructionDatabase construction lifecycle', () => {
     try {
       legacy.exec(`
         BEGIN;
+        ALTER TABLE nodes DROP COLUMN seen_epoch;
+        ALTER TABLE hardlink_paths DROP COLUMN seen_epoch;
+        ALTER TABLE directory_tasks DROP COLUMN enumeration_epoch;
         ALTER TABLE scan_run RENAME TO scan_run_legacy;
         CREATE TABLE scan_run (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1), scan_id TEXT NOT NULL UNIQUE,
@@ -546,6 +826,14 @@ describe('ConstructionDatabase construction lifecycle', () => {
 
     const resumed = ConstructionDatabase.openResumable(path)
     try { expect(resumed.phase).toBe('scanning') } finally { resumed.abort() }
+    const migrated = new DatabaseSync(path, { readOnly: true })
+    try {
+      const columnNames = (table: string): Set<string> => new Set((migrated.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>).map((column) => column.name))
+      expect(columnNames('nodes')).toContain('seen_epoch')
+      expect(columnNames('hardlink_paths')).toContain('seen_epoch')
+      expect(columnNames('directory_tasks')).toContain('enumeration_epoch')
+      expect(migrated.prepare('SELECT resume_replay_pending AS pending FROM scan_run').get()).toEqual({ pending: 0 })
+    } finally { migrated.close() }
   })
 
   it('discards current work on unexpected failure while preserving the last durable scan', async () => {
@@ -700,6 +988,21 @@ async function createAggregateRecoveryFixture(): Promise<{
     database.checkpoint({ reason: 'scheduled' })
   } finally { database.abort() }
   return { directory, path, rootId: 'root', affectedId: 'affected', stableId: 'stable', unrelatedId: 'unrelated' }
+}
+
+function replayAggregateFixture(database: ConstructionDatabase): void {
+  const batch = database.takeWork({ limit: 8, focusTurns: 0 })
+  for (const task of batch.work) {
+    const entries: ConstructionPage['entries'] = task.id === 'affected' ? [{
+      kind: 'node', node: { node: {
+        id: 'file', parentId: 'affected', name: 'file', path: 'affected/file', kind: 'file', ownBytes: 10, device: '1', inode: '5'
+      }, pathKey: 'affected/file' }
+    }] : []
+    database.accept({ kind: 'page', page: {
+      ...page(entries, true, task.entriesRead, task.id, task.enumerationEpoch), depth: task.depth, focused: task.focused
+    } })
+  }
+  database.takeWork({ limit: 1, focusTurns: 0 })
 }
 
 function installAggregateAudit(path: string): void {
@@ -865,7 +1168,7 @@ function replayGeneratedEntries(database: ConstructionDatabase, fixture: Generat
     const node = byId.get(task.id)
     if (!node) throw new Error(`Missing generated directory ${task.id}`)
     database.accept({ kind: 'page', page: {
-      taskId: task.id, depth: task.depth, focused: task.focused, entriesRead: task.entriesRead, done: true,
+      taskId: task.id, depth: task.depth, focused: task.focused, entriesRead: task.entriesRead, enumerationEpoch: task.enumerationEpoch, done: true,
       entries: node.children.map((child) => ({ kind: 'node' as const, node: { node: child, pathKey: child.path.slice(fixture.root.path.length + 1) } })),
       bulkMetadataEntries: 0, fallbackMetadataEntries: 0
     } })

@@ -9,7 +9,7 @@ import { Progress } from "@moirasia/ui-react/components/progress"
 import { AlertCircle, ChevronLeft, RefreshCw, Square } from "@moirasia/ui-react/lib/icons"
 import type { ChartSegment, LocationId, NodeSummary, OrbisApi, OrbisSnapshot } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
-import { scanStatusPresentation } from "./scan-presentation"
+import { displayedVolume, scanStatusPresentation } from "./scan-presentation"
 import { Sunburst } from "./Sunburst"
 
 interface SelectedNode {
@@ -147,7 +147,7 @@ function PermissionWarning({ snapshot, onOpen }: { readonly snapshot: OrbisSnaps
 }
 
 function VolumeSummary({ snapshot }: { readonly snapshot: OrbisSnapshot }): React.JSX.Element {
-  const { capacityBytes, freeBytes, scannedBytes, unscannedBytes, sizeAccuracy } = snapshot.volume
+  const { capacityBytes, freeBytes, scannedBytes, unscannedBytes, sizeAccuracy } = displayedVolume(snapshot)
   return <div className="orbis-feature-panel__volume-summary" aria-label={`Storage summary, ${accuracyLabel(sizeAccuracy, snapshot.focus?.scanState ?? "queued")}`}>
     <Metric label="Capacity" value={formatBytes(capacityBytes)} />
     <Metric label="Free" value={formatBytes(freeBytes)} />

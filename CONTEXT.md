@@ -1,8 +1,9 @@
 # Orbis domain vocabulary
 
-- **Resume preparation**: the path-free, indeterminate UI state between accepting Resume and the first resumed traversal update. It keeps the last durable construction preview visible while the worker validates history, recovers interrupted work, repairs the index, and starts traversal.
+- **Resume preparation**: the path-free, indeterminate UI state between accepting Resume and the first resumed traversal update. It keeps the last durable construction preview visible while the worker validates history, marks replay epochs, recovers interrupted work, and starts traversal.
 - **Resume validation receipt**: an in-memory proof tied to one validated descriptor, checkpoint row, database file, and SQLite sidecar set. It crosses from the main process to one worker attempt; it never authorizes a path and any mismatch returns to authoritative validation.
-- **Affected recovery set**: the interrupted roots, deleted descendants, hard-link identities, owner parents, and ancestor rows captured before construction recovery mutates the database. It bounds hard-link, scheduler, and directory-aggregate repair without changing the saved schema; a scoped aggregate mismatch aborts recovery rather than triggering a global rebuild.
+- **Resume replay**: schema-4 recovery of each interrupted directory from offset zero. Existing rows remain visible while epoch-marked pages refresh them; completion removes unseen direct children, then a final reconciliation rebuilds hard-link ownership, aggregates, and scheduler state. The replay-pending marker remains durable until reconciliation succeeds.
+- **Scan-failure diagnostics**: a bounded, path-free, mode-0600 record in `indexes/scan-diagnostics.json`. It stores only lifecycle stages, typed checkpoint/native capability evidence, and sanitized failure codes; atomic writes are best effort and never block settlement.
 
 Settled terms used across the codebase. Keep these meanings stable when naming
 new symbols or writing docs.
@@ -36,9 +37,10 @@ new symbols or writing docs.
 
 - **construction database** — the private worker-side SQLite file behind
   `ProgressiveScanDatabase`. It holds the in-progress scan (nodes, tasks,
-  estimates, journal state) and is the source for `ProgressivePreview`
-  snapshots while a scan runs. It is never published as-is; `finalize()` drops
-  its construction-only tables before the file becomes a published index.
+  estimates, journal state, and schema-4 replay epochs) and is the source for
+  `ProgressivePreview` snapshots while a scan runs. It is never published as-is;
+  `finalize()` drops its construction-only tables before the file becomes a
+  published index.
 
 - **preview** — a path-free `ProgressivePreview` snapshot of the construction
   database, emitted during a scan and rebuilt from a saved construction file
@@ -63,7 +65,7 @@ new symbols or writing docs.
   `nodeFromRow` mapping. Breadcrumbs are all-or-nothing: a corrupt parent
   chain yields `[]`, never a partial trail.
 
-- **hard-link path** — one row in schema-3 `hardlink_paths`. Orbis stores these rows only for file identities whose observed link count is not exactly one. A tracked identity has all observed paths, one visible `nodes` row at the UTF-8 binary-minimum path, and one `hardlink_groups` row. Exact single-link files have no hard-link path row.
+- **hard-link path** — one row in construction schema-4 `hardlink_paths` (and in published schema 3 before finalization drops construction tables). Orbis stores these rows only for file identities whose observed link count is not exactly one. A tracked identity has all observed paths, one visible `nodes` row at the UTF-8 binary-minimum path, and one `hardlink_groups` row after reconciliation/publication. Exact single-link files have no hard-link path row.
 
 - **ready task** — a construction directory task whose parent enumeration is terminal. `pending_children` counts unsettled direct child subtrees, while `subtree_complete` records whether the task and every descendant are terminal. Enumeration status and subtree completion are separate states.
 
@@ -82,6 +84,8 @@ new symbols or writing docs.
   to injected catalog-side operations. It does not own the worker session,
   catalog transactions, snapshot assembly, or renderer navigation policy. See
   `ORBIS_SCAN_RUN_LIFECYCLE_PLAN.md`.
+
+- **publication settlement** — the catalog-side conversion of a terminal scan run's outcome into an immutable publication. It owns stale-base checks, coverage publication candidate installation, the post-commit best-effort ritual (Resume retirement, focus restore, estimate-cache store, run-file discard), and the single disposition vocabulary for stale candidates. It does not own the scan run lifecycle's run identity, worker session, renderer navigation policy, or catalog record creation.
 
 - **publication-owned artifact** — a recognized direct child of the private
   indexes directory that Orbis may remove: a published index, construction

@@ -2,7 +2,9 @@ import type { ProgressSnapshot } from '../shared/contracts'
 import { isResumePreparationPhase, RESUME_PREPARATION_PHASES, type ResumeMilestone, type ResumePreparationPhase } from './diagnostics'
 import type { JournalCursor } from './index-manifest'
 import { PublicationArtifacts } from './publication-artifacts'
-import type { FolderSizeEstimate } from './scan-metadata'
+import type { FolderSizeEstimate, NativeAddonStatus } from './scan-metadata'
+import { ScanFailureDiagnosticsStore, type ScanFailureDiagnosticsFailureInput, type ScanFailureKind } from './scan-failure-diagnostics'
+import type { ConstructionCheckpointNotice } from './construction-database'
 import type { ActivePersistentIndex } from './refresh-engine'
 import type { ResumeValidationReceipt } from './full-scan-resume'
 import type { ProgressivePreview, ScanResult, ScanTotals } from './scanner'
@@ -59,25 +61,33 @@ export interface ScanSession {
 
 export interface ScanExecution {
   start(request: ScanExecutionRequest): Promise<ScanSession>
+  recordFailure?(generation: number, failure: Omit<ScanFailureDiagnosticsFailureInput, 'generation'>): Promise<void>
   close(): Promise<void>
 }
 
 export interface WorkerScanExecutionOptions {
   readonly pauseTimeoutMs?: number
   readonly discardStaleCandidate?: (path: string, indexDirectory: string) => Promise<void>
+  readonly diagnostics?: ScanFailureDiagnosticsStore | (() => ScanFailureDiagnosticsStore | undefined)
 }
+
+type DiagnosticsProvider = ScanFailureDiagnosticsStore | (() => ScanFailureDiagnosticsStore | undefined)
 
 export class WorkerScanExecution implements ScanExecution {
   readonly #pauseTimeoutMs: number
   readonly #discardStaleCandidate: (path: string, indexDirectory: string) => Promise<void>
+  readonly #diagnostics: DiagnosticsProvider | undefined
   #generation = 0
   #active: WorkerScanSession | undefined
+  #diagnosticsResolved = false
+  #diagnosticsInstance: ScanFailureDiagnosticsStore | undefined
   #startQueue: Promise<void> = Promise.resolve()
   #closed = false
 
   constructor(private readonly workers: WorkerTransportFactory, options: WorkerScanExecutionOptions = {}) {
     this.#pauseTimeoutMs = options.pauseTimeoutMs ?? 250
     this.#discardStaleCandidate = options.discardStaleCandidate ?? discardStaleCandidate
+    this.#diagnostics = options.diagnostics
   }
 
   async start(request: ScanExecutionRequest): Promise<ScanSession> {
@@ -89,19 +99,31 @@ export class WorkerScanExecution implements ScanExecution {
       if (this.#closed) throw new Error('Scan execution is closed')
       if (this.#active && !this.#active.settled) await this.#active.pause()
       const generation = ++this.#generation
+      const diagnostics = this.#resolveDiagnostics()
+      const diagnosticsStarted = Promise.resolve(diagnostics?.startRun({ generation, resumeExpected: request.resumeExpected === true })).catch(() => undefined)
       let worker: WorkerTransport
       try { worker = this.workers.create() }
-      catch (error) { return new FailedScanSession(error) }
+      catch (error) {
+        await diagnosticsStarted
+        void Promise.resolve(diagnostics?.recordFailure({ generation, kind: 'worker-transport', code: errorCode(error) })).catch(() => undefined)
+        return new FailedScanSession(error)
+      }
       const session = new WorkerScanSession(
-        worker, generation, request, this.#pauseTimeoutMs, this.#discardStaleCandidate,
+        worker, generation, request, this.#pauseTimeoutMs, this.#discardStaleCandidate, diagnostics,
         () => { if (this.#active === session && session.settled) this.#active = undefined }
       )
       this.#active = session
       session.start()
+      await diagnosticsStarted
       return session
     } finally {
       release()
     }
+  }
+
+  async recordFailure(generation: number, failure: Omit<ScanFailureDiagnosticsFailureInput, 'generation'>): Promise<void> {
+    const diagnostics = this.#resolveDiagnostics()
+    try { await diagnostics?.recordFailure({ generation, ...failure }) } catch { /* Diagnostics are best effort. */ }
   }
 
   async close(): Promise<void> {
@@ -111,6 +133,14 @@ export class WorkerScanExecution implements ScanExecution {
     const active = this.#active
     this.#active = undefined
     if (active && !active.settled) await active.pause()
+  }
+
+  #resolveDiagnostics(): ScanFailureDiagnosticsStore | undefined {
+    if (!this.#diagnosticsResolved) {
+      this.#diagnosticsResolved = true
+      this.#diagnosticsInstance = resolveDiagnostics(this.#diagnostics)
+    }
+    return this.#diagnosticsInstance
   }
 }
 
@@ -130,6 +160,10 @@ class WorkerScanSession implements ScanSession {
   #pauseRequestId: number | undefined
   #pauseAcknowledgement: ReturnType<typeof deferred<WorkerPausedMessage>> | undefined
   #stopPromise: Promise<void> | undefined
+  #failureInProgress = false
+  #failurePromise: Promise<void> | undefined
+  #latestCheckpoint: ConstructionCheckpointNotice | undefined
+  #nativeAddonStatus: NativeAddonStatus | undefined
 
   constructor(
     private readonly worker: WorkerTransport,
@@ -137,16 +171,18 @@ class WorkerScanSession implements ScanSession {
     private readonly request: ScanExecutionRequest,
     private readonly pauseTimeoutMs: number,
     private readonly discardStaleCandidate: (path: string, indexDirectory: string) => Promise<void>,
+    private readonly diagnostics: ScanFailureDiagnosticsStore | undefined,
     private readonly onSettled: () => void
   ) {}
 
   get settled(): boolean { return this.#terminal }
 
   start(): void {
+    void this.diagnostics?.setStage(this.generation, 'starting')
     this.worker.on('message', (message) => this.#handleMessage(message))
-    this.worker.on('error', (error) => this.#fail(error))
+    this.worker.on('error', (error) => this.#fail(error, 'worker-transport'))
     this.worker.on('exit', (code) => {
-      if (!this.#terminal && !this.#stopping) this.#fail(new Error(code === 0 ? 'The scan worker exited before completing.' : `The scan worker stopped unexpectedly (code ${code}).`))
+      if (!this.#terminal && !this.#stopping) this.#fail(new Error(code === 0 ? 'The scan worker exited before completing.' : `The scan worker stopped unexpectedly (code ${code}).`), 'worker-exit', code)
     })
     const message: WorkerMessage = {
       type: 'start', generation: this.generation, requestId: this.#requestId,
@@ -156,7 +192,7 @@ class WorkerScanSession implements ScanSession {
       ...(this.request.initialEstimate ? { initialEstimate: this.request.initialEstimate } : {}),
       ...(this.request.active ? { active: this.request.active } : {})
     }
-    try { this.worker.postMessage(message) } catch (error) { this.#fail(error) }
+    try { this.worker.postMessage(message) } catch (error) { this.#fail(error, 'worker-transport') }
   }
 
   async focus(nodeId: string): Promise<FocusOutcome> {
@@ -178,6 +214,7 @@ class WorkerScanSession implements ScanSession {
   }
 
   async pause(): Promise<ScanOutcome> {
+    if (this.#failureInProgress) await this.#failurePromise
     if (this.#terminal) {
       await this.#stopPromise
       return this.result
@@ -193,10 +230,18 @@ class WorkerScanSession implements ScanSession {
     this.#pauseRequestId = requestId
     this.#pauseAcknowledgement = deferred<WorkerPausedMessage>()
     try { this.worker.postMessage({ type: 'pause', generation: this.generation, requestId } satisfies WorkerMessage) } catch { /* Termination still preserves the last durable checkpoint. */ }
+    void this.diagnostics?.setStage(this.generation, 'pausing')
     const paused = await Promise.race([
       this.#pauseAcknowledgement.promise.then((message) => ({ acknowledged: true, checkpointSequence: message.checkpointSequence })),
       delay(this.pauseTimeoutMs).then(() => ({ acknowledged: false as const }))
     ])
+    if (paused.acknowledged) {
+      void Promise.resolve(this.diagnostics?.clearActive(this.generation)).catch(() => undefined)
+    } else {
+      void Promise.resolve(this.diagnostics?.recordFailure({ generation: this.generation, kind: 'pause-timeout', lifecycleStage: 'pausing',
+        ...(this.#latestCheckpoint ? { latestCheckpoint: this.#latestCheckpoint } : {}),
+        ...(this.#nativeAddonStatus ? { nativeAddon: this.#nativeAddonStatus } : {}) })).catch(() => undefined)
+    }
     await this.#terminate()
     if (!this.#terminal) this.#settle({ kind: 'paused', ...paused })
   }
@@ -215,10 +260,18 @@ class WorkerScanSession implements ScanSession {
       if (isComplete(message)) void this.#discard(message.result.publishedPath)
       return
     }
-    if (message.type === 'progress' && message.progress) {
+    if (message.type === 'checkpoint' && isCheckpoint(message.checkpoint)) {
+      this.#latestCheckpoint = message.checkpoint
+      void this.diagnostics?.setCheckpoint(this.generation, message.checkpoint)
+    } else if (message.type === 'native-addon-status' && isNativeAddonStatus(message.status)) {
+      this.#nativeAddonStatus = message.status
+      void this.diagnostics?.setNativeAddonStatus(this.generation, message.status)
+    } else if (message.type === 'progress' && message.progress) {
       this.#latestResumePreparation = RESUME_PREPARATION_PHASES.length
+      void this.diagnostics?.setStage(this.generation, message.progress.stage)
       this.#updates.push({ type: 'progress', progress: message.progress })
     } else if (message.type === 'resume-preparation' && message.requestId === this.#requestId && this.request.resumeExpected === true && isResumePreparationPhase(message.phase)) {
+      void this.diagnostics?.setStage(this.generation, message.phase)
       const phase = RESUME_PREPARATION_PHASES.indexOf(message.phase)
       if (phase > this.#latestResumePreparation) {
         this.#latestResumePreparation = phase
@@ -247,22 +300,37 @@ class WorkerScanSession implements ScanSession {
     } else if (isComplete(message)) {
       if (message.result.generation !== this.generation || message.result.target !== this.request.target || message.result.publishedPath !== this.request.publishedPath) {
         void this.#discard(message.result.publishedPath)
-        this.#fail(new Error('The scan worker returned an invalid publication.'))
-      } else this.#settle({ kind: 'completed', result: message.result, ...(message.refresh ? { refresh: message.refresh } : {}) })
+        this.#fail(new Error('The scan worker returned an invalid publication.'), 'invalid-publication')
+      } else void this.#complete({ kind: 'completed', result: message.result, ...(message.refresh ? { refresh: message.refresh } : {}) })
     } else if (message.type === 'unchanged' && message.journal && message.totals && typeof message.basePublicationId === 'string') {
-      this.#settle({ kind: 'unchanged', journal: message.journal, totals: message.totals, basePublicationId: message.basePublicationId })
+      void this.#clearAndSettle({ kind: 'unchanged', journal: message.journal, totals: message.totals, basePublicationId: message.basePublicationId })
     } else if (message.type === 'canceled') {
-      this.#settle({ kind: 'canceled' })
+      void this.#clearAndSettle({ kind: 'canceled' })
     } else if (message.type === 'error' && message.error && typeof message.error.message === 'string') {
       this.#fail(Object.assign(new Error(message.error.message), message.error.code ? { code: message.error.code } : {}))
     }
   }
 
-  #fail(error: unknown): void {
-    if (this.#terminal) return
-    const stopAfterFailure = !this.#stopping
-    this.#settle({ kind: 'failed', error: error instanceof Error ? error : new Error(String(error)) })
-    if (stopAfterFailure) this.#stopPromise ??= this.#stopAfterFailure()
+  #fail(error: unknown, kind: ScanFailureKind = 'worker-error', exitCode?: number): void {
+    if (this.#terminal || this.#stopping || this.#failureInProgress) return
+    this.#failureInProgress = true
+    const failure = error instanceof Error ? error : new Error(String(error))
+    void Promise.resolve(this.diagnostics?.recordFailure({ generation: this.generation, kind, code: errorCode(failure), exitCode,
+      ...(this.#latestCheckpoint ? { latestCheckpoint: this.#latestCheckpoint } : {}),
+      ...(this.#nativeAddonStatus ? { nativeAddon: this.#nativeAddonStatus } : {}) })).catch(() => undefined)
+    this.#settle({ kind: 'failed', error: failure })
+    this.#stopPromise ??= this.#stopAfterFailure()
+    this.#failurePromise = Promise.resolve()
+  }
+
+  #complete(outcome: Extract<ScanOutcome, { readonly kind: 'completed' }>): void {
+    void Promise.resolve(this.diagnostics?.clearActive(this.generation)).catch(() => undefined)
+    this.#settle(outcome)
+  }
+
+  #clearAndSettle(outcome: ScanOutcome): void {
+    void Promise.resolve(this.diagnostics?.clearActive(this.generation)).catch(() => undefined)
+    this.#settle(outcome)
   }
 
   async #stopAfterFailure(): Promise<void> {
@@ -351,6 +419,27 @@ function isResumeMilestone(value: unknown): value is ResumeMilestone {
 }
 function validRequestId(value: unknown, latest: number): value is number { return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= latest }
 function isComplete(value: Partial<WorkerResultMessage>): value is WorkerCompleteMessage { return value.type === 'complete' && !!value.result }
+function resolveDiagnostics(provider: DiagnosticsProvider | undefined): ScanFailureDiagnosticsStore | undefined {
+  try { return typeof provider === 'function' ? provider() : provider } catch { return undefined }
+}
+function errorCode(error: unknown): string | undefined {
+  const value = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined
+  return typeof value === 'string' && /^[A-Za-z0-9._-]{1,64}$/u.test(value) ? value : undefined
+}
+function isCheckpoint(value: unknown): value is ConstructionCheckpointNotice {
+  if (!value || typeof value !== 'object') return false
+  const checkpoint = value as Partial<ConstructionCheckpointNotice>
+  return typeof checkpoint.sequence === 'number' && Number.isSafeInteger(checkpoint.sequence) && checkpoint.sequence >= 0
+    && typeof checkpoint.count === 'number' && Number.isSafeInteger(checkpoint.count) && checkpoint.count >= 0
+    && typeof checkpoint.reason === 'string' && typeof checkpoint.phase === 'string'
+}
+function isNativeAddonStatus(value: unknown): value is NativeAddonStatus {
+  if (!value || typeof value !== 'object') return false
+  const status = value as Partial<NativeAddonStatus>
+  return (status.loadStatus === 'not-requested' || status.loadStatus === 'loaded' || status.loadStatus === 'load-failed' || status.loadStatus === 'unknown')
+    && (status.journalCapability === 'unknown' || status.journalCapability === 'available' || status.journalCapability === 'missing' || status.journalCapability === 'disabled')
+    && (status.metadataCapability === 'unknown' || status.metadataCapability === 'available' || status.metadataCapability === 'missing' || status.metadataCapability === 'disabled')
+}
 
 async function discardStaleCandidate(path: string, indexDirectory: string): Promise<void> {
   await new PublicationArtifacts(indexDirectory).discardUnreferencedDatabase(path)
