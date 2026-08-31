@@ -5,7 +5,7 @@ pub use fsevents::{capture_volume_checkpoint, read_changes};
 
 use napi::bindgen_prelude::{AsyncTask, Buffer, Error, Result, Task};
 use napi_derive::napi;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 #[cfg(target_os = "macos")]
 use std::fs::File;
 #[cfg(target_os = "macos")]
@@ -16,6 +16,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(target_os = "macos")]
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 
@@ -57,6 +59,44 @@ pub struct ReadPageOutput {
     done: bool,
     bulk_entries: i64,
     fallback_entries: i64,
+}
+
+#[napi(object)]
+pub struct NativeScanSummary {
+    pub elapsed_ms: f64,
+    pub scanned_items: i64,
+    pub files: i64,
+    pub directories: i64,
+    pub allocated_bytes: i64,
+    pub skipped_items: i64,
+    pub unreadable_items: i64,
+    pub nested_mounts: i64,
+    pub symlinks: i64,
+    pub duplicate_hard_links: i64,
+    pub bulk_calls: i64,
+}
+
+pub struct NativeScanTask {
+    target: String,
+}
+
+impl Task for NativeScanTask {
+    type Output = NativeScanSummary;
+    type JsValue = NativeScanSummary;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        #[cfg(target_os = "macos")]
+        { scan_tree_summary_impl(&self.target) }
+        #[cfg(not(target_os = "macos"))]
+        { Err(Error::from_reason("native tree scanning is only available on macOS")) }
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> { Ok(output) }
+}
+
+#[napi]
+pub fn scan_tree_summary(target: String) -> AsyncTask<NativeScanTask> {
+    AsyncTask::new(NativeScanTask { target })
 }
 
 #[napi]
@@ -535,6 +575,121 @@ fn parse_bulk_records(buffer: &[u8], count: usize, parent_device: u64) -> Result
         offset = record_end;
     }
     Ok(entries)
+}
+
+#[cfg(target_os = "macos")]
+fn scan_tree_summary_impl(target: &str) -> Result<NativeScanSummary> {
+    struct Frame {
+        file: File,
+        relative: String,
+        children: VecDeque<(String, String)>,
+        enumerated: bool,
+    }
+
+    let started = Instant::now();
+    let path = CString::new(Path::new(target).as_os_str().as_bytes()).map_err(|_| Error::from_reason("metadata target contains NUL"))?;
+    let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if descriptor < 0 { return Err(io_error(std::io::Error::last_os_error())); }
+    let root = unsafe { File::from_raw_fd(descriptor) };
+    let mut root_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(root.as_raw_fd(), root_stat.as_mut_ptr()) } != 0 { return Err(io_error(std::io::Error::last_os_error())); }
+    let root_stat = unsafe { root_stat.assume_init() };
+    let root_device = root_stat.st_dev as u64;
+    let mut summary = NativeScanSummary {
+        elapsed_ms: 0.0, scanned_items: 1, files: 0, directories: 1,
+        allocated_bytes: (root_stat.st_blocks as i128 * 512).clamp(0, i64::MAX as i128) as i64,
+        skipped_items: 0, unreadable_items: 0, nested_mounts: 0, symlinks: 0,
+        duplicate_hard_links: 0, bulk_calls: 0,
+    };
+    let mut identities = HashSet::<(u64, u64)>::new();
+    identities.insert((root_device, root_stat.st_ino as u64));
+    let startup = target == "/";
+    let mut stack = vec![Frame { file: root, relative: String::new(), children: VecDeque::new(), enumerated: false }];
+
+    while !stack.is_empty() {
+        let descend = {
+            let frame = stack.last_mut().unwrap();
+            if !frame.enumerated {
+                loop {
+                    summary.bulk_calls += 1;
+                    let entries = match read_bulk_records(frame.file.as_raw_fd(), root_device) {
+                        Ok(entries) => entries,
+                        Err(_) => {
+                            summary.skipped_items += 1;
+                            summary.unreadable_items += 1;
+                            break;
+                        }
+                    };
+                    if entries.is_empty() { break; }
+                    for entry in entries {
+                        let relative = if frame.relative.is_empty() { entry.name.clone() } else { format!("{}/{}", frame.relative, entry.name) };
+                        if startup && is_startup_exclusion(&relative) {
+                            summary.skipped_items += 1;
+                            continue;
+                        }
+                        if entry.error_code.is_some() {
+                            summary.skipped_items += 1;
+                            summary.unreadable_items += 1;
+                            continue;
+                        }
+                        if entry.kind == "symlink" {
+                            summary.skipped_items += 1;
+                            summary.symlinks += 1;
+                            continue;
+                        }
+                        if entry.mount_point || entry.device.parse::<u64>().ok().is_some_and(|device| device != root_device) {
+                            summary.skipped_items += 1;
+                            summary.nested_mounts += 1;
+                            continue;
+                        }
+                        if entry.kind != "file" && entry.kind != "directory" {
+                            summary.skipped_items += 1;
+                            continue;
+                        }
+                        let identity = entry.device.parse::<u64>().ok().zip(entry.inode.parse::<u64>().ok());
+                        if entry.kind == "file" && entry.link_count != 1 && identity.is_some_and(|value| !identities.insert(value)) {
+                            summary.skipped_items += 1;
+                            summary.duplicate_hard_links += 1;
+                            continue;
+                        }
+                        if entry.kind == "directory" {
+                            if let Some(value) = identity { identities.insert(value); }
+                            summary.directories += 1;
+                            frame.children.push_back((entry.name, relative));
+                        } else {
+                            summary.files += 1;
+                        }
+                        summary.scanned_items += 1;
+                        summary.allocated_bytes = summary.allocated_bytes.saturating_add(entry.allocated_bytes.max(0));
+                    }
+                }
+                frame.enumerated = true;
+            }
+            frame.children.pop_front().map(|(name, relative)| (frame.file.as_raw_fd(), name, relative))
+        };
+        if let Some((parent_fd, name, relative)) = descend {
+            let name = CString::new(name.into_bytes()).map_err(|_| Error::from_reason("metadata path contains NUL"))?;
+            let child = unsafe { libc::openat(parent_fd, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+            if child < 0 {
+                summary.skipped_items += 1;
+                summary.unreadable_items += 1;
+                continue;
+            }
+            stack.push(Frame { file: unsafe { File::from_raw_fd(child) }, relative, children: VecDeque::new(), enumerated: false });
+        } else {
+            stack.pop();
+        }
+    }
+    summary.elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    Ok(summary)
+}
+
+#[cfg(target_os = "macos")]
+fn is_startup_exclusion(relative: &str) -> bool {
+    const EXCLUSIONS: [&str; 8] = [
+        "System/Volumes", "Volumes", "dev", "Network", "net", "automount", "private/var/automount", "private/var/run",
+    ];
+    EXCLUSIONS.iter().any(|excluded| relative == *excluded || relative.strip_prefix(excluded).is_some_and(|rest| rest.starts_with('/')))
 }
 
 fn io_error(error: std::io::Error) -> Error {
