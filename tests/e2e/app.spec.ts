@@ -117,7 +117,9 @@ test("scans the fixture without touching the startup volume", async () => {
     await expect(page.getByText("Orbis", { exact: true })).toBeVisible()
     await page.getByRole("button", { name: "Scan", exact: true }).click()
     await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
-    await expect(page.getByText("Largest items", { exact: true })).toBeVisible()
+    const contents = page.getByRole("complementary", { name: "fixture contents" })
+    await expect(contents).toBeVisible()
+    await expect(contents.getByRole("button", { name: /Photos, directory/ })).toBeVisible()
     await expect(page.getByRole("button", { name: /large\.raw/ })).toBeVisible()
     await expect(page.getByRole("group", { name: "Disk usage sunburst" })).toBeVisible()
   } finally {

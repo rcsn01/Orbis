@@ -18,7 +18,7 @@ export function Sunburst({ segments, onActivate, provisionalState = "complete", 
   const center = 300
   return <div className="orbis-feature-panel__sunburst-wrap">
     <svg className="orbis-feature-panel__sunburst" viewBox="0 0 600 600" role="group" aria-label="Disk usage sunburst">
-      <title>Disk usage. Select a segment to inspect it.</title>
+      <title>Disk usage. Open a folder or reveal a file from its segment.</title>
       <defs><pattern id="orbis-provisional-hatch" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6 M -2 6 L 2 10 M 0 0 L 8 8 M 6 -2 L 10 2" className="orbis-feature-panel__sunburst-hatch-line" /></pattern><pattern id="orbis-estimated-dots" width="8" height="8" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /><circle cx="6" cy="6" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /></pattern></defs>
       {segments.map((segment) => {
         const inner = innerRadius + (segment.depth - 1) * ringWidth + 1
@@ -97,7 +97,7 @@ function point(cx: number, cy: number, radius: number, angle: number): { readonl
   return { x: cx + radius * Math.cos(radians), y: cy + radius * Math.sin(radians) }
 }
 
-function segmentColor(segment: ChartSegment): string {
+export function segmentColor(segment: ChartSegment): string {
   if (segment.kind === "other" || segment.kind === "unavailable") return "#89909a"
   const hue = hash(segment.colorKey) % 360
   const lightness = Math.max(30, 55 - (segment.depth - 1) * 5)
