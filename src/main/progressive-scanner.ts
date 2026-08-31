@@ -1,8 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto"
 import { lstat, open, opendir, realpath, rename, statfs } from "node:fs/promises"
 import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path"
-import type { Breadcrumb, ChartSegment, NodeSummary, VolumeSnapshot } from "../shared/contracts"
-import { buildChart } from "./chart"
 import { prepareDatabaseDirectory, removeDatabaseFiles } from "./database"
 import { createScanTimingAccumulator, measureScan, measureScanAsync, publishScanWork, recordScanCounter, runWithScanDiagnostics, type ResumeMilestone, type ResumePreparationPhase, type ScanTimingAccumulator } from "./diagnostics"
 import {
@@ -24,6 +22,7 @@ import {
   DEFAULT_METADATA_CONCURRENCY, STARTUP_EXCLUSIONS, ScanCanceledError,
   type ScanFileSystem, type ScanOptions, type ScanProgress, type ScanResult, type ScanStats, type ScanTotals
 } from "./legacy-scanner"
+import { projectSnapshotView, type SnapshotView } from './snapshot-projection'
 
 interface ScanWorkTimings {
   readonly scheduler: ScanTimingAccumulator
@@ -39,16 +38,10 @@ interface ActiveCursor {
   readonly source: "bulk" | "node"
 }
 
-export interface ProgressivePreview {
+export interface ProgressivePreview extends SnapshotView {
   readonly generation: number
   readonly revision: number
   readonly committed: false
-  readonly target: { readonly name: string; readonly isStartup: boolean }
-  readonly focus: NodeSummary
-  readonly breadcrumbs: readonly Breadcrumb[]
-  readonly chart: readonly ChartSegment[]
-  readonly largestItems: readonly NodeSummary[]
-  readonly volume: VolumeSnapshot
 }
 
 export class ResumeJournalInvalidatedError extends Error {
@@ -266,7 +259,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       database.setHardLinkOwner(part(preflight.rootStats.dev), part(preflight.rootStats.ino), rootId, "")
     }
     options.control.attach(database, rootId, () => {
-      queueMicrotask(() => { if (database && constructionActive) reporter.focus(database, preflight) })
+      queueMicrotask(() => { if (database && constructionActive) reporter.focus(database, preflight, rootId) })
     })
     if (totals.scannedItems === 0) totals.scannedItems = 1
     if (totals.discoveredBytes === 0) totals.discoveredBytes = rootBytes
@@ -275,7 +268,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
       database.applyEstimates(options.initialEstimate)
       database.bumpRevision()
     }
-    reporter.initial(database, preflight)
+    reporter.initial(database, preflight, rootId)
     reporter.progress(displayName(preflight.target), true)
 
     let focusTurns = 0
@@ -348,7 +341,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
             addConstructionTotals(totals, delta)
             const firstResumePage = reportAcceptedMetadataPage()
             checkpointDue()
-            reporter.batch(database!, task, preflight, task.id === rootId || firstResumePage)
+            reporter.batch(database!, task, preflight, rootId, task.id === rootId || firstResumePage)
             continue
           }
           const page = read.page
@@ -365,7 +358,7 @@ async function scanImpl(options: ProgressiveScanOptions): Promise<ScanResult> {
           const firstResumePage = page.entries.length > 0 || page.done ? reportAcceptedMetadataPage() : false
           if (page.entries.length === 0 && !page.done) options.onMetadataPageAccepted?.()
           if (page.done) await closeCursor(cursors, task.id)
-          reporter.batch(database!, task, preflight, task.id === rootId && firstRootPage || firstResumePage)
+          reporter.batch(database!, task, preflight, rootId, task.id === rootId && firstRootPage || firstResumePage)
           checkpointDue()
         }
       }
@@ -645,69 +638,61 @@ class PreviewReporter {
     this.#lastProgress = now
     this.options.onProgress?.({ stage, scannedItems: this.totals.scannedItems, discoveredBytes: this.totals.discoveredBytes, elapsedMs: now - this.startedAt, currentItem: item })
   }
-  focus(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  focus(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string): void {
     if (!this.#firstPreview) return
-    this.emit(database, volume, false)
+    this.emit(database, volume, rootId, false)
   }
-  estimate(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  estimate(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string): void {
     if (!this.#firstPreview) return
-    this.emit(database, volume, false)
+    this.emit(database, volume, rootId, false)
   }
-  initial(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }): void {
+  initial(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string): void {
     if (!this.options.onPreview) return
-    this.emit(database, volume, true, false)
+    this.emit(database, volume, rootId, true, false)
     // This bootstrap preview gives the renderer a root model before progress
     // starts. It must not delay the first data-bearing root-page preview.
     this.#firstPreview = false
     this.#lastPreview = 0
   }
-  batch(database: ConstructionDatabase, task: DirectoryTask, volume: { target: string; capacityBytes: number; freeBytes: number }, rootPageCompleted: boolean): void {
+  batch(database: ConstructionDatabase, task: DirectoryTask, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string, rootPageCompleted: boolean): void {
     this.progress(displayName(task.path))
     this.options.control.consumeFocusRequest()
     if (!this.options.onPreview) return
     const now = Date.now()
     if (!this.#firstPreview) {
       if (!rootPageCompleted) return
-      this.emit(database, volume, true)
+      this.emit(database, volume, rootId, true)
       return
     }
     if (now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
-    this.emit(database, volume, false)
+    this.emit(database, volume, rootId, false)
   }
   publishTimings(): void { this.#previewTiming.publish() }
-  private emit(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean, prepare = true): void {
+  private emit(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string, first: boolean, prepare = true): void {
     this.#previewTiming.measure(() => {
       if (prepare) database.preparePreviewReadModel()
-      this.build(database, volume, first)
+      this.build(database, volume, rootId, first)
     })
   }
-  private build(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, first: boolean): void {
+  private build(database: ConstructionDatabase, volume: { target: string; capacityBytes: number; freeBytes: number }, rootId: string, first: boolean): void {
     const now = Date.now()
     if (!first && now - this.#lastPreview < PREVIEW_INTERVAL_MS) return
     const onPreview = this.options.onPreview
     if (!onPreview) return
     const focusId = this.options.control.focusId
-    const focus = focusId ? database.getNode(focusId) : undefined
-    if (!focus || focus.kind !== "directory") return
+    if (!focusId) return
+    const projection = projectSnapshotView({
+      source: database,
+      rootId,
+      focusId,
+      target: { name: displayName(volume.target), isStartup: volume.target === '/' },
+      volume: { ...volume, scannedBytes: database.semanticTotals().discoveredBytes }
+    })
+    if (!projection) return
     this.#firstPreview = true
     this.#lastPreview = now
-    const breadcrumbs = database.getBreadcrumbs(focus.id)
-    const rootId = breadcrumbs[0]?.id ?? focus.id
-    const scannedBytes = database.semanticTotals().discoveredBytes
-    const unscannedBytes = volume.target === "/" ? Math.max(0, volume.capacityBytes - volume.freeBytes - scannedBytes) : 0
-    onPreview({
-      generation: this.options.generation, revision: database.revision, committed: false,
-      target: { name: displayName(volume.target), isStartup: volume.target === "/" },
-      focus: summary(focus), breadcrumbs, chart: buildChart(database, focus, {
-        rootTotalBytes: focus.id === rootId && volume.target === "/" ? volume.capacityBytes : 0
-      }), largestItems: database.getLargestItems(focus.id),
-      volume: { capacityBytes: volume.capacityBytes, freeBytes: volume.freeBytes, scannedBytes, unscannedBytes, sizeAccuracy: unscannedBytes > 0 ? "estimated" : focus.sizeAccuracy }
-    })
+    onPreview({ generation: this.options.generation, revision: database.revision, committed: false, ...projection })
   }
-}
-
-function summary(node: NonNullable<ReturnType<ConstructionDatabase["getNode"]>>): NodeSummary {
-  return { id: node.id, parentId: node.parentId, name: node.name, kind: node.kind, sizeBytes: node.sizeBytes, ...(node.estimatedBytes > 0 ? { estimatedSizeBytes: node.estimatedBytes } : {}), directChildren: node.directChildren, descendantCount: node.descendantCount, unreadableCount: node.unreadableCount, scanState: node.scanState, sizeAccuracy: node.sizeAccuracy }
 }
 
 async function closeCursor(cursors: Map<string, ActiveCursor>, id: string): Promise<void> {

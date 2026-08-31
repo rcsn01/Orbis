@@ -4,12 +4,12 @@ import { lstat, statfs } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { Breadcrumb, NodeSummary } from '../shared/contracts'
-import { buildChart } from './chart'
 import type { FullScanResumeLoad } from './full-scan-resume'
 import { isFullScanResumeDescriptor } from './full-scan-resume'
-import { CONSTRUCTION_NODE_SELECT, NodeReadModel, nodeFromRow, toSummary } from './index-store'
+import { CONSTRUCTION_NODE_SELECT, NodeReadModel, nodeFromRow } from './index-store'
 import type { ChartDataSource, DatabaseNode } from './index-store'
 import type { ProgressivePreview } from './scanner'
+import { projectSnapshotView } from './snapshot-projection'
 
 type ConstructionResumeLoad = Extract<FullScanResumeLoad, { readonly kind: 'construction' }>
 
@@ -26,34 +26,16 @@ export async function readConstructionPreview(
 ): Promise<ProgressivePreview | undefined> {
   if (!Number.isSafeInteger(generation) || generation < 0) return undefined
   return withConstructionDatabase(load, async (source, rootId, target, revision) => {
-    const focus = source.getNode(focusId ?? rootId)
-    if (!focus || focus.kind !== 'directory') return undefined
-    const breadcrumbs = source.getBreadcrumbs(focus.id)
-    if (breadcrumbs.length === 0 || breadcrumbs[0]?.id !== rootId || breadcrumbs.at(-1)?.id !== focus.id) return undefined
-    const root = source.getNode(rootId)
-    if (!root || root.kind !== 'directory') return undefined
     const volume = await readVolume(target)
     if (!volume) return undefined
-    const scannedBytes = source.semanticScannedBytes()
-    const unscannedBytes = target === '/' ? Math.max(0, volume.capacityBytes - volume.freeBytes - scannedBytes) : 0
-    const rootTotalBytes = focus.id === rootId && target === '/' ? volume.capacityBytes : 0
-    return {
-      generation,
-      revision,
-      committed: false,
+    const projection = projectSnapshotView({
+      source,
+      rootId,
+      focusId: focusId ?? rootId,
       target: { name: displayName(target), isStartup: target === '/' },
-      focus: toSummary(focus),
-      breadcrumbs,
-      chart: buildChart(source, focus, { rootTotalBytes }),
-      largestItems: source.getLargestItems(focus.id),
-      volume: {
-        capacityBytes: volume.capacityBytes,
-        freeBytes: volume.freeBytes,
-        scannedBytes,
-        unscannedBytes,
-        sizeAccuracy: unscannedBytes > 0 ? 'estimated' : focus.sizeAccuracy
-      }
-    }
+      volume: { ...volume, scannedBytes: source.semanticScannedBytes() }
+    })
+    return projection ? { generation, revision, committed: false, ...projection } : undefined
   })
 }
 

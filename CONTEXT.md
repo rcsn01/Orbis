@@ -47,6 +47,14 @@ new symbols or writing docs.
   after a pause. It carries summaries, breadcrumbs, a chart, and volume
   numbers, but never filesystem paths.
 
+- **snapshot projection** — the common path-free view built from an already-open
+  node read-model for committed, live construction, and resumed construction
+  snapshots. It owns focus validation, summaries, breadcrumbs, chart scaling,
+  largest items, and volume presentation. Disk capacity scales only the startup
+  publication root; a focused descendant uses its own contents as 100 percent.
+  It does not own source acquisition or lifecycle fields such as generation,
+  revision, committed state, saved locations, or scan status.
+
 - **estimate cache** — the app-private `folder-estimates.json` (mode 0600)
   holding root direct-child totals from the previous scan. It is reused as
   provisional `size_estimates` rows when a rescan starts, so the UI can show

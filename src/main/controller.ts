@@ -1,10 +1,8 @@
 import { lstat, readFile, rename, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, normalize, resolve } from 'node:path'
 import type { LocationId, OrbisSnapshot, SizeAccuracy } from '../shared/contracts'
-import { buildChart } from './chart'
 import { measureController } from './diagnostics'
 import { FullScanResumeStore } from './full-scan-resume'
-import { toSummary } from './index-store'
 import { createCoveragePublicationAccess, type CoveragePublicationAccess, type InstalledLocationAccess } from './coverage-publication-access'
 import { LocationCatalogStore, createEmptyCatalog, createLocationId, uniqueDisplayName, type LocationCatalogDocument, type SavedLocationRecord } from './location-catalog'
 import { IndexManifestStore, type IndexManifest } from './index-manifest'
@@ -15,6 +13,7 @@ import { createScanLifecycleDependencies } from './scan-start-adapters'
 import { ScanRunLifecycle } from './scan-run-lifecycle'
 import { errorCode, isMissingPath, isWithinPath, resolveTarget, validateRevealPath } from './scan-target'
 import type { ScanTotals } from './scanner'
+import { projectSnapshotView, type SnapshotVolumeFacts } from './snapshot-projection'
 
 export interface OrbisDialog { showOpenDialog(options: { readonly properties: Array<'openDirectory'> }): Promise<{ readonly canceled: boolean; readonly filePaths: readonly string[] }> }
 export interface OrbisShell { showItemInFolder(path: string): void; openExternal(url: string): Promise<void> }
@@ -157,27 +156,28 @@ export class OrbisController {
     }
     const timed = <T>(phase: string, operation: () => T): T => diagnosticGeneration === undefined ? operation() : measureController(diagnosticGeneration, phase, operation)
     const active = this.#coverageAccess.current()
-    const focus = timed('snapshot-focus-query', () => active && this.#focusId ? active.getNode(this.#focusId) : undefined)
     const totals = active ? parseTotals(active.metadata.totals) : null
     const root = timed('snapshot-root-query', () => active?.root)
-    const volume = active ? parseVolume(active.metadata.volume, root?.sizeBytes ?? 0, active.logicalTarget, root?.sizeAccuracy ?? 'partial') : emptyVolume()
-    const breadcrumbs = timed('snapshot-breadcrumbs-query', () => focus && active ? active.getBreadcrumbs(focus.id) : [])
-    const chart = timed('snapshot-chart-query', () => focus && active ? buildChart(active, focus, {
-      rootTotalBytes: focus.id === active.rootId && active.logicalTarget === '/' ? volume.capacityBytes : 0
-    }) : [])
-    const largestItems = timed('snapshot-largest-items-query', () => focus && active ? active.getLargestItems(focus.id) : [])
-    const summary = focus ? toSummary(focus) : null
+    const target = { name: root?.name ?? selected.displayName, isStartup: selected.target === '/' }
+    const volumeFacts = active ? parseVolumeFacts(active.metadata.volume, root?.sizeBytes ?? 0, root?.sizeAccuracy ?? 'partial') : undefined
+    const projection = timed('snapshot-projection-query', () => active && this.#focusId && volumeFacts ? projectSnapshotView({
+      source: active,
+      rootId: active.rootId,
+      focusId: this.#focusId,
+      target,
+      volume: volumeFacts
+    }) : undefined)
     return {
       version: 4,
       committed: !!active,
       selectedLocationId: selected.id,
       locations,
-      target: { name: root?.name ?? selected.displayName, isStartup: selected.target === '/' },
-      focus: summary && focus?.id === active?.rootId ? { ...summary, parentId: null } : summary,
-      breadcrumbs,
-      chart,
-      largestItems,
-      volume,
+      target: projection?.target ?? target,
+      focus: projection?.focus ?? null,
+      breadcrumbs: projection?.breadcrumbs ?? [],
+      chart: projection?.chart ?? [],
+      largestItems: projection?.largestItems ?? [],
+      volume: projection?.volume ?? emptyVolume(),
       scan: { ...scan, totals: scan.status === 'scanning' ? null : scan.totals ?? totals }
     }
   }
@@ -464,14 +464,11 @@ function isEstimateCacheDocument(value: unknown): value is EstimateCacheDocument
 
 function finiteNonnegative(value: unknown): value is number { return typeof value === 'number' && Number.isFinite(value) && value >= 0 }
 
-function parseVolume(value: string | undefined, scannedBytes: number, target: string, accuracy: SizeAccuracy): OrbisSnapshot['volume'] {
+function parseVolumeFacts(value: string | undefined, scannedBytes: number, sizeAccuracy: SizeAccuracy): SnapshotVolumeFacts {
   try {
     const parsed = JSON.parse(value ?? '{}') as { capacityBytes?: unknown; freeBytes?: unknown }
-    const capacityBytes = finite(parsed.capacityBytes)
-    const freeBytes = finite(parsed.freeBytes)
-    const unscannedBytes = target === '/' ? Math.max(0, capacityBytes - freeBytes - scannedBytes) : 0
-    return { capacityBytes, freeBytes, scannedBytes, unscannedBytes, sizeAccuracy: unscannedBytes > 0 ? 'estimated' : accuracy }
-  } catch { return { capacityBytes: 0, freeBytes: 0, scannedBytes, unscannedBytes: 0, sizeAccuracy: accuracy } }
+    return { capacityBytes: finite(parsed.capacityBytes), freeBytes: finite(parsed.freeBytes), scannedBytes, sizeAccuracy }
+  } catch { return { capacityBytes: 0, freeBytes: 0, scannedBytes, sizeAccuracy } }
 }
 
 function emptyVolume(): OrbisSnapshot['volume'] { return { capacityBytes: 0, freeBytes: 0, scannedBytes: 0, unscannedBytes: 0, sizeAccuracy: 'partial' } }

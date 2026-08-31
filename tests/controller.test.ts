@@ -678,7 +678,7 @@ describe("OrbisController", () => {
       await publish(workers[0]!, controller)
       await completed
       await new Promise((resolve) => setImmediate(resolve))
-      const required = ["index-open", "partial-index-cleanup", "snapshot-focus-query", "snapshot-root-query", "snapshot-breadcrumbs-query", "snapshot-chart-query", "snapshot-largest-items-query", "snapshot-total", "listener-notify", "publication-total"]
+      const required = ["index-open", "partial-index-cleanup", "snapshot-root-query", "snapshot-projection-query", "snapshot-total", "listener-notify", "publication-total"]
       for (const phase of required) {
         const matches = events.filter((event) => event.phase === phase && event.generation === 1)
         expect(matches, phase).toHaveLength(1)
