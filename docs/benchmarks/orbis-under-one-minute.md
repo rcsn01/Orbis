@@ -67,7 +67,7 @@ The Orbis checkout improved only 2.4 percent at the median because most entries 
 
 ## Native SQLite index
 
-The integrated scanner collects records in eight root-subtree workers, resolves hard links globally with the UTF-8 binary-minimum relative path as owner, calculates directory totals bottom-up, and writes persistent schema 3 in one native SQLite transaction. It stores every unique file and directory. The production worker selects it when the packaged native addon is available and falls back to the progressive scanner otherwise.
+The integrated scanner collects records in eight root-subtree workers, resolves hard links globally with the UTF-8 binary-minimum relative path as owner, calculates directory totals bottom-up, and writes persistent schema 3 in one native SQLite transaction. It stores every unique file and directory. The production worker selects it for startup-volume scans when the packaged native addon is available and falls back to the progressive scanner for ordinary folders or unsupported environments.
 
 The final prepared benchmark command was:
 
@@ -84,4 +84,4 @@ A first default-mode run completed native scanning but rejected publication beca
 
 ## Remaining tradeoffs
 
-The passing run peaked at several GiB because this implementation retains node records until bottom-up aggregation and database construction finish. Cancellation now propagates through an atomic flag checked during traversal and database insertion, but the native path still does not emit progressive previews. The next engineering work should add periodic aggregate progress and spill or stream records to bound memory without returning to per-directory SQLite updates.
+The passing run peaked at several GiB because this implementation retains node records until bottom-up aggregation and database construction finish. Cancellation propagates through an atomic flag checked during traversal and database insertion, and the UI polls native item and allocated-byte counters during startup-volume scans. The native path still does not emit progressive tree previews. The next engineering work should add aggregate previews and spill or stream records to bound memory without returning to per-directory SQLite updates.

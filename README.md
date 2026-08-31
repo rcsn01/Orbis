@@ -1,6 +1,6 @@
 # Orbis
 
-Orbis is a read-only disk usage visualizer for macOS 14 and later on Apple Silicon. The standalone app scans the startup volume after its window loads. The same product code runs inside Moirasia, where the panel stays idle until you click Scan. It stores the completed index in a temporary SQLite database and draws the result as an interactive sunburst.
+Orbis is a read-only disk usage visualizer for macOS 14 and later on Apple Silicon. In both the standalone app and Moirasia, choose a location and click Scan to begin. It stores the completed index in a temporary SQLite database and draws the result as an interactive sunburst.
 
 Orbis never deletes, moves, edits, or uploads files. It can reveal a discovered item in Finder. Allocated blocks, not apparent file length, drive the size display. Symbolic links are skipped and hard links are counted once.
 

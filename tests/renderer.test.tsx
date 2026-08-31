@@ -40,6 +40,24 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); publish = undefined })
 
 describe("Orbis renderer", () => {
+  it("does not let a stale scan command result overwrite a completion notification", async () => {
+    const user = userEvent.setup()
+    const idle: OrbisSnapshot = { ...scanning, scan: { locationId, status: "idle", generation: 0, progress: null, totals: null, error: null } }
+    let resolveStart!: (snapshot: OrbisSnapshot) => void
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(idle)
+    vi.mocked(window.orbis.startScan).mockReturnValueOnce(new Promise((resolve) => { resolveStart = resolve }))
+
+    render(<App />)
+    await user.click(await screen.findByRole("button", { name: "Scan" }))
+    act(() => publish?.(completed))
+    resolveStart(scanning)
+
+    expect(await screen.findByText("Scan complete", { exact: true })).toBeVisible()
+    act(() => publish?.(scanning))
+    expect(screen.getByText("Scan complete", { exact: true })).toBeVisible()
+    expect(screen.queryByText("Scanning…", { exact: true })).toBeNull()
+  })
+
   it("switches and removes saved locations through opaque ids", async () => {
     const user = userEvent.setup()
     const multiple = { ...completed, locations: [
@@ -118,7 +136,7 @@ describe("Orbis renderer", () => {
     publish?.({ ...preparing, scan: { ...preparing.scan, progress: { ...preparing.scan.progress!, currentItem: "Repairing saved index" } } })
     expect(await screen.findByText("Repairing saved index", { exact: false })).toBeVisible()
     expect(savedSegment).toBeVisible()
-    publish?.(scanning)
+    publish?.({ ...scanning, scan: { ...scanning.scan, generation: 2 } })
     expect(await screen.findByText("Scanning…")).toBeVisible()
   })
 

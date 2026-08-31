@@ -20,7 +20,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
 };
 #[cfg(target_os = "macos")]
@@ -113,6 +113,41 @@ pub fn scan_tree_summary(target: String) -> AsyncTask<NativeScanTask> {
 }
 
 #[napi(object)]
+pub struct NativeDatabaseScanProgress {
+    pub scanned_items: i64,
+    pub allocated_bytes: i64,
+    pub indexing: bool,
+}
+
+struct NativeDatabaseProgressState {
+    scanned_items: AtomicI64,
+    allocated_bytes: AtomicI64,
+    indexing: AtomicBool,
+}
+
+impl NativeDatabaseProgressState {
+    fn reset(&self) {
+        self.scanned_items.store(0, Ordering::Relaxed);
+        self.allocated_bytes.store(0, Ordering::Relaxed);
+        self.indexing.store(false, Ordering::Release);
+    }
+
+    fn add(&self, items: i64, allocated_bytes: i64) {
+        self.scanned_items.fetch_add(items, Ordering::Relaxed);
+        self.allocated_bytes
+            .fetch_add(allocated_bytes, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> NativeDatabaseScanProgress {
+        NativeDatabaseScanProgress {
+            scanned_items: self.scanned_items.load(Ordering::Relaxed),
+            allocated_bytes: self.allocated_bytes.load(Ordering::Relaxed),
+            indexing: self.indexing.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[napi(object)]
 pub struct NativeDatabaseScanSummary {
     pub elapsed_ms: f64,
     pub traversal_ms: f64,
@@ -132,11 +167,13 @@ pub struct NativeDatabaseScanTask {
     target: String,
     database_path: String,
     cancellation: Arc<AtomicBool>,
+    progress: Arc<NativeDatabaseProgressState>,
 }
 
 #[napi]
 pub struct NativeDatabaseScanner {
     cancellation: Arc<AtomicBool>,
+    progress: Arc<NativeDatabaseProgressState>,
 }
 
 #[napi]
@@ -145,6 +182,11 @@ impl NativeDatabaseScanner {
     pub fn new() -> Self {
         Self {
             cancellation: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(NativeDatabaseProgressState {
+                scanned_items: AtomicI64::new(0),
+                allocated_bytes: AtomicI64::new(0),
+                indexing: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -155,11 +197,18 @@ impl NativeDatabaseScanner {
         database_path: String,
     ) -> AsyncTask<NativeDatabaseScanTask> {
         self.cancellation.store(false, Ordering::Relaxed);
+        self.progress.reset();
         AsyncTask::new(NativeDatabaseScanTask {
             target,
             database_path,
             cancellation: self.cancellation.clone(),
+            progress: self.progress.clone(),
         })
+    }
+
+    #[napi]
+    pub fn progress(&self) -> NativeDatabaseScanProgress {
+        self.progress.snapshot()
     }
 
     #[napi]
@@ -174,7 +223,12 @@ impl Task for NativeDatabaseScanTask {
     fn compute(&mut self) -> Result<Self::Output> {
         #[cfg(target_os = "macos")]
         {
-            scan_tree_to_database_impl(&self.target, &self.database_path, &self.cancellation)
+            scan_tree_to_database_impl(
+                &self.target,
+                &self.database_path,
+                &self.cancellation,
+                &self.progress,
+            )
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -197,6 +251,11 @@ pub fn scan_tree_to_database(
         target,
         database_path,
         cancellation: Arc::new(AtomicBool::new(false)),
+        progress: Arc::new(NativeDatabaseProgressState {
+            scanned_items: AtomicI64::new(0),
+            allocated_bytes: AtomicI64::new(0),
+            indexing: AtomicBool::new(false),
+        }),
     })
 }
 
@@ -842,6 +901,7 @@ fn scan_index_subtree(
     counter: &mut usize,
     output: &mut Vec<IndexRecord>,
     cancellation: &Arc<AtomicBool>,
+    progress: &Arc<NativeDatabaseProgressState>,
 ) -> Result<()> {
     let root_index = output.len();
     output.push(root_record);
@@ -863,6 +923,8 @@ fn scan_index_subtree(
             if entries.is_empty() {
                 break;
             }
+            let mut page_items = 0i64;
+            let mut page_bytes = 0i64;
             for entry in entries {
                 let child_path = format!("{}/{}", output[parent_index].path, entry.name);
                 if is_native_scan_exclusion(&child_path, startup, index_exclusion) {
@@ -894,13 +956,15 @@ fn scan_index_subtree(
                     output[parent_index].skipped += 1;
                     continue;
                 }
-                let id = format!("w{worker}-{counter}");
+                let id = format!("n-w{worker}x{counter}");
                 *counter += 1;
                 let parent = output[parent_index].id.clone();
                 let is_directory = entry.kind == "directory";
                 let name = entry.name.clone();
                 let index = output.len();
                 output.push(index_record_from_entry(entry, id, parent, child_path));
+                page_items += 1;
+                page_bytes = page_bytes.saturating_add(output[index].own);
                 if is_directory {
                     let name = CString::new(name.into_bytes())
                         .map_err(|_| Error::from_reason("metadata path contains NUL"))?;
@@ -921,6 +985,7 @@ fn scan_index_subtree(
                     }
                 }
             }
+            progress.add(page_items, page_bytes);
         }
     }
     Ok(())
@@ -931,6 +996,7 @@ fn scan_tree_to_database_impl(
     target: &str,
     database_path: &str,
     cancellation: &Arc<AtomicBool>,
+    progress: &Arc<NativeDatabaseProgressState>,
 ) -> Result<NativeDatabaseScanSummary> {
     use rusqlite::{params, Connection};
     use std::collections::HashMap;
@@ -979,8 +1045,9 @@ fn scan_tree_to_database_impl(
         }
     };
     let root_own = (stat.st_blocks as i128 * 512).clamp(0, i64::MAX as i128) as i64;
+    progress.add(1, root_own);
     let mut records = vec![IndexRecord {
-        id: "n0".into(),
+        id: "n-root".into(),
         parent: None,
         name: Path::new(target)
             .file_name()
@@ -1024,6 +1091,8 @@ fn scan_tree_to_database_impl(
         if entries.is_empty() {
             break;
         }
+        let mut page_items = 0i64;
+        let mut page_bytes = 0i64;
         for entry in entries {
             let child_path = entry.name.clone();
             if is_native_scan_exclusion(&child_path, startup, &index_exclusion) {
@@ -1055,10 +1124,12 @@ fn scan_tree_to_database_impl(
                 records[0].skipped += 1;
                 continue;
             }
-            let id = format!("r{root_counter}");
+            let id = format!("n-r{root_counter}");
             root_counter += 1;
             let mut record =
-                index_record_from_entry(entry.clone(), id, "n0".into(), child_path.clone());
+                index_record_from_entry(entry.clone(), id, "n-root".into(), child_path.clone());
+            page_items += 1;
+            page_bytes = page_bytes.saturating_add(record.own);
             if entry.kind == "directory" {
                 let name = CString::new(entry.name.into_bytes())
                     .map_err(|_| Error::from_reason("metadata path contains NUL"))?;
@@ -1082,6 +1153,7 @@ fn scan_tree_to_database_impl(
                 records.push(record);
             }
         }
+        progress.add(page_items, page_bytes);
     }
     let jobs = Arc::new(Mutex::new(jobs));
     let mut worker_results = Vec::with_capacity(THREADS);
@@ -1110,6 +1182,7 @@ fn scan_tree_to_database_impl(
                         &mut counter,
                         &mut output,
                         &cancellation,
+                        &progress,
                     )?;
                 }
                 Ok(output)
@@ -1128,6 +1201,7 @@ fn scan_tree_to_database_impl(
         records.extend(result?);
     }
     let traversal_ms = started.elapsed().as_secs_f64() * 1000.0;
+    progress.indexing.store(true, Ordering::Release);
     // Select hard-link ownership globally, using Rust's bytewise UTF-8 string ordering.
     let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (i, r) in records.iter().enumerate() {
@@ -1307,7 +1381,7 @@ fn scan_tree_to_database_impl(
             ("hardLinkOrderingVersion", "binary-relative-path-v1".into()),
             ("exclusionPolicyVersion", "startup-and-index-root-v1".into()),
             ("indexRevision", "1".into()),
-            ("rootId", "n0".into()),
+            ("rootId", "n-root".into()),
             ("target", target.into()),
             ("targetDevice", root_device.to_string()),
             ("targetInode", (stat.st_ino as u64).to_string()),

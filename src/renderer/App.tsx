@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import type { Appearance } from "@moirasia/desktop-shell"
 import { AppearanceScope, AppearanceToggle, DesktopAppShell, DesktopContentHeader, DesktopPage, useProductAppearance } from "@moirasia/desktop-shell/react"
 import { Alert, AlertDescription, AlertTitle } from "@moirasia/ui-react/components/alert"
@@ -42,18 +42,34 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
   const [selected, setSelected] = useState<SelectedNode>()
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(true)
+  const notificationVersion = useRef(0)
+  const commandVersion = useRef(0)
 
   useEffect(() => {
     let alive = true
-    const unsubscribe = bridge.subscribe((next) => { if (alive) { setSnapshot(next); setError(undefined) } })
-    void bridge.getSnapshot().then((next) => { if (alive) setSnapshot(next) }).catch((reason: unknown) => { if (alive) setError(message(reason)) }).finally(() => { if (alive) setLoading(false) })
+    const requestedAt = notificationVersion.current
+    const unsubscribe = bridge.subscribe((next) => {
+      notificationVersion.current += 1
+      if (alive) { setSnapshot((current) => preferNewerSnapshot(current, next)); setError(undefined) }
+    })
+    void bridge.getSnapshot().then((next) => {
+      if (alive && notificationVersion.current === requestedAt) setSnapshot((current) => preferNewerSnapshot(current, next))
+    }).catch((reason: unknown) => { if (alive) setError(message(reason)) }).finally(() => { if (alive) setLoading(false) })
     return () => { alive = false; unsubscribe() }
   }, [bridge])
 
   const run = async (operation: () => Promise<OrbisSnapshot>): Promise<void> => {
+    const command = ++commandVersion.current
+    const requestedAt = notificationVersion.current
     setError(undefined)
-    try { setSnapshot(await operation()) }
-    catch (reason) { setError(message(reason)) }
+    try {
+      const next = await operation()
+      if (commandVersion.current === command && notificationVersion.current === requestedAt) {
+        setSnapshot((current) => preferNewerSnapshot(current, next))
+      }
+    } catch (reason) {
+      if (commandVersion.current === command) setError(message(reason))
+    }
   }
 
   useEffect(() => { setSelected(undefined) }, [snapshot?.selectedLocationId])
@@ -131,6 +147,13 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
       </>}
     </DesktopPage>
   </AppearanceScope>
+}
+
+function preferNewerSnapshot(current: OrbisSnapshot | undefined, next: OrbisSnapshot): OrbisSnapshot {
+  if (!current) return next
+  if (next.scan.generation < current.scan.generation) return current
+  if (next.scan.generation === current.scan.generation && next.scan.status === "scanning" && current.scan.status !== "scanning") return current
+  return next
 }
 
 function ScanStatus({ snapshot, onCancel, onRescan }: { readonly snapshot: OrbisSnapshot; readonly onCancel: () => void; readonly onRescan: () => void }): React.JSX.Element {

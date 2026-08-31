@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { open, rename, statfs } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { measureScanAsync, recordScanCounter, recordScanTiming } from './diagnostics'
 import { prepareDatabaseDirectory, readMetadata, removeDatabaseFiles } from './database'
@@ -23,8 +23,15 @@ interface NativeDatabaseScanSummary {
   readonly duplicateHardLinks: number
 }
 
+interface NativeDatabaseScanProgress {
+  readonly scannedItems: number
+  readonly allocatedBytes: number
+  readonly indexing: boolean
+}
+
 interface NativeDatabaseScanner {
   scanTreeToDatabase(target: string, databasePath: string): Promise<NativeDatabaseScanSummary>
+  progress(): NativeDatabaseScanProgress
   cancel(): void
 }
 
@@ -33,6 +40,7 @@ interface NativeDatabaseScannerAddon {
 }
 
 export async function canUseNativeScanner(options: ScanOptions): Promise<boolean> {
+  if (resolve(options.target) !== '/' || options.startupRoot === false) return false
   if (!options.nativeAddonPath || options.fileSystem || options.resumable?.resume) return false
   const addon = await loadNativeOrbisAddon(options.nativeAddonPath, options.onNativeAddonStatus)
   return typeof (addon as Partial<NativeDatabaseScannerAddon> | undefined)?.NativeDatabaseScanner === 'function'
@@ -50,10 +58,29 @@ export function scanFilesystemNative(options: ScanOptions): Promise<ScanResult> 
     const scanner = new addon.NativeDatabaseScanner()
     const cancel = (): void => scanner.cancel()
     options.signal?.addEventListener('abort', cancel, { once: true })
-    options.onProgress?.({ stage: 'traversing', scannedItems: 0, discoveredBytes: 0, elapsedMs: 0, currentItem: options.target })
+    const startedAt = performance.now()
+    let lastProgress = ''
+    const publishProgress = (): void => {
+      const progress = scanner.progress()
+      const key = `${progress.indexing}:${progress.scannedItems}:${progress.allocatedBytes}`
+      if (key === lastProgress) return
+      lastProgress = key
+      options.onProgress?.({
+        stage: progress.indexing ? 'indexing' : 'traversing',
+        scannedItems: progress.scannedItems,
+        discoveredBytes: progress.allocatedBytes,
+        elapsedMs: performance.now() - startedAt,
+        currentItem: options.target
+      })
+    }
+    publishProgress()
+    const progressTimer = setInterval(publishProgress, 250)
+    progressTimer.unref()
     let summary: NativeDatabaseScanSummary
     try {
       summary = await scanner.scanTreeToDatabase(options.target, stagingPath)
+      clearInterval(progressTimer)
+      publishProgress()
       if (options.signal?.aborted) throw new ScanCanceledError()
       await syncFile(stagingPath)
       await rename(stagingPath, options.publishedPath)
@@ -63,6 +90,7 @@ export function scanFilesystemNative(options: ScanOptions): Promise<ScanResult> 
       if (options.signal?.aborted) throw new ScanCanceledError()
       throw error
     } finally {
+      clearInterval(progressTimer)
       options.signal?.removeEventListener('abort', cancel)
     }
     publishNativeTimings(summary)
@@ -79,7 +107,7 @@ export function scanFilesystemNative(options: ScanOptions): Promise<ScanResult> 
     return {
       generation: options.generation,
       target: options.target,
-      rootId: metadata.rootId ?? 'n0',
+      rootId: metadata.rootId ?? 'n-root',
       publishedPath: options.publishedPath,
       capacityBytes: Number(volume.blocks) * Number(volume.bsize),
       freeBytes: Number(volume.bfree) * Number(volume.bsize),
