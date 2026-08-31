@@ -162,7 +162,9 @@ export class OrbisController {
     const root = timed('snapshot-root-query', () => active?.root)
     const volume = active ? parseVolume(active.metadata.volume, root?.sizeBytes ?? 0, active.logicalTarget, root?.sizeAccuracy ?? 'partial') : emptyVolume()
     const breadcrumbs = timed('snapshot-breadcrumbs-query', () => focus && active ? active.getBreadcrumbs(focus.id) : [])
-    const chart = timed('snapshot-chart-query', () => focus && active ? buildChart(active, focus, { rootTotalBytes: active.logicalTarget === '/' ? volume.capacityBytes : 0 }) : [])
+    const chart = timed('snapshot-chart-query', () => focus && active ? buildChart(active, focus, {
+      rootTotalBytes: focus.id === active.rootId && active.logicalTarget === '/' ? volume.capacityBytes : 0
+    }) : [])
     const largestItems = timed('snapshot-largest-items-query', () => focus && active ? active.getLargestItems(focus.id) : [])
     const summary = focus ? toSummary(focus) : null
     return {
