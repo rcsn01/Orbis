@@ -55,7 +55,7 @@ Database sizes remained unchanged: 0.42 MiB wide, 0.16 MiB deep, 2.14 MiB tiny, 
 ## Reproduction
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan -- \
+pnpm -C apps/integrated/Orbis benchmark:scan -- \
   --profile baseline \
   --warmup 1 \
   --samples 10 \

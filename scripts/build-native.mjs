@@ -7,7 +7,7 @@ const nativeRoot = resolve(appRoot, 'native')
 const output = resolve(appRoot, 'native')
 const target = process.argv.includes('--target') ? process.argv[process.argv.indexOf('--target') + 1] : 'aarch64-apple-darwin'
 const napi = resolve(appRoot, 'node_modules/.bin/napi')
-if (!existsSync(napi)) throw new Error(`Install apps/Orbis dependencies before building Orbis native metadata: ${napi}`)
+if (!existsSync(napi)) throw new Error(`Install apps/integrated/Orbis dependencies before building Orbis native metadata: ${napi}`)
 mkdirSync(output, { recursive: true })
 const result = spawnSync(napi, [
   'build', '--cwd', nativeRoot, '--package-json-path', resolve(appRoot, 'package.json'),

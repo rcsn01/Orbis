@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { Appearance } from "@moirasia/desktop-shell"
-import { AppearanceScope, AppearanceToggle, DesktopAppShell, DesktopContentHeader, DesktopPage, useProductAppearance } from "@moirasia/desktop-shell/react"
+import { AppearanceScope, DesktopAppShell, DesktopContentHeader, DesktopPage, useProductAppearance } from "@moirasia/desktop-shell/react"
 import { Alert, AlertDescription, AlertTitle } from "@moirasia/ui-react/components/alert"
 import { Badge } from "@moirasia/ui-react/components/badge"
 import { Button } from "@moirasia/ui-react/components/button"
@@ -25,19 +25,17 @@ interface SelectedNode {
 export function App(): React.JSX.Element {
   const [appearance, setAppearance] = useProductAppearance(window.desktopShell)
   return <DesktopAppShell product="Orbis" appearance={appearance} onAppearanceChange={setAppearance}>
-    <OrbisPanel bridge={window.orbis} appearance={appearance} onAppearanceChange={setAppearance} />
+    <OrbisPanel bridge={window.orbis} appearance={appearance} />
   </DesktopAppShell>
 }
 
 export interface OrbisPanelProps {
   readonly bridge: OrbisApi
   readonly appearance: Appearance
-  readonly onAppearanceChange: (appearance: Appearance) => void
-  readonly embeddedHeader?: boolean
 }
 
 /** Orbis content shared by the standalone window and the Moirasia shell. */
-export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHeader = false }: OrbisPanelProps): React.JSX.Element {
+export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<OrbisSnapshot>()
   const [selected, setSelected] = useState<SelectedNode>()
   const [error, setError] = useState<string>()
@@ -119,7 +117,6 @@ export function OrbisPanel({ bridge, appearance, onAppearanceChange, embeddedHea
   }
 
   return <AppearanceScope appearance={appearance} className="orbis-feature-panel">
-    {embeddedHeader && <header className="orbis-feature-panel__header"><strong>Orbis</strong><AppearanceToggle value={appearance} onChange={onAppearanceChange} /></header>}
     <DesktopPage width="full" scroll="contained" className="orbis-feature-panel__page">
       <DesktopContentHeader title="Disk usage" description={snapshot ? `${snapshot.target.name}${selectedLocation?.coverage === "ancestor" ? " · Shared parent index" : ""}` : "Read-only storage visualizer"} actions={<div className="orbis-feature-panel__actions">
         {snapshot && <select aria-label="Saved location" value={snapshot.selectedLocationId} disabled={isScanning} onChange={(event) => void run(() => bridge.selectLocation(event.target.value as LocationId))}>{snapshot.locations.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select>}

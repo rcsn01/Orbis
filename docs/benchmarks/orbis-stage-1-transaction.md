@@ -69,7 +69,7 @@ Deep-tree aggregation fell by 97.8%. Stage 0 autocommitted each directory update
 ## Reproduction
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan -- \
+pnpm -C apps/integrated/Orbis benchmark:scan -- \
   --profile baseline \
   --warmup 1 \
   --samples 5 \

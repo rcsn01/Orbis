@@ -91,7 +91,7 @@ Prepared insertion should affect the dominant traversal phase. Transactional fin
 ## Reproduction
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan -- \
+pnpm -C apps/integrated/Orbis benchmark:scan -- \
   --profile baseline \
   --warmup 1 \
   --samples 5 \
@@ -106,13 +106,13 @@ The command rejects worker failures, cancellations, and timeouts. It validates n
 A true cold-cache startup-volume measurement requires a restart or another controlled cache state. Building the worker or benchmark after restart would contaminate that run, so prepare both first:
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan:prepare
+pnpm -C apps/integrated/Orbis benchmark:scan:prepare
 ```
 
 After restarting, run the prepared bundle without a build:
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan:prepared -- \
+pnpm -C apps/integrated/Orbis benchmark:scan:prepared -- \
   --target / \
   --allow-live-target \
   --cache-state cold-manual \

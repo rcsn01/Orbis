@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@moirasia/desktop-shell':
-        specifier: file:../../packages/desktop-shell
-        version: file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
+        specifier: file:../../../packages/desktop-shell
+        version: file:../../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)
       '@moirasia/ui-react':
-        specifier: file:../../packages/ui-react
-        version: file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
+        specifier: file:../../../packages/ui-react
+        version: file:../../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)
       react:
         specifier: 19.2.8
         version: 19.2.8
@@ -893,14 +893,14 @@ packages:
       '@cfworker/json-schema':
         optional: true
 
-  '@moirasia/desktop-shell@file:../../packages/desktop-shell':
-    resolution: {directory: ../../packages/desktop-shell, type: directory}
+  '@moirasia/desktop-shell@file:../../../packages/desktop-shell':
+    resolution: {directory: ../../../packages/desktop-shell, type: directory}
     peerDependencies:
       electron: '>=41 <44'
       react: '>=19 <20'
 
-  '@moirasia/ui-react@file:../../packages/ui-react':
-    resolution: {directory: ../../packages/ui-react, type: directory}
+  '@moirasia/ui-react@file:../../../packages/ui-react':
+    resolution: {directory: ../../../packages/ui-react, type: directory}
     peerDependencies:
       react: '>=19 <20'
       react-dom: '>=19 <20'
@@ -4948,12 +4948,12 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  '@moirasia/desktop-shell@file:../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)':
+  '@moirasia/desktop-shell@file:../../../packages/desktop-shell(electron@43.1.0)(react@19.2.8)':
     dependencies:
       electron: 43.1.0
       react: 19.2.8
 
-  '@moirasia/ui-react@file:../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
+  '@moirasia/ui-react@file:../../../packages/ui-react(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react-is@19.2.8)(react@19.2.8)(redux@5.0.1)(typescript@5.9.3)':
     dependencies:
       '@base-ui/react': 1.7.0(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@fontsource-variable/jetbrains-mono': 5.3.0

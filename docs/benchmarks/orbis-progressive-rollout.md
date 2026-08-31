@@ -36,16 +36,16 @@ Run matched samples with the same profile, fixture, sample count, native addon, 
 
 ```sh
 # Initial full and clean warm replay
-pnpm -C apps/Orbis benchmark:scan -- --scenario initial-full --fixture mixed --profile baseline --samples 5
-pnpm -C apps/Orbis benchmark:scan -- --scenario warm-no-change --fixture mixed --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario initial-full --fixture mixed --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario warm-no-change --fixture mixed --profile baseline --samples 5
 
 # Exact incremental traversal
-pnpm -C apps/Orbis benchmark:scan -- --scenario one-file-allocation --fixture mixed --profile baseline --samples 5
-pnpm -C apps/Orbis benchmark:scan -- --scenario directory-rename --fixture deep --profile baseline --samples 5
-pnpm -C apps/Orbis benchmark:scan -- --scenario hardlink-owner-change --fixture deep --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario one-file-allocation --fixture mixed --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario directory-rename --fixture deep --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario hardlink-owner-change --fixture deep --profile baseline --samples 5
 
 # Conservative full fallback via a deliberately mismatched journal UUID
-pnpm -C apps/Orbis benchmark:scan -- --scenario dropped-history-fallback --fixture mixed --profile baseline --samples 5
+pnpm -C apps/integrated/Orbis benchmark:scan -- --scenario dropped-history-fallback --fixture mixed --profile baseline --samples 5
 ```
 
 The dropped-history scenario uses a UUID mismatch because benchmark fixtures cannot safely force the kernel or FSEvents daemon to emit a dropped-history flag. It exercises the same full-refresh dispatch and cursor non-advancement path.
@@ -61,13 +61,13 @@ A benchmark that changes target identity, invalidates the FSEvents UUID, drops h
 ## Reproduction
 
 ```sh
-pnpm -C apps/Orbis benchmark:scan -- \
+pnpm -C apps/integrated/Orbis benchmark:scan -- \
   --profile quick --warmup 1 --samples 5 --fixture all \
   --scanner progressive --concurrency 4 \
   --native-addon native/orbis-metadata.darwin-arm64.node \
   --output benchmark-results/progressive-rollout-quick-final.json
 
-pnpm -C apps/Orbis benchmark:scan -- \
+pnpm -C apps/integrated/Orbis benchmark:scan -- \
   --profile quick --warmup 1 --samples 5 --fixture all \
   --scanner legacy --concurrency 4 \
   --output benchmark-results/legacy-rollout-quick-final.json

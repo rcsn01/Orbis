@@ -21,7 +21,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:dev-ready": "node ../../scripts/check-electron-install.mjs .",
+    "test:dev-ready": "node ../../../scripts/check-electron-install.mjs .",
     "test:smoke": "playwright test",
     "benchmark:scan": "pnpm build:worker && node scripts/run-scan-benchmark.mjs",
     "benchmark:scan:prepare": "pnpm build:worker && node scripts/run-scan-benchmark.mjs --prepare-only benchmark-dist",
@@ -31,8 +31,8 @@
     "package:mac:unsigned": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --publish never -c.mac.notarize=false"
   },
   "dependencies": {
-    "@moirasia/desktop-shell": "file:../../packages/desktop-shell",
-    "@moirasia/ui-react": "file:../../packages/ui-react",
+    "@moirasia/desktop-shell": "file:../../../packages/desktop-shell",
+    "@moirasia/ui-react": "file:../../../packages/ui-react",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
