@@ -66,6 +66,43 @@ test("shows saved results while resume validation is delayed", async () => {
   }
 })
 
+test("keeps product chrome fixed while disk usage content scrolls", async () => {
+  const root = resolve(import.meta.dirname, "../..")
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "orbis-fixed-chrome-"))
+  const scanRoot = join(fixtureDirectory, "fixture")
+  const userData = join(fixtureDirectory, "user-data")
+  await mkdir(scanRoot, { recursive: true })
+  await Promise.all(Array.from({ length: 80 }, (_, index) => writeFile(join(scanRoot, `item-${String(index).padStart(3, "0")}.dat`), Buffer.alloc(512))))
+  const application = await electron.launch({ args: [root], cwd: root, env: { ...process.env, ORBIS_SCAN_ROOT: scanRoot, ORBIS_USER_DATA: userData } })
+  try {
+    const page = await application.firstWindow()
+    await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.setSize(860, 600))
+    await page.getByRole("button", { name: "Scan", exact: true }).click()
+    await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
+
+    const productBar = page.locator(".desktop-shell__chrome")
+    const contentHeader = page.getByRole("heading", { name: "Disk usage", exact: true })
+    const contentPage = page.locator(".orbis-feature-panel__page")
+    const productBarBefore = await productBar.boundingBox()
+    const contentHeaderBefore = await contentHeader.boundingBox()
+    expect(productBarBefore).not.toBeNull()
+    expect(contentHeaderBefore).not.toBeNull()
+
+    await contentPage.evaluate((element) => { element.scrollTop = 240 })
+    await expect.poll(() => contentPage.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+
+    const productBarAfter = await productBar.boundingBox()
+    const contentHeaderAfter = await contentHeader.boundingBox()
+    expect(await page.evaluate(() => window.scrollY)).toBe(0)
+    expect(productBarAfter?.y).toBe(productBarBefore?.y)
+    expect(contentHeaderAfter).not.toBeNull()
+    expect(contentHeaderAfter!.y).toBeLessThan(contentHeaderBefore!.y)
+  } finally {
+    await application.close()
+    await rm(fixtureDirectory, { recursive: true, force: true })
+  }
+})
+
 test("scans the fixture without touching the startup volume", async () => {
   const root = resolve(import.meta.dirname, "../..")
   const fixtureDirectory = await mkdtemp(join(tmpdir(), "orbis-smoke-"))
