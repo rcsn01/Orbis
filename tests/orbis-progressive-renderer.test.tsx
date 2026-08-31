@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { Sunburst } from '../src/renderer/Sunburst'
+import { segmentColor, Sunburst } from '../src/renderer/Sunburst'
 import type { ChartSegment } from '../src/shared/contracts'
 
 const base: ChartSegment = {
@@ -10,6 +10,18 @@ const base: ChartSegment = {
 }
 
 describe('progressive Orbis renderer', () => {
+  it('keeps nearby nested segments in the same color family', () => {
+    const parent = { ...base, startAngle: 0, endAngle: 80 }
+    const firstChild = { ...base, depth: 2, startAngle: 0, endAngle: 40, colorKey: 'root:n-folder:first' }
+    const secondChild = { ...base, depth: 2, startAngle: 40, endAngle: 80, colorKey: 'root:n-folder:second' }
+    const distantBranch = { ...base, startAngle: 180, endAngle: 260, colorKey: 'root:n-distant' }
+
+    expect(segmentColor(parent)).toBe('hsl(260 68% 54%)')
+    expect(segmentColor(firstChild)).toBe('hsl(240 68% 56%)')
+    expect(segmentColor(secondChild)).toBe('hsl(280 68% 56%)')
+    expect(segmentColor(distantBranch)).toBe('hsl(80 68% 54%)')
+  })
+
   it('hatches provisional segments and identifies their state accessibly', () => {
     const { container } = render(<Sunburst segments={[base]} onActivate={vi.fn()} />)
     expect(container.querySelector('pattern#orbis-provisional-hatch')).not.toBeNull()

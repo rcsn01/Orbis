@@ -99,15 +99,10 @@ function point(cx: number, cy: number, radius: number, angle: number): { readonl
 
 export function segmentColor(segment: ChartSegment): string {
   if (segment.kind === "other" || segment.kind === "unavailable") return "#89909a"
-  const hue = hash(segment.colorKey) % 360
-  const lightness = Math.max(30, 55 - (segment.depth - 1) * 5)
-  return `hsl(${hue} 58% ${lightness}%)`
-}
-
-function hash(value: string): number {
-  let result = 0
-  for (let index = 0; index < value.length; index += 1) result = (result * 31 + value.charCodeAt(index)) >>> 0
-  return result
+  const midpoint = (segment.startAngle + segment.endAngle) / 2
+  const hue = Math.round((220 + midpoint) % 360)
+  const lightness = 54 + Math.min(8, Math.max(0, segment.depth - 1) * 2)
+  return `hsl(${hue} 68% ${lightness}%)`
 }
 
 function formatItemCount(value: number): string {

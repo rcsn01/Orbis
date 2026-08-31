@@ -80,6 +80,12 @@ test("keeps product chrome fixed while disk usage content scrolls", async () => 
     await page.getByRole("button", { name: "Scan", exact: true }).click()
     await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
 
+    const sunburst = await page.locator(".orbis-feature-panel__sunburst").boundingBox()
+    const contents = await page.locator(".orbis-feature-panel__contents").boundingBox()
+    expect(sunburst).not.toBeNull()
+    expect(contents).not.toBeNull()
+    expect(contents!.y).toBeGreaterThanOrEqual(sunburst!.y + sunburst!.height)
+
     const productBar = page.locator(".desktop-shell__chrome")
     const contentHeader = page.getByRole("heading", { name: "Disk usage", exact: true })
     const contentPage = page.locator(".orbis-feature-panel__page")
