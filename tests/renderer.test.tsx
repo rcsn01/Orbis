@@ -150,7 +150,6 @@ describe("Orbis renderer", () => {
 
     render(<App />)
     expect(await screen.findByText(/400 items · 1\.6 MB · notes\.txt/)).toBeVisible()
-    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("1.6 MB")
     const progress = screen.getByRole("progressbar", { name: "Scan progress" })
     const progressValue = progress.getAttribute("aria-valuenow")
     expect(progress).toHaveAttribute("aria-valuetext", "400 items · 1.6 MB")
@@ -161,7 +160,6 @@ describe("Orbis renderer", () => {
     }
     act(() => publish?.(progressOnly))
     expect(screen.getByText(/400 items · 2\.0 MB · notes\.txt/)).toBeVisible()
-    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("2.0 MB")
     expect(progress).toHaveAttribute("aria-valuenow", progressValue)
 
     const matchingPreview: OrbisSnapshot = {
@@ -170,12 +168,29 @@ describe("Orbis renderer", () => {
     }
     act(() => publish?.(matchingPreview))
     expect(screen.getByText(/400 items · 2\.0 MB · notes\.txt/)).toBeVisible()
-    expect(screen.getByText("Readable scanned").parentElement).toHaveTextContent("2.0 MB")
     expect(progress).toHaveAttribute("aria-valuenow", progressValue)
     expect(progress).toHaveAttribute("aria-valuetext", "400 items · 2.0 MB")
 
     act(() => publish?.({ ...matchingPreview, scan: { ...matchingPreview.scan, progress: { ...matchingPreview.scan.progress!, stage: "indexing" } } }))
     expect(screen.getByRole("progressbar", { name: "Scan progress" })).toHaveAttribute("aria-valuenow", "95")
+  })
+
+  it("places the skipped-path warning beside the completed scan status", async () => {
+    const user = userEvent.setup()
+    const withSkippedPaths: OrbisSnapshot = {
+      ...completed,
+      scan: { ...completed.scan, totals: { ...completed.scan.totals!, skippedItems: 3, unreadableItems: 2 } }
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(withSkippedPaths)
+
+    render(<App />)
+    const warning = await screen.findByText("Some paths were skipped", { exact: true })
+    const status = warning.closest(".orbis-feature-panel__scan-status")
+    expect(status).not.toBeNull()
+    expect(status).toHaveTextContent("Scan complete")
+    expect(status).toHaveTextContent("3 paths could not be included")
+    await user.click(screen.getByRole("button", { name: "Open Full Disk Access" }))
+    expect(window.orbis.openFullDiskAccess).toHaveBeenCalledOnce()
   })
 
   it("shows current-folder contents and supports drill-down and Finder reveal", async () => {

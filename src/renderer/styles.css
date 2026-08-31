@@ -15,11 +15,11 @@
 .orbis-feature-panel__scan-status-copy strong { font-size: 12px; }
 .orbis-feature-panel__scan-status-copy span { overflow: hidden; color: var(--muted-foreground); font: 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .orbis-feature-panel__scan-progress { min-width: 90px; }
-.orbis-feature-panel__volume-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 18px; }
-.orbis-feature-panel__volume-metric { display: grid; gap: 5px; min-width: 0; border: 1px solid var(--border); border-radius: 10px; padding: 11px 13px; background: var(--card); }
-.orbis-feature-panel__volume-metric span { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.orbis-feature-panel__volume-metric strong { font-size: 16px; letter-spacing: -.02em; }
-.orbis-feature-panel__volume-metric--muted strong { color: var(--muted-foreground); }
+.orbis-feature-panel__scan-warning { grid-column: 2 / -1; display: flex; min-width: 0; align-items: center; justify-self: end; gap: 9px; color: var(--muted-foreground); }
+.orbis-feature-panel__scan-warning > svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--warning-foreground, var(--foreground)); }
+.orbis-feature-panel__scan-warning > span { display: grid; gap: 1px; }
+.orbis-feature-panel__scan-warning strong { color: var(--foreground); font-size: 12px; }
+.orbis-feature-panel__scan-warning small { font-size: 10px; white-space: nowrap; }
 .orbis-feature-panel__workspace { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .85fr); align-items: start; gap: 18px; min-height: 0; }
 .orbis-feature-panel__chart-panel { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
 .orbis-feature-panel__chart-panel { min-height: 510px; padding: 18px; }
@@ -64,8 +64,6 @@
 .orbis-feature-panel__empty--large { min-height: 420px; }
 .orbis-feature-panel__empty--large h2 { margin: 0; color: var(--foreground); font-size: 20px; }
 .orbis-feature-panel__empty--large p { margin: 0 0 8px; }
-.orbis-feature-panel__permission-warning [data-slot="alert-description"] { align-items: center; }
-
 @media (max-width: 980px) {
   .orbis-feature-panel__page { padding: 20px; }
   .orbis-feature-panel__workspace { grid-template-columns: minmax(0, 1fr); }
@@ -77,7 +75,7 @@
   .orbis-feature-panel__page { padding: 16px; }
   .orbis-feature-panel__scan-status { grid-template-columns: 1fr auto; }
   .orbis-feature-panel__scan-progress { grid-column: 1 / -1; grid-row: 2; }
-  .orbis-feature-panel__volume-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .orbis-feature-panel__scan-warning { grid-column: 1 / -1; justify-self: stretch; }
   .orbis-feature-panel__chart-panel { padding: 12px; }
   .orbis-feature-panel__sunburst-wrap { min-height: 330px; }
 }

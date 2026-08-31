@@ -7,7 +7,7 @@ import { Progress } from "@moirasia/ui-react/components/progress"
 import { AlertCircle, ChevronLeft, RefreshCw, Square } from "@moirasia/ui-react/lib/icons"
 import type { ChartSegment, LocationId, NodeSummary, OrbisApi, OrbisSnapshot } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
-import { displayedVolume, scanStatusPresentation } from "./scan-presentation"
+import { scanStatusPresentation } from "./scan-presentation"
 import { segmentColor, Sunburst } from "./Sunburst"
 
 export function App(): React.JSX.Element {
@@ -105,12 +105,10 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
       {error && <Alert variant="destructive" className="orbis-feature-panel__alert"><AlertCircle /><AlertTitle>Orbis could not complete that action</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
       {loading && <div className="orbis-feature-panel__state" role="status">Loading Orbis…</div>}
       {!loading && snapshot && <>
-        <ScanStatus snapshot={snapshot} onCancel={() => void run(() => bridge.cancelScan())} onRescan={() => void run(() => bridge.rescan())} />
+        <ScanStatus snapshot={snapshot} onCancel={() => void run(() => bridge.cancelScan())} onRescan={() => void run(() => bridge.rescan())} onOpenPermissions={() => void run(async () => { await bridge.openFullDiskAccess(); return snapshot })} />
         {snapshot.scan.status === "fatal-error" && <Alert variant="destructive" className="orbis-feature-panel__alert"><AlertCircle /><AlertTitle>Scan failed</AlertTitle><AlertDescription><span>{snapshot.scan.error ?? "Orbis could not read this folder."}</span><Button size="sm" variant="outline" onClick={() => void run(async () => { await bridge.openFullDiskAccess(); return snapshot })}>Open Full Disk Access</Button></AlertDescription></Alert>}
         {(snapshot.scan.status === "canceled" || snapshot.scan.resume?.available && snapshot.scan.status === "fatal-error") && <Alert className="orbis-feature-panel__alert"><AlertTitle>{snapshot.scan.resume?.available ? "Scan paused — progress saved" : "Scan canceled"}</AlertTitle><AlertDescription><span>{snapshot.scan.resume?.available ? "Orbis will resume from the last completed directory checkpoint." : "The last completed index remains available. Rescan when you are ready."}</span>{snapshot.scan.resume?.available && <Button size="sm" variant="outline" onClick={() => void run(() => bridge.discardSavedScan())}>Discard saved scan</Button>}</AlertDescription></Alert>}
-        {snapshot.scan.totals && (snapshot.scan.totals.unreadableItems > 0 || snapshot.scan.totals.skippedItems > 0) && <PermissionWarning snapshot={snapshot} onOpen={() => void run(async () => { await bridge.openFullDiskAccess(); return snapshot })} />}
         {snapshot.committed && snapshot.volume.sizeAccuracy === "partial" && <Alert className="orbis-feature-panel__alert"><AlertTitle>Scan complete; some folders could not be measured</AlertTitle><AlertDescription>Orbis indexed the readable metadata and marked the remaining sizes as partial.</AlertDescription></Alert>}
-        <VolumeSummary snapshot={snapshot} />
         {focus ? <div className="orbis-feature-panel__workspace">
           <section className="orbis-feature-panel__chart-panel" aria-labelledby="chart-heading">
             <div className="orbis-feature-panel__panel-heading"><div><p className="orbis-feature-panel__eyebrow">LOCATION</p><h2 id="chart-heading">{focus.name}</h2><FolderSize node={focus} /></div>{focus.parentId && <Button size="sm" variant="ghost" onClick={() => void run(() => bridge.focusNode(focus.parentId!))}><ChevronLeft />Up</Button>}</div>
@@ -131,31 +129,15 @@ function preferNewerSnapshot(current: OrbisSnapshot | undefined, next: OrbisSnap
   return next
 }
 
-function ScanStatus({ snapshot, onCancel, onRescan }: { readonly snapshot: OrbisSnapshot; readonly onCancel: () => void; readonly onRescan: () => void }): React.JSX.Element {
+function ScanStatus({ snapshot, onCancel, onRescan, onOpenPermissions }: { readonly snapshot: OrbisSnapshot; readonly onCancel: () => void; readonly onRescan: () => void; readonly onOpenPermissions: () => void }): React.JSX.Element {
   const presentation = scanStatusPresentation(snapshot)
+  const totals = snapshot.scan.totals
+  const skippedPaths = totals ? Math.max(totals.skippedItems, totals.unreadableItems) : 0
   return <div className="orbis-feature-panel__scan-status" aria-live="polite">
     <div className="orbis-feature-panel__scan-status-copy" data-committed={snapshot.committed}><strong>{presentation.heading}</strong><span>{presentation.detail}</span></div>
     {presentation.progress ? <><Progress value={presentation.progress.value} max={100} className="orbis-feature-panel__scan-progress" aria-label={presentation.progress.label} aria-valuetext={presentation.progress.valueText} /><Button size="sm" variant="outline" onClick={onCancel}>Pause</Button></> : snapshot.scan.status === "canceled" ? <Button size="sm" onClick={onRescan}>{snapshot.scan.resume?.available ? "Resume" : "Rescan"}</Button> : null}
+    {skippedPaths > 0 && <div className="orbis-feature-panel__scan-warning" role="note"><AlertCircle aria-hidden="true" /><span><strong>Some paths were skipped</strong><small>{skippedPaths.toLocaleString()} path{skippedPaths === 1 ? "" : "s"} could not be included</small></span><Button size="sm" variant="outline" onClick={onOpenPermissions}>Open Full Disk Access</Button></div>}
   </div>
-}
-
-function PermissionWarning({ snapshot, onOpen }: { readonly snapshot: OrbisSnapshot; readonly onOpen: () => void }): React.JSX.Element {
-  const totals = snapshot.scan.totals!
-  return <Alert className="orbis-feature-panel__alert orbis-feature-panel__permission-warning"><AlertCircle /><AlertTitle>Some paths were skipped</AlertTitle><AlertDescription><span>{totals.skippedItems.toLocaleString()} item{totals.skippedItems === 1 ? "" : "s"} could not be included. Protected or unreadable paths remain in unscanned space.</span><Button size="sm" variant="outline" onClick={onOpen}>Open Full Disk Access</Button></AlertDescription></Alert>
-}
-
-function VolumeSummary({ snapshot }: { readonly snapshot: OrbisSnapshot }): React.JSX.Element {
-  const { capacityBytes, freeBytes, scannedBytes, unscannedBytes, sizeAccuracy } = displayedVolume(snapshot)
-  return <div className="orbis-feature-panel__volume-summary" aria-label={`Storage summary, ${accuracyLabel(sizeAccuracy, snapshot.focus?.scanState ?? "queued")}`}>
-    <Metric label="Capacity" value={formatBytes(capacityBytes)} />
-    <Metric label="Free" value={formatBytes(freeBytes)} />
-    <Metric label="Readable scanned" value={formatBytes(scannedBytes)} />
-    {unscannedBytes > 0 && <Metric label="Unscanned or system data" value={formatBytes(unscannedBytes)} muted />}
-  </div>
-}
-
-function Metric({ label, value, muted = false }: { readonly label: string; readonly value: string; readonly muted?: boolean }): React.JSX.Element {
-  return <div className={`orbis-feature-panel__volume-metric${muted ? " orbis-feature-panel__volume-metric--muted" : ""}`}><span>{label}</span><strong>{value}</strong></div>
 }
 
 function FolderSize({ node }: { readonly node: NodeSummary }): React.JSX.Element {

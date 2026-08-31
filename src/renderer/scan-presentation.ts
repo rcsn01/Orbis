@@ -1,4 +1,4 @@
-import type { OrbisSnapshot, VolumeSnapshot } from "../shared/contracts"
+import type { OrbisSnapshot } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
 
 export interface ScanStatusPresentation {
@@ -43,14 +43,6 @@ function scanStatusHeading(snapshot: OrbisSnapshot): string {
   if (snapshot.scan.status === "canceled") return snapshot.scan.resume?.available ? "Scan paused — progress saved" : "Scan canceled"
   if (snapshot.scan.status === "fatal-error") return "Scan unavailable"
   return "Waiting to scan"
-}
-
-export function displayedVolume(snapshot: OrbisSnapshot): VolumeSnapshot {
-  const scannedBytes = scanStatusBytes(snapshot)
-  const unscannedBytes = snapshot.target.isStartup
-    ? Math.max(0, snapshot.volume.capacityBytes - snapshot.volume.freeBytes - scannedBytes)
-    : snapshot.volume.unscannedBytes
-  return { ...snapshot.volume, scannedBytes, unscannedBytes }
 }
 
 export function scanStatusBytes(snapshot: OrbisSnapshot): number {
