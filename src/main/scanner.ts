@@ -8,6 +8,7 @@ import type { DirectoryMetadataSource, FolderSizeEstimate, NativeAddonProbe } fr
 import type { ConstructionCheckpointNotice } from './construction-database'
 import type { ResumeMilestone, ResumePreparationPhase } from './diagnostics'
 import type { FullScanResumeDescriptor, FullScanResumeStore } from './full-scan-resume'
+import { canUseNativeScanner, scanFilesystemNative } from './native-scanner'
 
 export interface ScanOptions extends LegacyScanOptions {
   readonly control?: ProgressiveScanControl
@@ -30,8 +31,9 @@ export interface ScanOptions extends LegacyScanOptions {
   readonly drainResumeJournal?: (eventId: string) => { readonly throughEventId: string; readonly scopes: readonly string[]; readonly restartReason?: string }
 }
 
-export function scanFilesystem(options: ScanOptions): Promise<ScanResult> {
+export async function scanFilesystem(options: ScanOptions): Promise<ScanResult> {
   if (options.referenceScan === true) return scanFilesystemLegacy(options)
+  if (await canUseNativeScanner(options)) return scanFilesystemNative(options)
   const control = options.control ?? new ProgressiveScanControl()
   return scanFilesystemProgressive({ ...options, control })
 }

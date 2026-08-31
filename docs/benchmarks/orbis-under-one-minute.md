@@ -25,13 +25,18 @@ The benchmark reports worker `scanTotalMs`. It validates the published SQLite no
 | Native depth-first `getattrlistbulk` traversal prototype | `perf/native-batched-traversal` | Orbis checkout | 5 | 42,828 | 165.68 ms traversal-only | 165.62 ms | n/a | included | n/a | 20.6x faster than the baseline end-to-end scan; integration pending |
 | Native depth-first `getattrlistbulk` traversal prototype | `perf/native-batched-traversal` | `/` | 1 | 4,079,698 | 57,829.87 ms traversal-only | 57,829.68 ms | n/a | included | n/a | Raw traversal meets 60 seconds by 2.17 seconds; not an end-to-end pass |
 | Eight native workers split across root subtrees | `perf/native-parallel-traversal` | Orbis checkout | 5 | 42,845 | 161.73 ms traversal-only | 161.66 ms | n/a | included | n/a | Checkout has one dominant subtree; 2.4% faster than sequential native median |
-| Eight native workers split across root subtrees | `perf/native-parallel-traversal` | `/` | 1 | 4,079,718 | 40,792.26 ms traversal-only | 40,791.99 ms | n/a | included | 29.5% faster than sequential native; 19.2 seconds remain for indexing |
+| Eight native workers split across root subtrees | `perf/native-parallel-traversal` | `/` | 1 | 4,079,718 | 40,792.26 ms traversal-only | 40,791.99 ms | n/a | included | n/a | 29.5% faster than sequential native; 19.2 seconds remain for indexing |
+| Parallel native traversal plus direct SQLite schema-3 construction | `perf/native-sqlite-index` | Orbis checkout | 3 after 1 warmup | 43,348 | 271.68 ms | 170.02 ms | n/a | included | included | Integrated benchmark path, 12.5x faster than main |
+| Parallel native traversal plus direct SQLite schema-3 construction | `perf/native-sqlite-index` | `/` | 1 | 4,081,964 | 49,754.07 ms | 41,542.94 ms | n/a | included | included | Final default-mode pass with atomic staging and cancellation, 10.25 seconds below the goal |
 
 Raw reports:
 
 - `benchmark-results/iteration-main-baseline.json`
 - `benchmark-results/iteration-parent-fd-cache.json`
-- Native prototype output was captured directly from `scanTreeSummary()` because this branch measures traversal before production integration.
+- Native prototype output was captured directly from `scanTreeSummary()` because that branch measures traversal before production integration.
+- `benchmark-results/iteration-native-sqlite-index.json`
+- `benchmark-results/full-mac-native-sqlite-final.json`
+- `benchmark-results/full-mac-native-sqlite-default-final.json`
 
 The node count changed by 30 because build and benchmark artifacts inside the live checkout changed between runs. Throughput fell from 12,559 to 12,522 nodes per second. Traversal changed by less than 0.4 percent, while total scan time increased by 0.4 percent. Descriptor caching does not address the per-directory JavaScript, N-API, scheduling, preview, and SQLite work.
 
@@ -60,6 +65,23 @@ Eight workers claim top-level subtrees and use depth-first descriptor-relative t
 
 The Orbis checkout improved only 2.4 percent at the median because most entries sit under one top-level build subtree. That target remains useful for per-entry CPU and database costs but does not model full-volume parallelism well.
 
-## Next method
+## Native SQLite index
 
-Build the final SQLite schema from native traversal. Use one writer transaction and prepared statements, overlap it with metadata workers, and calculate directory totals bottom-up after discovery. This must preserve every file, deterministic hard-link ownership, allocated-byte totals, startup exclusions, cancellation, and atomic publication.
+The integrated scanner collects records in eight root-subtree workers, resolves hard links globally with the UTF-8 binary-minimum relative path as owner, calculates directory totals bottom-up, and writes persistent schema 3 in one native SQLite transaction. It stores every unique file and directory. The production worker selects it when the packaged native addon is available and falls back to the progressive scanner otherwise.
+
+The final prepared benchmark command was:
+
+```sh
+pnpm benchmark:scan:prepared -- \
+  --target / --allow-live-target --cache-state warm \
+  --warmup 0 --samples 1 --timeout-ms 180000 \
+  --output benchmark-results/full-mac-native-sqlite-default-final.json
+```
+
+The final default-mode benchmark completed and validated the atomically published database in 49.75 seconds. It indexed 4,081,964 nodes at 82,043 nodes per second. Traversal took 41.54 seconds. The final database was 1,354.42 MiB, with 1,047.13 MiB in persistent tables. Controller publication took 11.89 ms.
+
+A first default-mode run completed native scanning but rejected publication because more than 1,024 filesystem event scopes accumulated during the scan. Native full scans now publish without an FSEvents cursor, matching the existing no-journal fallback policy. A later refresh performs another full scan rather than pretending the initial live traversal has a trustworthy incremental boundary.
+
+## Remaining tradeoffs
+
+The passing run peaked at several GiB because this implementation retains node records until bottom-up aggregation and database construction finish. Cancellation now propagates through an atomic flag checked during traversal and database insertion, but the native path still does not emit progressive previews. The next engineering work should add periodic aggregate progress and spill or stream records to bound memory without returning to per-directory SQLite updates.

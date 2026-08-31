@@ -164,7 +164,7 @@ async function fullRefresh(request: RefreshRequest, journal: ChangeJournal | und
     throw error
   }
   const privateDrain = result.metadata?.resume
-  let cursor = checkpoint?.journalUuid && checkpoint.device === metadataTargetDevice(result.publishedPath)
+  let cursor = !result.metadata?.nativeFullScan && checkpoint?.journalUuid && checkpoint.device === metadataTargetDevice(result.publishedPath)
     ? { uuid: checkpoint.journalUuid, eventId: privateDrain?.drainedThrough ?? checkpoint.eventId }
     : null
 

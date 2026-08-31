@@ -61,6 +61,7 @@ export interface ScanResult {
   readonly metadata?: {
     readonly bulkMetadataEntries: number
     readonly fallbackMetadataEntries: number
+    readonly nativeFullScan?: true
     readonly resume?: { readonly drainedThrough: string; readonly dirtyScopes: readonly string[] }
   }
 }

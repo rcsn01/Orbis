@@ -120,6 +120,10 @@ export function recordScanCounter(counter: ScanCounterName, value = 1): void {
   counterChannel.publish({ scope: 'scan', counter, value, generation: context.generation } satisfies OrbisCounterEvent)
 }
 
+export function recordScanTiming(phase: string, durationMs: number): void {
+  publishScan(phase, Math.max(0, Number.isFinite(durationMs) ? durationMs : 0))
+}
+
 export function measureScanWork<T>(phase: string, operation: () => T): T {
   if (!scanChannel.hasSubscribers) return operation()
   const startedAt = performance.now()
