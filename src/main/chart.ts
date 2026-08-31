@@ -39,7 +39,7 @@ interface Candidate {
 }
 
 const DEFAULT_OPTIONS: Required<ChartOptions> = {
-  maxRings: 5,
+  maxRings: 10,
   maxSegments: 400,
   childrenPerDirectory: 64,
   maxVisibleChildren: 16,

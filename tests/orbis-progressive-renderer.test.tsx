@@ -1,8 +1,10 @@
 /** @vitest-environment jsdom */
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { segmentColor, Sunburst } from '../src/renderer/Sunburst'
 import type { ChartSegment } from '../src/shared/contracts'
+
+afterEach(cleanup)
 
 const base: ChartSegment = {
   id: 'n-folder', name: 'Folder', kind: 'directory', depth: 1, startAngle: 0, endAngle: 90,
@@ -20,6 +22,20 @@ describe('progressive Orbis renderer', () => {
     expect(segmentColor(firstChild)).toBe('hsl(240 68% 56%)')
     expect(segmentColor(secondChild)).toBe('hsl(280 68% 56%)')
     expect(segmentColor(distantBranch)).toBe('hsl(80 68% 54%)')
+  })
+
+  it('uses five normal rings followed by five thin rings', () => {
+    const fifth = { ...base, id: 'level-5', depth: 5, startAngle: 0, endAngle: 45, colorKey: 'root:one:two:three:four:five' }
+    const sixth = { ...base, id: 'level-6', depth: 6, startAngle: 0, endAngle: 45, colorKey: 'root:one:two:three:four:five:six' }
+    const tenth = { ...base, id: 'level-10', depth: 10, startAngle: 0, endAngle: 45, colorKey: 'root:one:two:three:four:five:six:seven:eight:nine:ten' }
+    const { container } = render(<Sunburst segments={[fifth, sixth, tenth]} onActivate={vi.fn()} />)
+
+    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-inner-radius', '217')
+    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-outer-radius', '257')
+    expect(container.querySelector('[data-depth="6"]')).toHaveAttribute('data-inner-radius', '259')
+    expect(container.querySelector('[data-depth="6"]')).toHaveAttribute('data-outer-radius', '267')
+    expect(container.querySelector('[data-depth="10"]')).toHaveAttribute('data-outer-radius', '307')
+    expect(container.querySelector('.orbis-feature-panel__sunburst-geometry')).toHaveAttribute('data-outer-radius', '308')
   })
 
   it('hatches provisional segments and identifies their state accessibly', () => {

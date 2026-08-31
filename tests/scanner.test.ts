@@ -362,7 +362,7 @@ describe("Orbis chart limits", () => {
     const source = { getNode: (id: string) => id === root.id ? root : children.find((child) => child.id === id), getChildren: (_id: string, limit: number) => children.slice(0, limit), countChildren: () => children.length }
     const chart = buildChart(source, root)
     expect(chart.length).toBeLessThanOrEqual(400)
-    expect(new Set(chart.map((segment) => segment.depth)).size).toBeLessThanOrEqual(5)
+    expect(new Set(chart.map((segment) => segment.depth)).size).toBeLessThanOrEqual(10)
     expect(chart.some((segment) => segment.name === "Other" && segment.id === null && !segment.drillable)).toBe(true)
     for (const maxSegments of [1, 2, 3]) {
       const limited = buildChart(source, root, { maxSegments })

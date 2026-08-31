@@ -24,6 +24,16 @@ describe('Orbis chart disk-capacity scale', () => {
     expect(chart.some((segment) => segment.name === 'Unscanned or system data')).toBe(false)
   })
 
+  it('includes ten folder levels by default', () => {
+    const chain = Array.from({ length: 10 }, (_, index) => directory(`level-${index + 1}`, index === 0 ? root.id : `level-${index}`, 100, index === 9 ? 0 : 1))
+    const byParent = new Map<string, readonly TestNode[]>([[root.id, [chain[0]!]]])
+    for (let index = 0; index < chain.length - 1; index += 1) byParent.set(chain[index]!.id, [chain[index + 1]!])
+
+    const chart = buildChart(chartSource({ ...root, sizeBytes: 100, directChildren: 1 }, byParent), { ...root, sizeBytes: 100, directChildren: 1 })
+
+    expect(Math.max(...chart.map((segment) => segment.depth))).toBe(10)
+  })
+
   it('continues to fill the circle for a selected folder', () => {
     const chart = buildChart(source, root, { maxRings: 1 })
 

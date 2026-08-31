@@ -24,11 +24,10 @@
 .orbis-feature-panel__chart-panel { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
 .orbis-feature-panel__chart-panel { min-height: 510px; padding: 18px; }
 .orbis-feature-panel__panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.orbis-feature-panel__panel-heading h2 { margin: 0; font-size: 18px; letter-spacing: -.025em; }
-.orbis-feature-panel__folder-size { display: flex; align-items: baseline; gap: 6px; margin: 4px 0 0; color: var(--muted-foreground); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.orbis-feature-panel__location { min-width: 0; }
+.orbis-feature-panel__folder-size { display: flex; align-items: baseline; gap: 6px; margin: 5px 4px 0; color: var(--muted-foreground); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .orbis-feature-panel__folder-size strong { color: var(--foreground); font-weight: 600; }
-.orbis-feature-panel__eyebrow { margin: 0 0 5px; color: var(--muted-foreground); font-size: 10px; font-weight: 700; letter-spacing: .12em; }
-.orbis-feature-panel__breadcrumbs { display: flex; min-width: 0; align-items: center; gap: 5px; margin: 14px 0 2px; overflow: auto; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.orbis-feature-panel__breadcrumbs { display: flex; min-width: 0; align-items: center; gap: 5px; margin: 0; overflow: auto; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
 .orbis-feature-panel__breadcrumbs span { display: inline-flex; align-items: center; gap: 5px; }
 .orbis-feature-panel__breadcrumbs button { border: 0; border-radius: 4px; padding: 3px 4px; color: inherit; background: transparent; cursor: pointer; }
 .orbis-feature-panel__breadcrumbs button:hover, .orbis-feature-panel__breadcrumbs button:focus-visible { color: var(--foreground); background: var(--accent); outline: none; }

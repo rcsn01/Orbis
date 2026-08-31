@@ -12,17 +12,16 @@ interface SunburstProps {
 export function Sunburst({ segments, onActivate, provisionalState = "complete", diskUsagePercentage }: SunburstProps): React.JSX.Element {
   const [tooltip, setTooltip] = useState<{ readonly segment: ChartSegment; readonly x: number; readonly y: number }>()
   const maxDepth = Math.max(1, ...segments.map((segment) => segment.depth))
-  const ringWidth = 42
   const innerRadius = 48
-  const outerRadius = innerRadius + maxDepth * ringWidth
-  const center = 300
+  const outerRadius = ringOuterRadius(maxDepth, innerRadius)
+  const center = 320
   return <div className="orbis-feature-panel__sunburst-wrap">
-    <svg className="orbis-feature-panel__sunburst" viewBox="0 0 600 600" role="group" aria-label="Disk usage sunburst">
+    <svg className="orbis-feature-panel__sunburst" viewBox="0 0 640 640" role="group" aria-label="Disk usage sunburst">
       <title>Disk usage. Open a folder or reveal a file from its segment.</title>
       <defs><pattern id="orbis-provisional-hatch" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6 M -2 6 L 2 10 M 0 0 L 8 8 M 6 -2 L 10 2" className="orbis-feature-panel__sunburst-hatch-line" /></pattern><pattern id="orbis-estimated-dots" width="8" height="8" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /><circle cx="6" cy="6" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /></pattern></defs>
       {segments.map((segment) => {
-        const inner = innerRadius + (segment.depth - 1) * ringWidth + 1
-        const outer = innerRadius + segment.depth * ringWidth - 1
+        const inner = ringInnerRadius(segment.depth, innerRadius) + 1
+        const outer = ringOuterRadius(segment.depth, innerRadius) - 1
         const path = ringPath(center, center, inner, outer, segment.startAngle, segment.endAngle)
         const provisional = segment.scanState === "queued" || segment.scanState === "scanning"
         const estimated = segment.sizeAccuracy === "estimated"
@@ -36,6 +35,9 @@ export function Sunburst({ segments, onActivate, provisionalState = "complete", 
           tabIndex={0}
           aria-disabled={!selectable ? true : undefined}
           aria-label={`${segment.name}, ${segment.kind === "directory" ? "directory" : segment.kind === "file" ? "file" : "aggregate"}, ${displayedSize.value}, ${segment.percentage.toFixed(1)} percent${count}${state}`}
+          data-depth={segment.depth}
+          data-inner-radius={inner}
+          data-outer-radius={outer}
           onClick={() => onActivate(segment)}
           onKeyDown={(event) => {
             if (event.key !== "Enter" && event.key !== " ") return
@@ -79,6 +81,20 @@ function accuracyLabel(accuracy: ChartSegment["sizeAccuracy"] | undefined, state
   if (accuracy === "exact") return "Exact"
   if (state === "queued" || state === "scanning") return "Scanning"
   return "Partial"
+}
+
+const NORMAL_RING_COUNT = 5
+const NORMAL_RING_WIDTH = 42
+const THIN_RING_WIDTH = 10
+
+function ringInnerRadius(depth: number, centerRadius: number): number {
+  const completedNormalRings = Math.min(Math.max(0, depth - 1), NORMAL_RING_COUNT)
+  const completedThinRings = Math.max(0, depth - 1 - NORMAL_RING_COUNT)
+  return centerRadius + completedNormalRings * NORMAL_RING_WIDTH + completedThinRings * THIN_RING_WIDTH
+}
+
+function ringOuterRadius(depth: number, centerRadius: number): number {
+  return ringInnerRadius(depth, centerRadius) + (depth <= NORMAL_RING_COUNT ? NORMAL_RING_WIDTH : THIN_RING_WIDTH)
 }
 
 function ringPath(cx: number, cy: number, inner: number, outer: number, start: number, end: number): string {
