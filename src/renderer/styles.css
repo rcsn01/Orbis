@@ -21,12 +21,9 @@
 .orbis-feature-panel__scan-warning strong { color: var(--foreground); font-size: 12px; }
 .orbis-feature-panel__scan-warning small { font-size: 10px; white-space: nowrap; }
 .orbis-feature-panel__workspace { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(300px, .85fr); min-height: 0; flex: 0 0 auto; align-items: start; gap: 18px; }
-.orbis-feature-panel__chart-panel { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
-.orbis-feature-panel__chart-panel { min-height: 510px; padding: 18px; }
+.orbis-feature-panel__chart-panel { min-width: 0; min-height: 510px; }
 .orbis-feature-panel__panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .orbis-feature-panel__location { min-width: 0; }
-.orbis-feature-panel__folder-size { display: flex; align-items: baseline; gap: 6px; margin: 5px 4px 0; color: var(--muted-foreground); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.orbis-feature-panel__folder-size strong { color: var(--foreground); font-weight: 600; }
 .orbis-feature-panel__breadcrumbs { display: flex; min-width: 0; align-items: center; gap: 5px; margin: 0; overflow: auto; color: var(--muted-foreground); font-size: 12px; white-space: nowrap; }
 .orbis-feature-panel__breadcrumbs span { display: inline-flex; align-items: center; gap: 5px; }
 .orbis-feature-panel__breadcrumbs button { border: 0; border-radius: 4px; padding: 3px 4px; color: inherit; background: transparent; cursor: pointer; }
@@ -46,7 +43,6 @@
 .orbis-feature-panel__sunburst-estimate-dot { fill: rgb(255 255 255 / 72%); }
 .orbis-feature-panel__sunburst-center { fill: var(--card); stroke: var(--border); stroke-width: 1; }
 .orbis-feature-panel__sunburst-center-label { fill: var(--foreground); font-size: 19px; font-weight: 650; }
-.orbis-feature-panel__sunburst-center-caption { fill: var(--muted-foreground); font-size: 9px; }
 .orbis-feature-panel__sunburst-tooltip { position: fixed; z-index: 30; display: grid; gap: 3px; max-width: 240px; pointer-events: none; border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; color: var(--foreground); background: var(--popover); box-shadow: 0 5px 20px rgb(0 0 0 / 18%); font-size: 11px; }
 .orbis-feature-panel__sunburst-tooltip span { color: var(--muted-foreground); }
 .orbis-feature-panel__sunburst-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--muted-foreground); font-size: 12px; }
@@ -56,7 +52,7 @@
 .orbis-feature-panel__contents-heading h2 { margin: 0; overflow: hidden; font-size: 20px; font-weight: 500; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
 .orbis-feature-panel__contents-heading strong { flex: 0 0 auto; font-size: 19px; font-weight: 500; }
 .orbis-feature-panel__contents-list { max-height: 465px; margin: 0; padding: 12px 0 0; overflow: auto; list-style: none; }
-.orbis-feature-panel__contents-list button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 16px; min-height: 42px; border: 0; border-radius: 6px; padding: 5px 4px; color: var(--foreground); background: transparent; text-align: left; cursor: pointer; }
+.orbis-feature-panel__contents-list button { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 16px; min-height: 34px; border: 0; border-radius: 6px; padding: 3px 4px; color: var(--foreground); background: transparent; text-align: left; cursor: pointer; }
 .orbis-feature-panel__contents-list button:hover, .orbis-feature-panel__contents-list button:focus-visible { color: var(--primary); background: var(--accent); outline: none; }
 .orbis-feature-panel__contents-list-name { display: flex; min-width: 0; align-items: center; gap: 11px; overflow: hidden; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .orbis-feature-panel__contents-list-size { flex: 0 0 auto; color: var(--muted-foreground); font: 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -82,7 +78,6 @@
   .orbis-feature-panel__scan-status { grid-template-columns: 1fr auto; }
   .orbis-feature-panel__scan-progress { grid-column: 1 / -1; grid-row: 2; }
   .orbis-feature-panel__scan-warning { grid-column: 1 / -1; justify-self: stretch; }
-  .orbis-feature-panel__chart-panel { padding: 12px; }
   .orbis-feature-panel__sunburst-wrap { height: min(430px, calc(100vw - 56px)); }
 }
 @media (prefers-reduced-motion: reduce) {

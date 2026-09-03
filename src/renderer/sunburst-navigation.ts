@@ -383,6 +383,6 @@ export function segmentColor(segment: ChartSegment, chart: readonly ChartSegment
   const positionInFamily = Math.max(-1, Math.min(1, (segmentMidpoint - familyMidpoint) / halfSpan))
   const depthOffset = Math.max(0, segment.depth - 1)
   const hue = Math.round((palette.hue + depthOffset * 12 + positionInFamily * 40 + 360) % 360)
-  const lightness = Math.round(Math.max(46, Math.min(80, palette.lightness + depthOffset * 2 + positionInFamily * 10)))
+  const lightness = Math.round(Math.max(46, Math.min(80, palette.lightness + depthOffset * 6)))
   return `hsl(${hue} ${palette.saturation}% ${lightness}%)`
 }

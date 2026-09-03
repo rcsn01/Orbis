@@ -174,7 +174,20 @@ describe('sunburst navigation planner', () => {
     const child = segment('child', 2, 0, 80, 'root:folder:child')
     const sibling = segment('sibling', 1, 80, 180, 'root:sibling')
     expect(segmentColor(colorBranch, [colorBranch, child, sibling])).toBe('hsl(132 64% 62%)')
-    expect(segmentColor(child, [colorBranch, child, sibling])).toBe('hsl(144 64% 64%)')
+    expect(segmentColor(child, [colorBranch, child, sibling])).toBe('hsl(144 64% 68%)')
     expect(segmentColor(sibling, [colorBranch, child, sibling])).toBe('hsl(198 72% 64%)')
+  })
+
+  it('keeps nested family shades from getting darker', () => {
+    const colorBranch = { ...branch, endAngle: 80 }
+    const child = segment('child', 2, 0, 80, 'root:folder:child')
+    const grandchild = segment('grandchild', 3, 0, 20, 'root:folder:child:grandchild')
+    const chart = [colorBranch, child, grandchild]
+
+    expect(chart.map((item) => segmentColor(item, chart))).toEqual([
+      'hsl(132 64% 62%)',
+      'hsl(144 64% 68%)',
+      'hsl(126 64% 74%)'
+    ])
   })
 })

@@ -25,7 +25,7 @@ interface SunburstProps {
   readonly onActivate: (segment: ChartSegment) => void
   readonly onContextMenu?: (segment: ChartSegment) => void
   readonly provisionalState?: DirectoryScanState
-  readonly diskUsagePercentage?: number | undefined
+  readonly folderSizeBytes?: number | undefined
   readonly transition?: SunburstTransition | undefined
   readonly onTransitionComplete?: () => void
 }
@@ -38,7 +38,7 @@ interface TransitionClock {
 const CENTER = 320
 const INNER_RADIUS = 48
 
-export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", diskUsagePercentage, transition, onTransitionComplete }: SunburstProps): React.JSX.Element {
+export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", folderSizeBytes = 0, transition, onTransitionComplete }: SunburstProps): React.JSX.Element {
   const [tooltip, setTooltip] = useState<{ readonly segment: ChartSegment; readonly x: number; readonly y: number }>()
   const [clock, setClock] = useState<TransitionClock>({ transition, progress: transition ? 0 : 1 })
   const onTransitionCompleteRef = useRef(onTransitionComplete)
@@ -83,8 +83,7 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
         {staticBars.map((bar) => <SemanticSegment key={bar.key} bar={bar} interactive={!transitioning} onActivate={onActivate} onContextMenu={onContextMenu} onTooltip={setTooltip} />)}
       </g>
       <circle cx={CENTER} cy={CENTER} r={INNER_RADIUS - 2} className="orbis-feature-panel__sunburst-center" />
-      <text x={CENTER} y={CENTER - 4} textAnchor="middle" className="orbis-feature-panel__sunburst-center-label">{diskUsagePercentage === undefined ? "100%" : `${Math.max(0, Math.min(100, diskUsagePercentage)).toFixed(1)}%`}</text>
-      <text x={CENTER} y={CENTER + 17} textAnchor="middle" className="orbis-feature-panel__sunburst-center-caption">{diskUsagePercentage === undefined ? "selected folder" : "disk capacity"}</text>
+      <text x={CENTER} y={CENTER + 6} textAnchor="middle" className="orbis-feature-panel__sunburst-center-label">{formatBytes(folderSizeBytes)}</text>
     </svg>
     {transitionFrame && <SunburstTransitionLayer frame={transitionFrame} direction={activeTransition!.direction} />}
     {tooltip && <div className="orbis-feature-panel__sunburst-tooltip" role="tooltip" style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}>

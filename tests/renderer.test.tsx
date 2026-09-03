@@ -59,6 +59,19 @@ describe("Orbis renderer", () => {
     expect(screen.queryByText("Scanning…", { exact: true })).toBeNull()
   })
 
+  it("does not duplicate the separator after a root breadcrumb", async () => {
+    const pathSnapshot: OrbisSnapshot = {
+      ...completed,
+      focus: { ...root, id: "library", parentId: "mac", name: "Library" },
+      breadcrumbs: [{ id: "root", name: "/" }, { id: "users", name: "Users" }, { id: "mac", name: "mac" }, { id: "library", name: "Library" }]
+    }
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(pathSnapshot)
+
+    render(<App />)
+    const breadcrumbs = await screen.findByRole("navigation", { name: "Folder breadcrumbs" })
+    expect(breadcrumbs.textContent).toBe("/Users/mac/Library")
+  })
+
   it("switches and removes saved locations through opaque ids", async () => {
     const user = userEvent.setup()
     const multiple = { ...completed, locations: [
@@ -74,19 +87,16 @@ describe("Orbis renderer", () => {
     expect(window.orbis.removeLocation).toHaveBeenCalledWith(otherLocationId)
   })
 
-  it("shows the estimated folder size until an exact snapshot replaces it", async () => {
+  it("does not show a separate folder size below the breadcrumbs", async () => {
     const provisional: OrbisSnapshot = {
       ...scanning,
       focus: { ...root, sizeBytes: 12 * 1024 * 1024, estimatedSizeBytes: 8 * 1024 * 1024, scanState: "scanning", sizeAccuracy: "estimated" }
     }
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(provisional)
 
-    render(<App />)
-    expect(await screen.findByLabelText("Estimated folder size, 8.0 MB")).toBeVisible()
-
-    publish?.(completed)
-    expect(await screen.findByLabelText("Folder size, 10 KB")).toBeVisible()
-    expect(screen.queryByLabelText(/Estimated folder size/)).toBeNull()
+    const { container } = render(<App />)
+    await screen.findByRole("complementary", { name: "fixture contents" })
+    expect(container.querySelector(".orbis-feature-panel__folder-size")).toBeNull()
   })
 
   it("shows the currently known folder size while scanning", async () => {
@@ -98,11 +108,12 @@ describe("Orbis renderer", () => {
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(withoutEstimate)
 
     render(<App />)
-    expect(await screen.findByLabelText("Known folder size, 4.0 KB")).toBeVisible()
+    await screen.findByRole("complementary", { name: "fixture contents" })
+    expect(screen.queryByLabelText(/folder size/i)).toBeNull()
     expect(screen.getByRole("button", { name: "Documents, directory, 4.0 KB, Scanning" })).toBeVisible()
   })
 
-  it("presents the startup root as a share of total disk capacity", async () => {
+  it("shows the current folder size in the sunburst center", async () => {
     const diskSnapshot: OrbisSnapshot = {
       ...completed,
       target: { name: "Macintosh HD", isStartup: true },
@@ -113,10 +124,11 @@ describe("Orbis renderer", () => {
     }
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(diskSnapshot)
 
-    render(<App />)
-    expect(await screen.findByText("50.0%")).toBeVisible()
-    expect(screen.getByText("disk capacity")).toBeVisible()
-    expect(screen.queryByText("selected folder")).toBeNull()
+    const { container } = render(<App />)
+    await screen.findByRole("complementary", { name: "fixture contents" })
+    expect(container.querySelector(".orbis-feature-panel__sunburst-center-label")).toHaveTextContent("10 KB")
+    expect(screen.queryByText("50.0%")).toBeNull()
+    expect(screen.queryByText("disk capacity")).toBeNull()
   })
 
   it("keeps saved results visible during resume preparation", async () => {
@@ -357,29 +369,18 @@ describe("Orbis renderer", () => {
     expect(animatedSegment).toHaveAttribute("data-end-angle", "288")
   })
 
-  it("opens a contents-list folder through its representing Other wedge", async () => {
-    const user = userEvent.setup()
-    const nestedFile = { ...file, id: "n-4", parentId: folder.id, name: "inside.txt", sizeBytes: folder.sizeBytes }
+  it("hides contents-list items grouped into Other", async () => {
     const aggregatedSource: OrbisSnapshot = {
       ...completed,
       chart: [{ id: null, name: "Other", kind: "other", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: root.sizeBytes, percentage: 100, drillable: false, colorKey: "root:other", scanState: "complete", sizeAccuracy: "exact" }]
     }
-    const nested: OrbisSnapshot = {
-      ...completed,
-      focus: folder,
-      breadcrumbs: [{ id: root.id, name: root.name }, { id: folder.id, name: folder.name }],
-      chart: [{ id: nestedFile.id, name: nestedFile.name, kind: "file", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: nestedFile.sizeBytes, percentage: 100, drillable: false, colorKey: "root:n-4", scanState: "complete", sizeAccuracy: "exact" }],
-      largestItems: [nestedFile]
-    }
-    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1))
-    vi.stubGlobal("cancelAnimationFrame", vi.fn())
     vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(aggregatedSource)
-    vi.mocked(window.orbis.focusNode).mockResolvedValueOnce(nested)
 
-    const { container } = render(<App />)
-    await user.click(await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, Exact$/ }))
-    await screen.findByRole("complementary", { name: "Documents contents" })
-    expect(container.querySelector('.orbis-feature-panel__sunburst-transition [data-track-origin="aggregate"]')).not.toBeNull()
+    render(<App />)
+    await screen.findByRole("complementary", { name: "fixture contents" })
+    expect(screen.queryByRole("button", { name: /Documents, directory/ })).toBeNull()
+    expect(screen.queryByRole("button", { name: /notes\.txt, file/ })).toBeNull()
+    expect(screen.getByText("No individual items to show.")).toBeVisible()
   })
 
   it("opens native node menus without activating the node", async () => {

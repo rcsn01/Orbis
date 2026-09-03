@@ -85,14 +85,10 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
 
   const focus = snapshot?.focus
   const scan = snapshot?.scan
-  const selectedLocation = snapshot?.locations.find((location) => location.id === snapshot.selectedLocationId)
   const isScanning = scan?.status === "scanning"
   const diskRoot = Boolean(focus && snapshot?.target.isStartup && focus.id === snapshot.breadcrumbs[0]?.id)
   const folderIsEmpty = Boolean(focus && snapshot && focus.directChildren === 0 && focus.scanState === "complete" && !(diskRoot && snapshot.volume.unscannedBytes > 0))
-  const displayTotal = useMemo(() => focus && snapshot ? (diskRoot ? snapshot.volume.capacityBytes : focus.sizeBytes) : 0, [diskRoot, focus, snapshot])
-  const diskUsagePercentage = diskRoot && focus && displayTotal > 0
-    ? (isPending(focus) ? focus.estimatedSizeBytes ?? focus.sizeBytes : focus.sizeBytes) / displayTotal * 100
-    : undefined
+  const folderSizeBytes = focus ? isPending(focus) ? focus.estimatedSizeBytes ?? focus.sizeBytes : focus.sizeBytes : 0
   const startOrRescan = !scan || scan.status === "idle" ? bridge.startScan : bridge.rescan
   const startOrRescanLabel = scan?.resume?.available ? "Resume" : !scan || scan.status === "idle" ? "Scan" : "Rescan"
   const exitAnchor = pendingNavigation?.direction === "exit" && pendingNavigation.targetFocusId === focus?.id
@@ -201,7 +197,7 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
 
   return <AppearanceScope appearance={appearance} className="orbis-feature-panel">
     <DesktopPage width="full" scroll="contained" className="orbis-feature-panel__page">
-      <DesktopContentHeader title="Disk usage" description={snapshot ? `${snapshot.target.name}${selectedLocation?.coverage === "ancestor" ? " · Shared parent index" : ""}` : "Read-only storage visualizer"} actions={<div className="orbis-feature-panel__actions">
+      <DesktopContentHeader title="Disk usage" actions={<div className="orbis-feature-panel__actions">
         {snapshot && <select aria-label="Saved location" value={snapshot.selectedLocationId} disabled={isScanning} onChange={(event) => void run(() => bridge.selectLocation(event.target.value as LocationId))}>{snapshot.locations.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}</select>}
         <Button size="sm" variant="outline" onClick={() => void run(() => bridge.addLocation())} disabled={isScanning}>Add Folder</Button>
         {snapshot && <Button size="sm" variant="outline" aria-label="Remove location" disabled={snapshot.locations.length <= 1 || isScanning || Boolean(scan?.resume?.available && scan.locationId === snapshot.selectedLocationId)} onClick={() => void run(() => bridge.removeLocation(snapshot.selectedLocationId))}>Remove</Button>}
@@ -216,8 +212,8 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
         {snapshot.committed && snapshot.volume.sizeAccuracy === "partial" && <Alert className="orbis-feature-panel__alert"><AlertTitle>Scan complete; some folders could not be measured</AlertTitle><AlertDescription>Orbis indexed the readable metadata and marked the remaining sizes as partial.</AlertDescription></Alert>}
         {focus ? <div className="orbis-feature-panel__workspace">
           <section className="orbis-feature-panel__chart-panel" aria-label={`Disk usage for ${focus.name}`}>
-            <div className="orbis-feature-panel__panel-heading"><div className="orbis-feature-panel__location"><Breadcrumbs snapshot={snapshot} onFocus={exitToNode} onContextMenu={(id) => void showNodeContextMenu(id)} /><FolderSize node={focus} /></div>{focus.parentId && <Button size="sm" variant="ghost" onClick={() => exitToNode(focus.parentId!)}><ChevronLeft />Up</Button>}</div>
-            {folderIsEmpty ? <div className="orbis-feature-panel__empty" role="status"><strong>This folder is empty</strong><span>No readable child files or folders were found.</span></div> : <Sunburst segments={snapshot.chart} onActivate={activateSegment} onContextMenu={(segment) => { if (segment.id) void showNodeContextMenu(segment.id) }} provisionalState={focus.scanState} diskUsagePercentage={diskUsagePercentage} transition={chartTransition} onTransitionComplete={() => setPendingNavigation((current) => current?.token === chartTransition?.navigationToken ? undefined : current)} />}
+            <div className="orbis-feature-panel__panel-heading"><div className="orbis-feature-panel__location"><Breadcrumbs snapshot={snapshot} onFocus={exitToNode} onContextMenu={(id) => void showNodeContextMenu(id)} /></div>{focus.parentId && <Button size="sm" variant="ghost" onClick={() => exitToNode(focus.parentId!)}><ChevronLeft />Up</Button>}</div>
+            {folderIsEmpty ? <div className="orbis-feature-panel__empty" role="status"><strong>This folder is empty</strong><span>No readable child files or folders were found.</span></div> : <Sunburst segments={snapshot.chart} onActivate={activateSegment} onContextMenu={(segment) => { if (segment.id) void showNodeContextMenu(segment.id) }} provisionalState={focus.scanState} folderSizeBytes={folderSizeBytes} transition={chartTransition} onTransitionComplete={() => setPendingNavigation((current) => current?.token === chartTransition?.navigationToken ? undefined : current)} />}
           </section>
           <DirectoryContents snapshot={snapshot} onActivate={activateNode} onContextMenu={(id) => void showNodeContextMenu(id)} />
         </div> : <EmptyScanState snapshot={snapshot} onStart={() => void run(() => bridge.startScan())} />}
@@ -244,24 +240,19 @@ function ScanStatus({ snapshot, onCancel, onRescan, onOpenPermissions }: { reado
   </div>
 }
 
-function FolderSize({ node }: { readonly node: NodeSummary }): React.JSX.Element {
-  const value = formatBytes(isPending(node) ? node.estimatedSizeBytes ?? node.sizeBytes : node.sizeBytes)
-  const label = node.sizeAccuracy === "estimated" ? "Estimated size" : node.sizeAccuracy === "exact" ? "Size" : "Known size"
-  const accessibleLabel = node.sizeAccuracy === "estimated" ? `Estimated folder size, ${value}` : node.sizeAccuracy === "exact" ? `Folder size, ${value}` : `Known folder size, ${value}`
-  return <p className="orbis-feature-panel__folder-size" aria-label={accessibleLabel}><span>{label}</span><strong>{value}</strong></p>
-}
-
 function Breadcrumbs({ snapshot, onFocus, onContextMenu }: { readonly snapshot: OrbisSnapshot; readonly onFocus: (id: string) => void; readonly onContextMenu: (id: string) => void }): React.JSX.Element {
-  return <nav className="orbis-feature-panel__breadcrumbs" aria-label="Folder breadcrumbs">{snapshot.breadcrumbs.map((breadcrumb, index) => <span key={breadcrumb.id}><button type="button" onClick={() => onFocus(breadcrumb.id)} onContextMenu={(event) => { event.preventDefault(); onContextMenu(breadcrumb.id) }} aria-current={index === snapshot.breadcrumbs.length - 1 ? "location" : undefined}>{breadcrumb.name}</button>{index < snapshot.breadcrumbs.length - 1 && <span aria-hidden="true">/</span>}</span>)}</nav>
+  return <nav className="orbis-feature-panel__breadcrumbs" aria-label="Folder breadcrumbs">{snapshot.breadcrumbs.map((breadcrumb, index) => <span key={breadcrumb.id}><button type="button" onClick={() => onFocus(breadcrumb.id)} onContextMenu={(event) => { event.preventDefault(); onContextMenu(breadcrumb.id) }} aria-current={index === snapshot.breadcrumbs.length - 1 ? "location" : undefined}>{breadcrumb.name}</button>{index < snapshot.breadcrumbs.length - 1 && breadcrumb.name !== "/" && <span aria-hidden="true">/</span>}</span>)}</nav>
 }
 
 function DirectoryContents({ snapshot, onActivate, onContextMenu }: { readonly snapshot: OrbisSnapshot; readonly onActivate: (item: NodeSummary) => void; readonly onContextMenu: (id: string) => void }): React.JSX.Element {
   const focus = snapshot.focus
   const name = focus?.name ?? snapshot.target.name
   const size = focus ? nodeSizePresentation(focus).visible : formatBytes(0)
+  const visibleItems = snapshot.largestItems.filter((item) => snapshot.chart.some((segment) => segment.depth === 1 && segment.id === item.id))
+  const emptyMessage = snapshot.largestItems.length === 0 ? "No readable items in this folder." : "No individual items to show."
   return <aside className="orbis-feature-panel__contents" aria-label={`${name} contents`}>
     <div className="orbis-feature-panel__contents-heading"><h2>{name}</h2><strong>{size}</strong></div>
-    {snapshot.largestItems.length === 0 ? <p className="orbis-feature-panel__muted">No readable items in this folder.</p> : <ul className="orbis-feature-panel__contents-list" aria-label={`${name} contents`}>{snapshot.largestItems.map((item) => {
+    {visibleItems.length === 0 ? <p className="orbis-feature-panel__muted">{emptyMessage}</p> : <ul className="orbis-feature-panel__contents-list" aria-label={`${name} contents`}>{visibleItems.map((item) => {
       const itemSize = nodeSizePresentation(item)
       const segment = snapshot.chart.find((candidate) => candidate.id === item.id && candidate.depth === 1)
       const color = segment ? segmentColor(segment, snapshot.chart) : item.kind === "directory" ? "#5a87c5" : "#89909a"
