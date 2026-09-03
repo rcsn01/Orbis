@@ -115,7 +115,9 @@ test("animates a folder wedge into its contents with reduced motion enabled", as
   const scanRoot = join(fixtureDirectory, "fixture")
   const userData = join(fixtureDirectory, "user-data")
   await mkdir(join(scanRoot, "Photos", "Nested"), { recursive: true })
+  await mkdir(join(scanRoot, "Videos"), { recursive: true })
   await writeFile(join(scanRoot, "Photos", "Nested", "large.raw"), Buffer.alloc(32 * 1024))
+  await writeFile(join(scanRoot, "Videos", "clip.mov"), Buffer.alloc(24 * 1024))
   await writeFile(join(scanRoot, "notes.txt"), "notes")
   const application = await electron.launch({ args: [root], cwd: root, env: { ...process.env, ORBIS_SCAN_ROOT: scanRoot, ORBIS_USER_DATA: userData } })
   try {
@@ -124,24 +126,60 @@ test("animates a folder wedge into its contents with reduced motion enabled", as
     await page.getByRole("button", { name: "Scan", exact: true }).click()
     await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
     await page.evaluate(() => {
-      const chart = document.querySelector(".orbis-feature-panel__sunburst")
+      const wrap = document.querySelector(".orbis-feature-panel__sunburst-wrap")
+      const chart = wrap?.querySelector(".orbis-feature-panel__sunburst")
       const states: string[] = []
       const paths: string[] = []
+      const outgoingPaths: string[] = []
       new MutationObserver(() => {
         states.push(chart?.getAttribute("data-transitioning") ?? "missing")
         const path = chart?.querySelector(".orbis-feature-panel__sunburst-segment")?.getAttribute("d")
         if (path) paths.push(path)
       }).observe(chart!, { attributes: true, subtree: true, attributeFilter: ["data-transitioning", "d"] })
-      Object.assign(window, { __orbisAnimationProbe: { states, paths } })
+      new MutationObserver(() => {
+        const outgoingPath = wrap?.querySelector(".orbis-feature-panel__sunburst-outgoing .orbis-feature-panel__sunburst-segment")?.getAttribute("d")
+        if (outgoingPath) outgoingPaths.push(outgoingPath)
+      }).observe(wrap!, { attributes: true, childList: true, subtree: true, attributeFilter: ["d"] })
+      Object.assign(window, { __orbisAnimationProbe: { states, paths, outgoingPaths } })
     })
 
     const folderWedge = page.getByRole("button", { name: /Photos, directory, .* percent/ })
+    const siblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
     await folderWedge.dispatchEvent("click")
     await expect(page.getByRole("complementary", { name: "Photos contents" })).toBeVisible()
+    await expect.poll(() => page.evaluate((expectedGeometry) => {
+      const siblings = document.querySelector(".orbis-feature-panel__sunburst-fading-siblings")
+      const opacity = siblings ? Number(getComputedStyle(siblings).opacity) : -1
+      const geometries = Array.from(siblings?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
+      return opacity > 0 && opacity < 1 && geometries.includes(expectedGeometry)
+    }, siblingGeometry)).toBe(true)
     await expect.poll(() => page.evaluate(() => {
       const probe = (window as unknown as { __orbisAnimationProbe: { states: string[]; paths: string[] } }).__orbisAnimationProbe
       return probe.states.includes("true") && new Set(probe.paths).size > 1
     })).toBe(true)
+
+    await page.evaluate(() => {
+      const probe = (window as unknown as { __orbisAnimationProbe: { outgoingPaths: string[] } }).__orbisAnimationProbe
+      probe.outgoingPaths.length = 0
+    })
+    await page.getByRole("button", { name: "Up" }).click()
+    await expect(page.getByRole("complementary", { name: "fixture contents" })).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as { __orbisAnimationProbe: { outgoingPaths: string[] } }).__orbisAnimationProbe
+      return new Set(probe.outgoingPaths).size > 1
+    })).toBe(true)
+    await expect(page.locator(".orbis-feature-panel__sunburst-outgoing")).toHaveCount(0)
+
+    const nestedWedge = page.getByRole("button", { name: /Nested, directory, .* percent/ })
+    const rootSiblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
+    await nestedWedge.dispatchEvent("click")
+    await expect(page.getByRole("complementary", { name: "Nested contents" })).toBeVisible()
+    await expect.poll(() => page.evaluate((expectedGeometry) => {
+      const siblings = document.querySelector(".orbis-feature-panel__sunburst-fading-siblings")
+      const opacity = siblings ? Number(getComputedStyle(siblings).opacity) : -1
+      const geometries = Array.from(siblings?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
+      return opacity > 0 && opacity < 1 && geometries.includes(expectedGeometry)
+    }, rootSiblingGeometry)).toBe(true)
   } finally {
     await application.close()
     await rm(fixtureDirectory, { recursive: true, force: true })

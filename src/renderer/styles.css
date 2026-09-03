@@ -32,7 +32,12 @@
 .orbis-feature-panel__breadcrumbs button { border: 0; border-radius: 4px; padding: 3px 4px; color: inherit; background: transparent; cursor: pointer; }
 .orbis-feature-panel__breadcrumbs button:hover, .orbis-feature-panel__breadcrumbs button:focus-visible { color: var(--foreground); background: var(--accent); outline: none; }
 .orbis-feature-panel__sunburst-wrap { position: relative; display: grid; min-height: 430px; place-items: center; overflow: visible; }
-.orbis-feature-panel__sunburst { display: block; width: min(100%, 520px); height: auto; overflow: visible; }
+.orbis-feature-panel__sunburst { grid-area: 1 / 1; display: block; width: min(100%, 520px); height: auto; overflow: visible; }
+.orbis-feature-panel__sunburst-current { z-index: 1; }
+.orbis-feature-panel__sunburst-outgoing { z-index: 2; pointer-events: none; }
+.orbis-feature-panel__sunburst-outgoing .orbis-feature-panel__sunburst-segment { pointer-events: none; }
+.orbis-feature-panel__sunburst-fading-siblings { animation: orbis-sunburst-fade-siblings 960ms linear forwards; will-change: opacity; }
+@keyframes orbis-sunburst-fade-siblings { from { opacity: 1; } to { opacity: 0; } }
 .orbis-feature-panel__sunburst-segment { stroke: var(--card); stroke-width: 1.5; cursor: pointer; outline: none; transition: opacity 120ms ease, filter 120ms ease; }
 .orbis-feature-panel__sunburst[data-interactive="false"] .orbis-feature-panel__sunburst-segment { pointer-events: none; }
 .orbis-feature-panel__sunburst-segment:hover, .orbis-feature-panel__sunburst-segment:focus-visible { filter: brightness(1.18); opacity: .92; }

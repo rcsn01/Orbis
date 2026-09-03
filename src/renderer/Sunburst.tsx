@@ -8,20 +8,35 @@ export interface SunburstTransitionOrigin {
   readonly endAngle: number
 }
 
+export type SunburstTransition =
+  | {
+      readonly kind: "enter"
+      readonly origin: SunburstTransitionOrigin
+      readonly sourceSegments: readonly ChartSegment[]
+      readonly branchId: string
+    }
+  | {
+      readonly kind: "exit"
+      readonly destination: SunburstTransitionOrigin
+      readonly outgoingSegments: readonly ChartSegment[]
+      readonly branchId: string
+    }
+
 interface SunburstProps {
   readonly segments: readonly ChartSegment[]
   readonly onActivate: (segment: ChartSegment) => void
   readonly onContextMenu?: (segment: ChartSegment) => void
   readonly provisionalState?: DirectoryScanState
   readonly diskUsagePercentage?: number | undefined
-  readonly transitionOrigin?: SunburstTransitionOrigin | undefined
+  readonly transition?: SunburstTransition | undefined
   readonly onTransitionComplete?: () => void
 }
 
-const TRANSITION_DURATION_MS = 480
+const TRANSITION_DURATION_MS = 1_920
 const TRANSITION_INTERACTION_THRESHOLD = 0.7
+const TRANSITION_STAGE_SPLIT = 0.5
 
-export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", diskUsagePercentage, transitionOrigin, onTransitionComplete }: SunburstProps): React.JSX.Element {
+export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", diskUsagePercentage, transition, onTransitionComplete }: SunburstProps): React.JSX.Element {
   const [tooltip, setTooltip] = useState<{ readonly segment: ChartSegment; readonly x: number; readonly y: number }>()
   const [transitionProgress, setTransitionProgress] = useState(1)
   const onTransitionCompleteRef = useRef(onTransitionComplete)
@@ -30,11 +45,22 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
   const innerRadius = 48
   const outerRadius = ringOuterRadius(maxDepth, innerRadius)
   const center = 320
-  const transitioning = Boolean(transitionOrigin) && transitionProgress < 1
+  const transitioning = Boolean(transition) && transitionProgress < 1
+  const entryTransition = transition?.kind === "enter" ? transition : undefined
+  const entryOrigin = entryTransition?.origin
+  const exitTransition = transition?.kind === "exit" ? transition : undefined
+  const entrySourceBranch = entryTransition?.sourceSegments.find((segment) => segment.depth === entryTransition.origin.depth && segment.id === entryTransition.branchId)
+  const exitDestinationBranch = exitTransition
+    ? segments.find((segment) => segment.depth === 1 && segment.id === exitTransition.branchId)
+      ?? segments.find((segment) => segment.depth === 1 && segment.kind === "other")
+    : undefined
+  const entryMorphProgress = stagedProgress(transitionProgress, TRANSITION_STAGE_SPLIT, 1)
+  const exitMorphProgress = stagedProgress(transitionProgress, 0, TRANSITION_STAGE_SPLIT)
+  const exitRevealProgress = stagedProgress(transitionProgress, TRANSITION_STAGE_SPLIT, 1)
   const interactive = !transitioning || transitionProgress >= TRANSITION_INTERACTION_THRESHOLD
 
   useLayoutEffect(() => {
-    if (!transitionOrigin) {
+    if (!transition) {
       setTransitionProgress(1)
       return
     }
@@ -53,14 +79,21 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
     }
     frame = window.requestAnimationFrame(advance)
     return () => window.cancelAnimationFrame(frame)
-  }, [transitionOrigin])
+  }, [transition])
 
   return <div className="orbis-feature-panel__sunburst-wrap">
-    <svg className="orbis-feature-panel__sunburst" viewBox="0 0 640 640" role="group" aria-label="Disk usage sunburst" aria-busy={transitioning} data-transitioning={transitioning} data-interactive={interactive}>
+    <svg className="orbis-feature-panel__sunburst orbis-feature-panel__sunburst-current" viewBox="0 0 640 640" role="group" aria-label="Disk usage sunburst" aria-busy={transitioning} data-transitioning={transitioning} data-interactive={interactive}>
       <title>Disk usage. Open a folder or reveal a file from its segment.</title>
       <defs><pattern id="orbis-provisional-hatch" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6 M -2 6 L 2 10 M 0 0 L 8 8 M 6 -2 L 10 2" className="orbis-feature-panel__sunburst-hatch-line" /></pattern><pattern id="orbis-estimated-dots" width="8" height="8" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /><circle cx="6" cy="6" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /></pattern></defs>
       {segments.map((segment) => {
-        const geometry = animatedSegmentGeometry(segment, transitionOrigin, transitionProgress, innerRadius)
+        const sourceSegment = entryTransition ? matchingSegment(segment, entryTransition.sourceSegments, entryTransition.origin.depth) : undefined
+        const outsideExitBranch = Boolean(exitDestinationBranch && !isInBranch(segment, exitDestinationBranch))
+        const geometry = exitTransition && exitDestinationBranch
+          ? segment === exitDestinationBranch
+            ? growingBranchShellGeometry(segment, exitMorphProgress, innerRadius)
+            : segmentGeometry(segment, innerRadius)
+          : animatedSegmentGeometry(segment, entryOrigin, entryMorphProgress, innerRadius, sourceSegment)
+        const segmentOpacity = exitTransition && outsideExitBranch ? exitRevealProgress : 1
         const { inner, outer } = geometry
         const path = ringPath(center, center, inner, outer, geometry.startAngle, geometry.endAngle)
         const provisional = segment.scanState === "queued" || segment.scanState === "scanning"
@@ -69,8 +102,8 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
         const state = displayedSize.estimating ? "" : `, ${accuracyLabel(segment.sizeAccuracy, segment.scanState)}`
         const count = segment.itemCount && segment.itemCount > 1 ? `, ${formatItemCount(segment.itemCount)}` : ""
         const selectable = segment.id !== null && (segment.kind === "file" || segment.drillable)
-        return <g key={`${segment.depth}-${segment.colorKey}-${segment.startAngle}`}>
-          <path d={path} fill={segmentColor(segment, segments)} className="orbis-feature-panel__sunburst-segment"
+        return <g key={`${segment.depth}-${segment.colorKey}-${segment.startAngle}`} style={segmentOpacity < 1 ? { opacity: segmentOpacity } : undefined}>
+          <path d={path} fill={entryTransition && transitioning ? transitionColor(segmentColor(sourceSegment ?? entrySourceBranch ?? segment, entryTransition.sourceSegments), segmentColor(segment, segments), entryMorphProgress) : segmentColor(segment, segments)} className="orbis-feature-panel__sunburst-segment"
           role="button"
           tabIndex={interactive ? 0 : -1}
           aria-disabled={!selectable || !interactive ? true : undefined}
@@ -108,6 +141,20 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
       <text x={center} y={center - 4} textAnchor="middle" className="orbis-feature-panel__sunburst-center-label">{diskUsagePercentage === undefined ? "100%" : `${Math.max(0, Math.min(100, diskUsagePercentage)).toFixed(1)}%`}</text>
       <text x={center} y={center + 17} textAnchor="middle" className="orbis-feature-panel__sunburst-center-caption">{diskUsagePercentage === undefined ? "selected folder" : "disk capacity"}</text>
     </svg>
+    {entryTransition && transitioning && entrySourceBranch && <svg className="orbis-feature-panel__sunburst orbis-feature-panel__sunburst-outgoing" viewBox="0 0 640 640" aria-hidden="true" focusable="false" style={{ pointerEvents: "none" }}>
+      <DecorativeSegment segment={entrySourceBranch} geometry={expandingBranchShellGeometry(entrySourceBranch, entryMorphProgress, innerRadius)} color={segmentColor(entrySourceBranch, entryTransition.sourceSegments)} center={center} />
+      <g className="orbis-feature-panel__sunburst-fading-siblings">
+        {entryTransition.sourceSegments.filter((segment) => !isInBranch(segment, entrySourceBranch)).map((segment) => <DecorativeSegment key={`${segment.depth}-${segment.colorKey}-${segment.startAngle}`} segment={segment} geometry={segmentGeometry(segment, innerRadius)} color={segmentColor(segment, entryTransition.sourceSegments)} center={center} />)}
+      </g>
+    </svg>}
+    {exitTransition && transitioning && <svg className="orbis-feature-panel__sunburst orbis-feature-panel__sunburst-outgoing" viewBox="0 0 640 640" aria-hidden="true" focusable="false" style={{ pointerEvents: "none" }}>
+      {exitTransition.outgoingSegments.map((segment) => {
+        const destinationSegment = matchingSegment(segment, segments, 1)
+        const geometry = animatedSegmentGeometry(segment, exitTransition.destination, 1 - exitMorphProgress, innerRadius, destinationSegment)
+        const destinationColor = segmentColor(destinationSegment ?? exitDestinationBranch ?? segment, segments)
+        return <DecorativeSegment key={`${segment.depth}-${segment.colorKey}-${segment.startAngle}`} segment={segment} geometry={geometry} color={transitionColor(segmentColor(segment, exitTransition.outgoingSegments), destinationColor, exitMorphProgress)} center={center} />
+      })}
+    </svg>}
     {tooltip && <div className="orbis-feature-panel__sunburst-tooltip" role="tooltip" style={{ left: tooltip.x + 12, top: tooltip.y + 12 }}>
       <strong>{tooltip.segment.name}</strong>
       <span>{segmentSizePresentation(tooltip.segment).value} · {tooltip.segment.percentage.toFixed(1)}%{segmentSizePresentation(tooltip.segment).estimating ? "" : ` · ${accuracyLabel(tooltip.segment.sizeAccuracy, tooltip.segment.scanState)}`}{tooltip.segment.itemCount && tooltip.segment.itemCount > 1 ? ` · ${formatItemCount(tooltip.segment.itemCount)}` : ""}</span>
@@ -151,24 +198,43 @@ interface SegmentGeometry {
   readonly endAngle: number
 }
 
-export function animatedSegmentGeometry(segment: ChartSegment, origin: SunburstTransitionOrigin | undefined, progress: number, centerRadius = 48): SegmentGeometry {
+function DecorativeSegment({ segment, geometry, color, center }: { readonly segment: ChartSegment; readonly geometry: SegmentGeometry; readonly color: string; readonly center: number }): React.JSX.Element {
+  return <path
+    d={ringPath(center, center, geometry.inner, geometry.outer, geometry.startAngle, geometry.endAngle)}
+    fill={color}
+    className="orbis-feature-panel__sunburst-segment"
+    data-depth={segment.depth}
+    data-inner-radius={geometry.inner}
+    data-outer-radius={geometry.outer}
+    data-start-angle={geometry.startAngle}
+    data-end-angle={geometry.endAngle}
+  />
+}
+
+function segmentGeometry(segment: ChartSegment, centerRadius: number): SegmentGeometry {
   const ringInset = segment.depth <= NORMAL_RING_COUNT ? 0 : 1
-  const target = {
+  return {
     inner: ringInnerRadius(segment.depth, centerRadius) + ringInset,
     outer: ringOuterRadius(segment.depth, centerRadius) - ringInset,
     startAngle: segment.startAngle,
     endAngle: segment.endAngle
   }
-  if (!origin || progress >= 1) return target
+}
 
-  const originInset = origin.depth <= NORMAL_RING_COUNT ? 0 : 1
-  const originInner = ringInnerRadius(origin.depth, centerRadius) + originInset
-  const originOuter = ringOuterRadius(origin.depth, centerRadius) - originInset
-  const originSpan = Math.max(0, origin.endAngle - origin.startAngle)
-  const mapIntoOrigin = (angle: number): number => origin.startAngle + angle / 360 * originSpan
-  const start = segment.depth === 1
-    ? { inner: originInner, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
-    : { inner: originOuter, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
+export function animatedSegmentGeometry(segment: ChartSegment, origin: SunburstTransitionOrigin | undefined, progress: number, centerRadius = 48, sourceSegment?: ChartSegment): SegmentGeometry {
+  const target = segmentGeometry(segment, centerRadius)
+  if (progress >= 1) return target
+
+  const originInset = origin && origin.depth > NORMAL_RING_COUNT ? 1 : 0
+  const originInner = origin ? ringInnerRadius(origin.depth, centerRadius) + originInset : target.inner
+  const originOuter = origin ? ringOuterRadius(origin.depth, centerRadius) - originInset : target.outer
+  const originSpan = origin ? Math.max(0, origin.endAngle - origin.startAngle) : 0
+  const mapIntoOrigin = (angle: number): number => (origin?.startAngle ?? angle) + angle / 360 * originSpan
+  const start = sourceSegment
+    ? segmentGeometry(sourceSegment, centerRadius)
+    : segment.depth === 1
+      ? { inner: originInner, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
+      : { inner: originOuter, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
   const depthDelay = Math.min(0.35, Math.max(0, segment.depth - 1) * 0.07)
   const localProgress = Math.max(0, Math.min(1, (progress - depthDelay) / (1 - depthDelay)))
   const eased = 1 - Math.pow(1 - localProgress, 3)
@@ -178,6 +244,40 @@ export function animatedSegmentGeometry(segment: ChartSegment, origin: SunburstT
     startAngle: interpolate(start.startAngle, target.startAngle, eased),
     endAngle: interpolate(start.endAngle, target.endAngle, eased)
   }
+}
+
+function matchingSegment(segment: ChartSegment, candidates: readonly ChartSegment[], depthOffset: number): ChartSegment | undefined {
+  if (!segment.id) return undefined
+  return candidates.find((candidate) => candidate.id === segment.id && candidate.depth === segment.depth + depthOffset)
+}
+
+function isInBranch(segment: ChartSegment, branch: ChartSegment): boolean {
+  return segment.colorKey === branch.colorKey || segment.colorKey.startsWith(`${branch.colorKey}:`)
+}
+
+function expandingBranchShellGeometry(segment: ChartSegment, progress: number, centerRadius: number): SegmentGeometry {
+  const start = segmentGeometry(segment, centerRadius)
+  const eased = 1 - Math.pow(1 - Math.max(0, Math.min(1, progress)), 3)
+  return {
+    inner: interpolate(start.inner, centerRadius, eased),
+    outer: interpolate(start.outer, centerRadius, eased),
+    startAngle: interpolate(start.startAngle, 0, eased),
+    endAngle: interpolate(start.endAngle, 360, eased)
+  }
+}
+
+function growingBranchShellGeometry(segment: ChartSegment, progress: number, centerRadius: number): SegmentGeometry {
+  return expandingBranchShellGeometry(segment, 1 - progress, centerRadius)
+}
+
+function stagedProgress(progress: number, start: number, end: number): number {
+  return Math.max(0, Math.min(1, (progress - start) / (end - start)))
+}
+
+function transitionColor(start: string, end: string, progress: number): string {
+  if (progress <= 0) return start
+  if (progress >= 1) return end
+  return `color-mix(in srgb, ${start} ${(1 - progress) * 100}%, ${end})`
 }
 
 function interpolate(start: number, end: number, progress: number): number {

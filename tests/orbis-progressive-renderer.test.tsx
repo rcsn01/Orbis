@@ -62,6 +62,55 @@ describe('progressive Orbis renderer', () => {
     expect(animatedSegmentGeometry(nestedSegment, origin, 1)).toEqual({ inner: 132, outer: 174, startAngle: 120, endAngle: 240 })
   })
 
+  it('starts matching destination bars at their existing source geometry', () => {
+    const destination = { ...base, id: 'shared', depth: 1, startAngle: 0, endAngle: 180 }
+    const source = { ...base, id: 'shared', depth: 2, startAngle: 30, endAngle: 90 }
+    const origin = { depth: 1, startAngle: 0, endAngle: 180 }
+
+    expect(animatedSegmentGeometry(destination, origin, 0, 48, source)).toEqual({ inner: 90, outer: 132, startAngle: 30, endAngle: 90 })
+    expect(animatedSegmentGeometry(destination, origin, 1, 48, source)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 180 })
+  })
+
+  it('contracts outgoing segments into the destination wedge in reverse', () => {
+    const destination = { depth: 1, startAngle: 90, endAngle: 180 }
+    const firstLevel = { ...base, startAngle: 0, endAngle: 120 }
+    const nested = { ...base, depth: 3, startAngle: 120, endAngle: 240 }
+
+    expect(animatedSegmentGeometry(firstLevel, destination, 1)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 120 })
+    expect(animatedSegmentGeometry(firstLevel, destination, 0.5)).toEqual({ inner: 48, outer: 90, startAngle: 11.25, endAngle: 120 })
+    expect(animatedSegmentGeometry(firstLevel, destination, 0)).toEqual({ inner: 48, outer: 90, startAngle: 90, endAngle: 120 })
+    expect(animatedSegmentGeometry(nested, destination, 0)).toEqual({ inner: 90, outer: 90, startAngle: 120, endAngle: 150 })
+  })
+
+  it('keeps sibling branches fading when a nested ring is opened', () => {
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const nestedBranch = { ...base, id: 'nested-folder', depth: 2, startAngle: 30, endAngle: 90, colorKey: 'root:parent:nested-folder' }
+    const sibling = { ...base, id: 'sibling-folder', depth: 1, startAngle: 180, endAngle: 360, colorKey: 'root:sibling-folder' }
+    const destination = { ...base, id: 'nested-child', startAngle: 0, endAngle: 360, colorKey: 'root:nested-child' }
+    const { container } = render(<Sunburst segments={[destination]} transition={{ kind: 'enter', origin: nestedBranch, sourceSegments: [nestedBranch, sibling], branchId: nestedBranch.id! }} onActivate={vi.fn()} />)
+
+    const fadingSiblings = container.querySelector('.orbis-feature-panel__sunburst-fading-siblings')
+    expect(fadingSiblings).not.toBeNull()
+    expect(fadingSiblings?.querySelector('[data-depth="1"]')).toHaveAttribute('data-start-angle', '180')
+  })
+
+  it('renders the outgoing chart as a decorative non-interactive overlay', () => {
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const destination = { depth: 1, startAngle: 90, endAngle: 180 }
+    const { container } = render(<Sunburst segments={[{ ...base, id: 'parent-child', name: 'Parent child' }]} transition={{ kind: 'exit', destination, outgoingSegments: [base], branchId: 'parent-child' }} onActivate={vi.fn()} />)
+
+    const outgoing = container.querySelector('.orbis-feature-panel__sunburst-outgoing')
+    expect(outgoing).toHaveAttribute('aria-hidden', 'true')
+    expect(outgoing).toHaveAttribute('focusable', 'false')
+    expect(outgoing).toHaveStyle({ pointerEvents: 'none' })
+    expect(outgoing?.querySelector('[role], [tabindex]')).toBeNull()
+    expect(screen.getAllByRole('button')).toHaveLength(1)
+  })
+
   it('cancels an interrupted expansion and restores interaction near its end', () => {
     const callbacks = new Map<number, FrameRequestCallback>()
     let nextFrame = 0
@@ -77,17 +126,17 @@ describe('progressive Orbis renderer', () => {
     const onTransitionComplete = vi.fn()
     const firstOrigin = { depth: 2, startAngle: 0, endAngle: 90 }
     const secondOrigin = { depth: 2, startAngle: 90, endAngle: 180 }
-    const { container, rerender } = render(<Sunburst segments={[base]} transitionOrigin={firstOrigin} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+    const { container, rerender } = render(<Sunburst segments={[base]} transition={{ kind: 'enter', origin: firstOrigin, sourceSegments: [base], branchId: base.id! }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
 
     expect(container.querySelector('svg')).toHaveAttribute('data-interactive', 'false')
     expect(screen.getByRole('button')).toHaveAttribute('tabindex', '-1')
-    rerender(<Sunburst segments={[base]} transitionOrigin={secondOrigin} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+    rerender(<Sunburst segments={[base]} transition={{ kind: 'enter', origin: secondOrigin, sourceSegments: [base], branchId: base.id! }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
     expect(cancelAnimationFrame).toHaveBeenCalledWith(1)
 
-    act(() => callbacks.get(2)?.(336))
+    act(() => callbacks.get(2)?.(1_344))
     expect(container.querySelector('svg')).toHaveAttribute('data-interactive', 'true')
     expect(screen.getByRole('button')).toHaveAttribute('tabindex', '0')
-    act(() => callbacks.get(3)?.(480))
+    act(() => callbacks.get(3)?.(1_920))
     expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'false')
     expect(onTransitionComplete).toHaveBeenCalledOnce()
   })
@@ -99,12 +148,12 @@ describe('progressive Orbis renderer', () => {
     vi.stubGlobal('cancelAnimationFrame', vi.fn())
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true })))
     const onTransitionComplete = vi.fn()
-    const { container } = render(<Sunburst segments={[base]} transitionOrigin={{ depth: 2, startAngle: 90, endAngle: 180 }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+    const { container } = render(<Sunburst segments={[base]} transition={{ kind: 'enter', origin: { depth: 2, startAngle: 90, endAngle: 180 }, sourceSegments: [base], branchId: base.id! }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
 
     expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'true')
     expect(screen.getByRole('button')).toHaveAttribute('data-start-angle', '90')
     expect(screen.getByRole('button')).toHaveAttribute('data-end-angle', '112.5')
-    act(() => animationFrame?.(480))
+    act(() => animationFrame?.(1_920))
     expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'false')
     expect(screen.getByRole('button')).toHaveAttribute('data-start-angle', '0')
     expect(screen.getByRole('button')).toHaveAttribute('data-end-angle', '90')
