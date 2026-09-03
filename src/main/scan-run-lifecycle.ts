@@ -1,5 +1,5 @@
 import { mkdir } from 'node:fs/promises'
-import type { LocationId, ProgressSnapshot, ScanStatus } from '../shared/contracts'
+import type { LocationId, NodeKind, ProgressSnapshot, ScanStatus } from '../shared/contracts'
 import type { ConstructionResumeLoad } from './construction-preview'
 import { RESUME_PREPARATION_MESSAGES, type ControllerTimingMilestones } from './diagnostics'
 import type { FullScanResumeLoad, FullScanResumePeek, ResumeValidationReceipt } from './full-scan-resume'
@@ -124,13 +124,13 @@ export interface ScanLifecycleDependencies {
   readonly pendingScanId: () => string | undefined
   readonly readConstructionPreview: ReadConstructionPreview
   readonly resolveConstructionNodePath: ResolveConstructionNodePath
-  readonly validateRevealPath: (path: string, target: string) => Promise<string>
+  readonly validateNodeActionPath: (path: string, target: string, kind: NodeKind) => Promise<string>
   readonly createMilestones: () => ControllerTimingMilestones
 }
 
 export type ScanFocusDisposition = 'applied' | 'not-running'
-export type ScanRevealDisposition =
-  | { readonly kind: 'live' | 'saved'; readonly validatedPath: string }
+export type ScanNodePathDisposition =
+  | { readonly kind: 'live' | 'saved'; readonly validatedPath: string; readonly nodeKind: NodeKind }
   | { readonly kind: 'not-running' }
 
 interface LifecycleRun extends ScanRunContext {
@@ -155,7 +155,7 @@ export class ScanRunLifecycle {
   #pausedProgress: ProgressSnapshot | undefined
   #resume: ScanLifecycleResumeView | undefined
   #activeTarget: string
-  #pendingRevealCancellations = new Set<(error: Error) => void>()
+  #pendingNodeResolutionCancellations = new Set<(error: Error) => void>()
   #pendingTasks = new Set<Promise<void>>()
   #pendingTerminalCleanup: Promise<void> | undefined
   #queue: Promise<void> = Promise.resolve()
@@ -205,7 +205,7 @@ export class ScanRunLifecycle {
       const node = previewNode(this.#preview, id)
       if (!node) throw new Error('Unknown Orbis node')
       if (node.kind !== 'directory') throw new Error('Only directories can become the chart root')
-      this.#rejectPendingReveals('The focused folder changed before the item could be revealed')
+      this.#rejectPendingNodeResolutions('The focused folder changed before the item action could run')
       const session = await run.sessionPromise
       if (this.#run !== run || run.completed) return 'applied'
       run.session = session
@@ -217,7 +217,7 @@ export class ScanRunLifecycle {
       const preview = await this.#deps.readConstructionPreview(saved, this.#scanStatus.generation, id)
       if (!preview) throw new Error('Unknown Orbis node')
       if (this.#sealed || this.#run || this.#savedConstruction !== saved) throw new Error('The scan changed before the folder could be opened')
-      this.#rejectPendingReveals('The focused folder changed before the item could be revealed')
+      this.#rejectPendingNodeResolutions('The focused folder changed before the item action could run')
       this.#preview = preview
       this.#notify('preview', this.#scanStatus.generation)
       return 'applied'
@@ -225,24 +225,27 @@ export class ScanRunLifecycle {
     return 'not-running'
   }
 
-  async revealNode(id: string): Promise<ScanRevealDisposition> {
+  async resolveNodePath(id: string): Promise<ScanNodePathDisposition> {
     const run = this.#run
     if (run && !run.completed && this.#preview) {
-      if (!previewNode(this.#preview, id)) throw new Error('Unknown Orbis node')
+      const node = previewNode(this.#preview, id)
+      if (!node) throw new Error('Unknown Orbis node')
       const outcome = await this.#resolveLiveNode(run, id)
       if (outcome.kind !== 'resolved') throw new Error('Unknown Orbis node')
-      if (this.#run !== run) throw new Error('The scan changed before the item could be revealed')
-      const validatedPath = await this.#deps.validateRevealPath(outcome.path, run.target)
-      if (this.#run !== run) throw new Error('The scan changed before the item could be revealed')
-      return { kind: 'live', validatedPath }
+      if (this.#run !== run) throw new Error('The scan changed before the item action could run')
+      const validatedPath = await this.#deps.validateNodeActionPath(outcome.path, run.target, node.kind)
+      if (this.#run !== run) throw new Error('The scan changed before the item action could run')
+      return { kind: 'live', validatedPath, nodeKind: node.kind }
     }
     const saved = this.#savedConstruction
     if (saved && this.#preview) {
+      const node = previewNode(this.#preview, id)
+      if (!node) throw new Error('Unknown Orbis node')
       const path = await this.#deps.resolveConstructionNodePath(saved, id)
       if (!path) throw new Error('Unknown Orbis node')
-      const validatedPath = await this.#deps.validateRevealPath(path, saved.descriptor.target)
-      if (this.#sealed || this.#run || this.#savedConstruction !== saved) throw new Error('The scan changed before the item could be revealed')
-      return { kind: 'saved', validatedPath }
+      const validatedPath = await this.#deps.validateNodeActionPath(path, saved.descriptor.target, node.kind)
+      if (this.#sealed || this.#run || this.#savedConstruction !== saved) throw new Error('The scan changed before the item action could run')
+      return { kind: 'saved', validatedPath, nodeKind: node.kind }
     }
     return { kind: 'not-running' }
   }
@@ -264,7 +267,7 @@ export class ScanRunLifecycle {
     this.#preview = undefined
     this.#savedConstruction = undefined
     this.#resumeReceipt = undefined
-    this.#rejectPendingReveals('Orbis is shutting down')
+    this.#rejectPendingNodeResolutions('Orbis is shutting down')
   }
 
   /** Initialization-only adoption at generation 0. Never enqueued behind ensureInitialized. */
@@ -345,7 +348,7 @@ export class ScanRunLifecycle {
     // A receipt is single-use: once worker startup is scheduled it may not be
     // reused by a later generation or a second worker.
     this.#resumeReceipt = undefined
-    this.#rejectPendingReveals('A newer scan started')
+    this.#rejectPendingNodeResolutions('A newer scan started')
     await this.#deps.beginScan(
       { scanId: publicationId, locationId: context.ownerId, target, targetDevice: context.identity.targetDevice, targetInode: context.identity.targetInode, basePublicationId: context.basePublicationId },
       current?.publicationId,
@@ -393,7 +396,7 @@ export class ScanRunLifecycle {
     if (this.#scanStatus.progress && this.#scanStatus.progress.stage !== 'resuming') this.#pausedProgress = this.#scanStatus.progress
     this.#preview = undefined
     this.#savedConstruction = undefined
-    this.#rejectPendingReveals('Scan paused')
+    this.#rejectPendingNodeResolutions('Scan paused')
     const stopped = await this.#stopRun(run)
     if (this.#sealed || this.#generation !== run.generation || this.#run) return this.state
     const saved = await this.#loadResumeAfterStop(run.target, stopped)
@@ -432,7 +435,7 @@ export class ScanRunLifecycle {
     this.#preview = undefined
     this.#savedConstruction = undefined
     this.#resumeReceipt = undefined
-    this.#rejectPendingReveals('Saved scan discarded')
+    this.#rejectPendingNodeResolutions('Saved scan discarded')
     const pendingScanId = this.#deps.pendingScanId()
     await this.#deps.resume.discard(pendingScanId)
     if (pendingScanId) await this.#deps.clearPendingScan(pendingScanId)
@@ -500,7 +503,7 @@ export class ScanRunLifecycle {
       this.#run = undefined
       this.#preview = undefined
       this.#savedConstruction = undefined
-      this.#rejectPendingReveals('Scan paused')
+      this.#rejectPendingNodeResolutions('Scan paused')
       this.#scanStatus = { status: 'canceled', generation: run.generation, progress: null, totals: null, error: null }
       // The run ended from the worker side. Its terminal transition — the
       // resume load, the no-proof release, and the paused notification — runs
@@ -549,7 +552,7 @@ export class ScanRunLifecycle {
     this.#preview = undefined
     this.#savedConstruction = undefined
     this.#resumeReceipt = undefined
-    this.#rejectPendingReveals('Scan completed')
+    this.#rejectPendingNodeResolutions('Scan completed')
     this.#resume = undefined
     this.#activeTarget = activeTarget
     this.#scanStatus = { status: 'completed', generation: run.generation, progress: null, totals, error: null }
@@ -562,7 +565,7 @@ export class ScanRunLifecycle {
     this.#run = undefined
     this.#preview = run.durablePreview
     this.#savedConstruction = run.durableConstruction
-    this.#rejectPendingReveals('Scan failed')
+    this.#rejectPendingNodeResolutions('Scan failed')
     this.#scanStatus = { status: 'fatal-error', generation: run.generation, progress: null, totals: null, error }
     if (recordDiagnostic) void Promise.resolve(this.#deps.scanExecution.recordFailure?.(run.generation, {
       kind, lifecycleStage: 'failed', code: failureCode(error)
@@ -667,20 +670,20 @@ export class ScanRunLifecycle {
   async #resolveLiveNode(run: LifecycleRun, id: string): ReturnType<ScanSession['resolveNode']> {
     let rejectCancellation!: (error: Error) => void
     const canceled = new Promise<never>((_resolve, reject) => { rejectCancellation = reject })
-    this.#pendingRevealCancellations.add(rejectCancellation)
+    this.#pendingNodeResolutionCancellations.add(rejectCancellation)
     try {
       const session = await run.sessionPromise
       if (this.#run !== run || run.completed) throw new Error('The scan changed before the item could be revealed')
       run.session = session
       return await Promise.race([session.resolveNode(id), canceled])
     }
-    finally { this.#pendingRevealCancellations.delete(rejectCancellation) }
+    finally { this.#pendingNodeResolutionCancellations.delete(rejectCancellation) }
   }
 
-  #rejectPendingReveals(message: string): void {
+  #rejectPendingNodeResolutions(message: string): void {
     const error = new Error(message)
-    for (const reject of this.#pendingRevealCancellations) reject(error)
-    this.#pendingRevealCancellations.clear()
+    for (const reject of this.#pendingNodeResolutionCancellations) reject(error)
+    this.#pendingNodeResolutionCancellations.clear()
   }
 
   #track(task: Promise<void>): void {

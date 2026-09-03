@@ -55,7 +55,11 @@ function createController(workers: WorkerTransportFactory, options: ConstructorP
 
 class TestShell implements OrbisShell {
   readonly revealed: string[] = []
+  readonly previewed: string[] = []
+  readonly terminals: string[] = []
   showItemInFolder(path: string): void { this.revealed.push(path) }
+  quickLook(path: string): void { this.previewed.push(path) }
+  openInTerminal(directory: string): Promise<void> { this.terminals.push(directory); return Promise.resolve() }
   openExternal(_url: string): Promise<void> { return Promise.resolve() }
 }
 
@@ -130,7 +134,7 @@ describe('saved Orbis previews', () => {
     } finally { await controller.close() }
   })
 
-  it('uses the private construction path and existing Finder safety checks', async () => {
+  it('uses the private construction path and native-action safety checks', async () => {
     const fixture = await createSavedFixture()
     const shell = new TestShell()
     const controller = createController({ create: () => new TestWorker() }, { indexDirectory: fixture.indexDirectory, shell })
@@ -139,7 +143,11 @@ describe('saved Orbis previews', () => {
       const file = controller.snapshot().largestItems.find((item) => item.name === 'file-00')
       expect(file).toBeDefined()
       await controller.revealNode(file!.id)
+      await controller.performNodeAction(file!.id, 'quick-look')
+      await controller.performNodeAction(file!.id, 'open-in-terminal')
       expect(shell.revealed).toEqual([await realpath(join(fixture.target, 'file-00'))])
+      expect(shell.previewed).toEqual([await realpath(join(fixture.target, 'file-00'))])
+      expect(shell.terminals).toEqual([await realpath(fixture.target)])
 
       await unlink(join(fixture.target, 'file-00'))
       await symlink(join(fixture.target, 'file-01'), join(fixture.target, 'file-00'))

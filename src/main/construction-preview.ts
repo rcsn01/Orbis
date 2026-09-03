@@ -39,7 +39,7 @@ export async function readConstructionPreview(
   })
 }
 
-/** Resolve a construction node's private path for a main-process reveal. */
+/** Resolve a construction node's private path for a validated main-process action. */
 export async function resolveConstructionNodePath(
   load: ConstructionResumeLoad,
   id: string

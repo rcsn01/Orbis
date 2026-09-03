@@ -113,6 +113,7 @@ export interface OrbisApi {
   rescan(): Promise<OrbisSnapshot>
   focusNode(id: string): Promise<OrbisSnapshot>
   revealNode(id: string): Promise<void>
+  showNodeContextMenu(id: string): Promise<void>
   openFullDiskAccess(): Promise<void>
   subscribe(listener: (snapshot: OrbisSnapshot) => void): () => void
 }
@@ -128,6 +129,7 @@ export const IPC = {
   rescan: "orbis:rescan",
   focusNode: "orbis:focus-node",
   revealNode: "orbis:reveal-node",
+  showNodeContextMenu: "orbis:show-node-context-menu",
   openFullDiskAccess: "orbis:open-full-disk-access",
   snapshot: "orbis:snapshot"
 } as const

@@ -1,4 +1,4 @@
-import { BrowserWindow, dialog, shell, type WebContents } from 'electron'
+import { BrowserWindow, dialog, type WebContents } from 'electron'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { validateFeatureResources, type EmbeddedFeatureSurface, type FeatureContext, type MoirasiaFeature } from '@moirasia/desktop-shell/feature'
@@ -7,6 +7,7 @@ import { OrbisController } from './controller'
 import { WorkerScanExecution, type WorkerTransportFactory } from './scan-execution'
 import { ScanFailureDiagnosticsStore } from './scan-failure-diagnostics'
 import { registerIpc } from './ipc'
+import { createOrbisSystemShell } from './system-shell'
 
 export class OrbisFeature implements MoirasiaFeature {
   readonly id = 'orbis'
@@ -28,17 +29,12 @@ export class OrbisFeature implements MoirasiaFeature {
     if (!workerPath || !dataDirectory) throw new Error('Orbis feature resources are incomplete')
 
     const diagnostics = new ScanFailureDiagnosticsStore(join(dataDirectory, 'indexes'))
+    let target: WebContents | undefined
     const controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, nativeAddonPath), { diagnostics }), {
       dataDirectory,
       ...(process.env.ORBIS_SCAN_ROOT ? { initialTarget: process.env.ORBIS_SCAN_ROOT } : {}),
-      ...(ctx.mode === 'standalone'
-        ? {
-            dialog: { showOpenDialog: (options) => dialog.showOpenDialog(this.#window!, options) },
-            shell: { showItemInFolder: (path) => shell.showItemInFolder(path), openExternal: (url) => shell.openExternal(url) }
-          }
-        : {
-            shell: { showItemInFolder: (path) => shell.showItemInFolder(path), openExternal: (url) => shell.openExternal(url) }
-          })
+      ...(ctx.mode === 'standalone' ? { dialog: { showOpenDialog: (options) => dialog.showOpenDialog(this.#window!, options) } } : {}),
+      shell: createOrbisSystemShell(() => target)
     })
     let window: BrowserWindow | undefined
     let disposeIpc: (() => void) | undefined
@@ -49,7 +45,6 @@ export class OrbisFeature implements MoirasiaFeature {
       this.#controller = controller
       await controller.initialize()
       const surface = ctx.mode === 'suite' ? ctx.surface : undefined
-      let target: WebContents
       if (surface) target = surface.webContents
       else {
         window = createWindow(ctx)
@@ -62,6 +57,7 @@ export class OrbisFeature implements MoirasiaFeature {
         disposeAppearance = await registerProductAppearance('orbis', standaloneWindow, undefined, { applyNativeTheme: true })
         installWindowGuards(standaloneWindow)
       }
+      if (!target) throw new Error('Orbis renderer webContents is missing')
       disposeIpc = registerIpc({ webContents: target, controller })
       this.#window = window
       this.#surface = surface

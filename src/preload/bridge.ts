@@ -18,6 +18,7 @@ export function createOrbisBridge(renderer: IpcRendererLike): OrbisApi {
     rescan: () => renderer.invoke(IPC.rescan) as Promise<OrbisSnapshot>,
     focusNode: (id: string) => renderer.invoke(IPC.focusNode, id) as Promise<OrbisSnapshot>,
     revealNode: (id: string) => renderer.invoke(IPC.revealNode, id) as Promise<void>,
+    showNodeContextMenu: (id: string) => renderer.invoke(IPC.showNodeContextMenu, id) as Promise<void>,
     openFullDiskAccess: () => renderer.invoke(IPC.openFullDiskAccess) as Promise<void>,
     subscribe(listener: (snapshot: OrbisSnapshot) => void) {
       const handler = (_event: unknown, ...args: unknown[]) => {

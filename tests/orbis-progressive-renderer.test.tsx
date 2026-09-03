@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { segmentColor, Sunburst } from '../src/renderer/Sunburst'
+import { animatedSegmentGeometry, segmentColor, Sunburst } from '../src/renderer/Sunburst'
 import type { ChartSegment } from '../src/shared/contracts'
 
 afterEach(cleanup)
@@ -12,16 +12,21 @@ const base: ChartSegment = {
 }
 
 describe('progressive Orbis renderer', () => {
-  it('keeps nearby nested segments in the same color family', () => {
+  it('uses pleasant colors first and keeps nested segments in their parent color family', () => {
     const parent = { ...base, startAngle: 0, endAngle: 80 }
+    const onlyChild = { ...base, depth: 2, startAngle: 0, endAngle: 80, colorKey: 'root:n-folder:only' }
     const firstChild = { ...base, depth: 2, startAngle: 0, endAngle: 40, colorKey: 'root:n-folder:first' }
     const secondChild = { ...base, depth: 2, startAngle: 40, endAngle: 80, colorKey: 'root:n-folder:second' }
-    const distantBranch = { ...base, startAngle: 180, endAngle: 260, colorKey: 'root:n-distant' }
+    const blueBranch = { ...base, startAngle: 80, endAngle: 180, colorKey: 'root:n-blue' }
+    const yellowBranch = { ...base, startAngle: 180, endAngle: 260, colorKey: 'root:n-yellow' }
+    const chart = [parent, firstChild, secondChild, blueBranch, yellowBranch]
 
-    expect(segmentColor(parent)).toBe('hsl(260 68% 54%)')
-    expect(segmentColor(firstChild)).toBe('hsl(240 68% 56%)')
-    expect(segmentColor(secondChild)).toBe('hsl(280 68% 56%)')
-    expect(segmentColor(distantBranch)).toBe('hsl(80 68% 54%)')
+    expect(segmentColor(parent, chart)).toBe('hsl(132 64% 62%)')
+    expect(segmentColor(onlyChild, chart)).toBe('hsl(144 64% 64%)')
+    expect(segmentColor(firstChild, chart)).toBe('hsl(124 64% 59%)')
+    expect(segmentColor(secondChild, chart)).toBe('hsl(164 64% 69%)')
+    expect(segmentColor(blueBranch, chart)).toBe('hsl(198 72% 64%)')
+    expect(segmentColor(yellowBranch, chart)).toBe('hsl(52 78% 64%)')
   })
 
   it('uses five normal rings followed by five thin rings', () => {
@@ -30,12 +35,21 @@ describe('progressive Orbis renderer', () => {
     const tenth = { ...base, id: 'level-10', depth: 10, startAngle: 0, endAngle: 45, colorKey: 'root:one:two:three:four:five:six:seven:eight:nine:ten' }
     const { container } = render(<Sunburst segments={[fifth, sixth, tenth]} onActivate={vi.fn()} />)
 
-    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-inner-radius', '217')
-    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-outer-radius', '257')
+    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-inner-radius', '216')
+    expect(container.querySelector('[data-depth="5"]')).toHaveAttribute('data-outer-radius', '258')
     expect(container.querySelector('[data-depth="6"]')).toHaveAttribute('data-inner-radius', '259')
     expect(container.querySelector('[data-depth="6"]')).toHaveAttribute('data-outer-radius', '267')
     expect(container.querySelector('[data-depth="10"]')).toHaveAttribute('data-outer-radius', '307')
     expect(container.querySelector('.orbis-feature-panel__sunburst-geometry')).toHaveAttribute('data-outer-radius', '308')
+  })
+
+  it('expands a focused folder segment into the new chart geometry', () => {
+    const nextSegment = { ...base, depth: 1, startAngle: 0, endAngle: 120 }
+    const origin = { depth: 3, startAngle: 90, endAngle: 150 }
+
+    expect(animatedSegmentGeometry(nextSegment, origin, 0)).toEqual({ inner: 132, outer: 174, startAngle: 90, endAngle: 150 })
+    expect(animatedSegmentGeometry(nextSegment, origin, 1)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 120 })
+    expect(animatedSegmentGeometry(nextSegment, origin, 0.5)).toEqual({ inner: 58.5, outer: 100.5, startAngle: 11.25, endAngle: 123.75 })
   })
 
   it('hatches provisional segments and identifies their state accessibly', () => {
@@ -60,6 +74,18 @@ describe('progressive Orbis renderer', () => {
     const { container, rerender } = render(<Sunburst segments={[base]} onActivate={vi.fn()} />)
     rerender(<Sunburst segments={[{ ...base, scanState: 'complete' }]} onActivate={vi.fn()} />)
     expect(container.querySelector('.orbis-feature-panel__sunburst-hatch')).toBeNull()
+  })
+
+  it('opens context menus only for concrete segments', () => {
+    const onContextMenu = vi.fn()
+    render(<Sunburst segments={[base, { ...base, id: null, name: 'Other', kind: 'other', drillable: false, colorKey: 'other' }]} onActivate={vi.fn()} onContextMenu={onContextMenu} />)
+    const concrete = screen.getByRole('button', { name: /Folder, directory/ })
+    const aggregate = screen.getByRole('button', { name: /Other, aggregate/ })
+
+    expect(fireEvent.contextMenu(concrete)).toBe(false)
+    expect(onContextMenu).toHaveBeenCalledWith(base)
+    expect(fireEvent.contextMenu(aggregate)).toBe(true)
+    expect(onContextMenu).toHaveBeenCalledOnce()
   })
 
   it('describes an aggregate segment with its represented item count', () => {

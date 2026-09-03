@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../src/renderer/App"
@@ -33,6 +33,7 @@ beforeEach(() => {
     rescan: vi.fn(async () => scanning),
     focusNode: vi.fn(async () => completed),
     revealNode: vi.fn(async () => undefined),
+    showNodeContextMenu: vi.fn(async () => undefined),
     openFullDiskAccess: vi.fn(async () => undefined),
     subscribe: vi.fn((listener) => { publish = listener; return vi.fn() })
   }
@@ -191,6 +192,44 @@ describe("Orbis renderer", () => {
     expect(status).toHaveTextContent("3 paths could not be included")
     await user.click(screen.getByRole("button", { name: "Open Full Disk Access" }))
     expect(window.orbis.openFullDiskAccess).toHaveBeenCalledOnce()
+  })
+
+  it("starts the next chart inside the folder segment that was opened", async () => {
+    const user = userEvent.setup()
+    const nestedFile = { ...file, id: "n-4", parentId: folder.id, name: "inside.txt", sizeBytes: folder.sizeBytes }
+    const nested: OrbisSnapshot = {
+      ...completed,
+      focus: folder,
+      breadcrumbs: [{ id: root.id, name: root.name }, { id: folder.id, name: folder.name }],
+      chart: [{ id: nestedFile.id, name: nestedFile.name, kind: "file", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: nestedFile.sizeBytes, percentage: 100, drillable: false, colorKey: "root:n-4", scanState: "complete", sizeAccuracy: "exact" }],
+      largestItems: [nestedFile]
+    }
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1))
+    vi.stubGlobal("cancelAnimationFrame", vi.fn())
+    vi.mocked(window.orbis.focusNode).mockResolvedValueOnce(nested)
+
+    render(<App />)
+    const folderSegment = await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, 80\.0 percent/ })
+    await user.click(folderSegment)
+    await screen.findByRole("complementary", { name: "Documents contents" })
+    const nestedSegment = screen.getByRole("button", { name: /inside\.txt, file, 8\.0 KB, 100\.0 percent/ })
+    expect(nestedSegment).toHaveAttribute("data-start-angle", "0")
+    expect(nestedSegment).toHaveAttribute("data-end-angle", "288")
+  })
+
+  it("opens native node menus without activating the node", async () => {
+    render(<App />)
+    await screen.findByText("Scanning…")
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "fixture" }))
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Documents, directory, 8\.0 KB, Exact$/ }))
+    fireEvent.contextMenu(screen.getByRole("button", { name: /notes\.txt, file, 2\.0 KB, 20\.0 percent/ }))
+
+    expect(window.orbis.showNodeContextMenu).toHaveBeenNthCalledWith(1, "n-1")
+    expect(window.orbis.showNodeContextMenu).toHaveBeenNthCalledWith(2, "n-2")
+    expect(window.orbis.showNodeContextMenu).toHaveBeenNthCalledWith(3, "n-3")
+    expect(window.orbis.focusNode).not.toHaveBeenCalled()
+    expect(window.orbis.revealNode).not.toHaveBeenCalled()
   })
 
   it("shows current-folder contents and supports drill-down and Finder reveal", async () => {

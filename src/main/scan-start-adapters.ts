@@ -7,7 +7,7 @@ import type { CoveragePublicationAccess } from './coverage-publication-access'
 import type { FullScanResumeStore } from './full-scan-resume'
 import type { LocationCatalogStore, PendingScanRecord } from './location-catalog'
 import type { PublicationArtifacts } from './publication-artifacts'
-import { resolveTarget, validateRevealPath } from './scan-target'
+import { resolveTarget, validateNodeActionPath } from './scan-target'
 import type { FolderSizeEstimate } from './scan-metadata'
 import type { ScanExecution } from './scan-execution'
 
@@ -79,7 +79,7 @@ export function createScanLifecycleDependencies(inputs: ScanLifecycleAdapterInpu
     },
     readConstructionPreview,
     resolveConstructionNodePath,
-    validateRevealPath,
+    validateNodeActionPath,
     createMilestones: () => createControllerTimingMilestones()
   }
 }

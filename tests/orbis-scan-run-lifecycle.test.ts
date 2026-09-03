@@ -204,7 +204,7 @@ interface Harness {
     readonly resumeCheckpointLoad: Array<{ target: string; sequence: number }>
     readonly resumeRemoveDescriptor: number
     readonly settle: Array<{ run: ScanRunContext; outcome: CompletedOutcome | UnchangedOutcome }>
-    readonly validated: Array<{ path: string; target: string }>
+    readonly validated: Array<{ path: string; target: string; kind: 'directory' | 'file' }>
   }
   readonly config: {
     peek: FullScanResumePeek
@@ -219,7 +219,7 @@ interface Harness {
     prepareGate: Promise<void> | undefined
     prepareEntered: Promise<void>
     settle: ((run: ScanRunContext, outcome: CompletedOutcome | UnchangedOutcome) => Promise<SettlementResult>) | undefined
-    validateRevealPathGate: Promise<void> | undefined
+    validateNodeActionPathGate: Promise<void> | undefined
     pendingScanId: string | undefined
   }
 }
@@ -260,7 +260,7 @@ function createHarness(initialTarget = TARGET, options: HarnessOptions = {}): Ha
     prepareGate: undefined,
     prepareEntered: prepareEntered.promise,
     settle: undefined,
-    validateRevealPathGate: undefined,
+    validateNodeActionPathGate: undefined,
     pendingScanId: undefined
   }
   let publicationIdCounter = 0
@@ -335,9 +335,9 @@ function createHarness(initialTarget = TARGET, options: HarnessOptions = {}): Ha
       return item ? { ...base, generation, focus: item } : undefined
     },
     resolveConstructionNodePath: async () => config.constructionPath,
-    validateRevealPath: async (path, target) => {
-      calls.validated.push({ path, target })
-      if (config.validateRevealPathGate) await config.validateRevealPathGate
+    validateNodeActionPath: async (path, target, kind) => {
+      calls.validated.push({ path, target, kind })
+      if (config.validateNodeActionPathGate) await config.validateNodeActionPathGate
       return path
     },
     createMilestones: () => createControllerTimingMilestones()
@@ -857,11 +857,11 @@ describe("ScanRunLifecycle", () => {
     const { session } = await startScan(harness)
     session.update({ type: "preview", preview: makePreview(1, 1) })
     await waitFor(() => harness.lifecycle.state.preview !== undefined)
-    const reveal = harness.lifecycle.revealNode("n-file")
+    const reveal = harness.lifecycle.resolveNodePath("n-file")
     await waitFor(() => session.resolveNodeRequests.length === 1)
     session.resolveNodeWith({ kind: "resolved", path: `${TARGET}/file.txt` })
-    await expect(reveal).resolves.toEqual({ kind: "live", validatedPath: `${TARGET}/file.txt` })
-    expect(harness.calls.validated).toEqual([{ path: `${TARGET}/file.txt`, target: TARGET }])
+    await expect(reveal).resolves.toEqual({ kind: "live", validatedPath: `${TARGET}/file.txt`, nodeKind: "file" })
+    expect(harness.calls.validated).toEqual([{ path: `${TARGET}/file.txt`, target: TARGET, kind: "file" }])
     await harness.lifecycle.seal()
   })
 
@@ -870,22 +870,22 @@ describe("ScanRunLifecycle", () => {
     const { session } = await startScan(harness)
     session.update({ type: "preview", preview: makePreview(1, 1) })
     await waitFor(() => harness.lifecycle.state.preview !== undefined)
-    const reveal = harness.lifecycle.revealNode("n-file")
+    const reveal = harness.lifecycle.resolveNodePath("n-file")
     await waitFor(() => session.resolveNodeRequests.length === 1)
     const focus = harness.lifecycle.focusNode("n-root")
-    await expect(reveal).rejects.toThrow("The focused folder changed before the item could be revealed")
+    await expect(reveal).rejects.toThrow("The focused folder changed before the item action could run")
     await expect(focus).resolves.toBe("applied")
     expect(session.focusRequests).toEqual(["n-root"])
 
-    const gatedReveal = harness.lifecycle.revealNode("n-file")
+    const gatedReveal = harness.lifecycle.resolveNodePath("n-file")
     await waitFor(() => session.resolveNodeRequests.length === 2)
     const gate = testDeferred<void>()
-    harness.config.validateRevealPathGate = gate.promise
+    harness.config.validateNodeActionPathGate = gate.promise
     session.resolveNodeWith({ kind: "resolved", path: `${TARGET}/file.txt` })
     await waitFor(() => harness.calls.validated.length === 1)
     await startScan(harness)
     gate.resolve()
-    await expect(gatedReveal).rejects.toThrow("The scan changed before the item could be revealed")
+    await expect(gatedReveal).rejects.toThrow("The scan changed before the item action could run")
     await harness.lifecycle.seal()
   })
 
@@ -895,7 +895,7 @@ describe("ScanRunLifecycle", () => {
     harness.config.constructionPreview = makePreview(0, 1)
     await harness.lifecycle.adoptStartupState({ saved: load, selectedTarget: TARGET })
     harness.config.constructionPath = `${TARGET}/file.txt`
-    await expect(harness.lifecycle.revealNode("n-file")).resolves.toEqual({ kind: "saved", validatedPath: `${TARGET}/file.txt` })
+    await expect(harness.lifecycle.resolveNodePath("n-file")).resolves.toEqual({ kind: "saved", validatedPath: `${TARGET}/file.txt`, nodeKind: "file" })
     harness.config.constructionPreview = makePreview(0, 2, "n-file")
     await expect(harness.lifecycle.focusNode("n-file")).resolves.toBe("applied")
     expect(harness.lifecycle.state.preview).toMatchObject({ revision: 2, focus: { id: "n-file" } })
@@ -906,7 +906,7 @@ describe("ScanRunLifecycle", () => {
 
   it("returns not-running when neither a run nor a saved construction is present", async () => {
     const harness = createHarness()
-    await expect(harness.lifecycle.revealNode("n-file")).resolves.toEqual({ kind: "not-running" })
+    await expect(harness.lifecycle.resolveNodePath("n-file")).resolves.toEqual({ kind: "not-running" })
     await expect(harness.lifecycle.focusNode("n-file")).resolves.toBe("not-running")
     await harness.lifecycle.seal()
   })

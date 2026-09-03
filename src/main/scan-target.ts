@@ -1,8 +1,9 @@
 import { lstat, realpath } from 'node:fs/promises'
 import { isAbsolute, normalize, relative, sep } from 'node:path'
+import type { NodeKind } from '../shared/contracts'
 
 /**
- * Target and reveal path resolution shared by the controller and the scan-run
+ * Target and node-action path resolution shared by the controller and scan-run
  * lifecycle adapters. Pure filesystem helpers: no module state.
  */
 
@@ -21,22 +22,23 @@ export async function resolveTarget(value: string): Promise<{ target: string; ta
   return { target, targetDevice: String(stats.dev), targetInode: String(stats.ino) }
 }
 
-export async function validateRevealPath(path: string, target: string): Promise<string> {
-  if (!isAbsolute(path) || !isWithinPath(path, target)) throw new Error('The worker returned an unsafe Finder path')
+export async function validateNodeActionPath(path: string, target: string, kind: NodeKind): Promise<string> {
+  if (!isAbsolute(path) || !isWithinPath(path, target)) throw new Error('The worker returned an unsafe item path')
   const stats = await lstat(path).catch((error: unknown) => {
-    if (isMissingPath(error)) throw new Error('The Finder item is no longer available')
+    if (isMissingPath(error)) throw new Error('The item is no longer available')
     throw error
   })
-  if (stats.isSymbolicLink()) throw new Error('The Finder path is no longer a scanned item')
+  if (stats.isSymbolicLink()) throw new Error('The path is no longer a scanned item')
+  if (kind === 'directory' ? !stats.isDirectory() : !stats.isFile()) throw new Error('The item kind changed after it was scanned')
   const canonical = await realpath(path).catch((error: unknown) => {
-    if (isMissingPath(error)) throw new Error('The Finder item is no longer available')
+    if (isMissingPath(error)) throw new Error('The item is no longer available')
     throw error
   })
   const canonicalTarget = await realpath(target).catch((error: unknown) => {
     if (isMissingPath(error)) throw new Error('The scan target is no longer available')
     throw error
   })
-  if (!isWithinPath(canonical, canonicalTarget)) throw new Error('The Finder path escaped the scan target')
+  if (!isWithinPath(canonical, canonicalTarget)) throw new Error('The item path escaped the scan target')
   return canonical
 }
 

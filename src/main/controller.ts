@@ -1,6 +1,6 @@
 import { lstat, readFile, rename, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, normalize, resolve } from 'node:path'
-import type { LocationId, OrbisSnapshot, SizeAccuracy } from '../shared/contracts'
+import type { LocationId, NodeKind, OrbisSnapshot, SizeAccuracy } from '../shared/contracts'
 import { measureController } from './diagnostics'
 import { FullScanResumeStore } from './full-scan-resume'
 import { createCoveragePublicationAccess, type CoveragePublicationAccess, type InstalledLocationAccess } from './coverage-publication-access'
@@ -11,12 +11,18 @@ import type { ScanExecution } from './scan-execution'
 import type { PublicationArtifacts } from './publication-artifacts'
 import { createScanLifecycleDependencies } from './scan-start-adapters'
 import { ScanRunLifecycle } from './scan-run-lifecycle'
-import { errorCode, isMissingPath, isWithinPath, resolveTarget, validateRevealPath } from './scan-target'
+import { errorCode, isMissingPath, isWithinPath, resolveTarget, validateNodeActionPath } from './scan-target'
 import type { ScanTotals } from './scanner'
 import { projectSnapshotView, type SnapshotVolumeFacts } from './snapshot-projection'
 
 export interface OrbisDialog { showOpenDialog(options: { readonly properties: Array<'openDirectory'> }): Promise<{ readonly canceled: boolean; readonly filePaths: readonly string[] }> }
-export interface OrbisShell { showItemInFolder(path: string): void; openExternal(url: string): Promise<void> }
+export interface OrbisShell {
+  showItemInFolder(path: string): void
+  quickLook(path: string): void
+  openInTerminal(directory: string): Promise<void>
+  openExternal(url: string): Promise<void>
+}
+export type OrbisNodeAction = 'quick-look' | 'show-in-finder' | 'open-in-terminal'
 
 export interface OrbisControllerOptions {
   /** The feature stores its private persistent index here. It must be the feature's indexes directory. */
@@ -284,19 +290,42 @@ export class OrbisController {
   }
 
   async revealNode(id: string): Promise<void> {
-    if (!this.#shell) throw new Error('Reveal in Finder is unavailable')
-    const result = await this.#lifecycle.revealNode(id)
-    if (result.kind !== 'not-running') {
-      this.#shell.showItemInFolder(result.validatedPath)
+    await this.performNodeAction(id, 'show-in-finder')
+  }
+
+  async performNodeAction(id: string, action: OrbisNodeAction): Promise<void> {
+    if (!this.#shell) throw new Error('Native item actions are unavailable')
+    const focusedFolderId = this.#lifecycle.state.preview?.focus.id ?? this.#focusId
+    const selected = await this.#resolveValidatedNode(id)
+    if (action === 'quick-look') {
+      this.#shell.quickLook(selected.validatedPath)
       return
     }
+    if (action === 'show-in-finder') {
+      this.#shell.showItemInFolder(selected.validatedPath)
+      return
+    }
+    if (selected.nodeKind === 'directory') {
+      await this.#shell.openInTerminal(selected.validatedPath)
+      return
+    }
+    if (!focusedFolderId) throw new Error('No focused folder is available')
+    const focused = await this.#resolveValidatedNode(focusedFolderId)
+    if (focused.nodeKind !== 'directory') throw new Error('The focused item is no longer a folder')
+    await this.#shell.openInTerminal(focused.validatedPath)
+  }
+
+  async #resolveValidatedNode(id: string): Promise<{ readonly validatedPath: string; readonly nodeKind: NodeKind }> {
+    const result = await this.#lifecycle.resolveNodePath(id)
+    if (result.kind !== 'not-running') return result
     const active = this.#coverageAccess.current()
     if (!active) throw new Error('No completed scan is available')
+    const node = active.getNode(id)
     const path = active.resolvePath(id)
-    if (!path) throw new Error('Unknown Orbis node')
-    const safePath = await validateRevealPath(path, active.logicalTarget)
-    if (this.#coverageAccess.current() !== active) throw new Error('The scan changed before the item could be revealed')
-    this.#shell.showItemInFolder(safePath)
+    if (!node || !path) throw new Error('Unknown Orbis node')
+    const validatedPath = await validateNodeActionPath(path, active.logicalTarget, node.kind)
+    if (this.#coverageAccess.current() !== active) throw new Error('The scan changed before the item action could run')
+    return { validatedPath, nodeKind: node.kind }
   }
 
   async openFullDiskAccess(): Promise<void> {

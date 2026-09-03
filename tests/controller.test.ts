@@ -869,7 +869,7 @@ describe("OrbisController", () => {
     const revealed: string[] = []
     const controller = createController(
       { create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } },
-      { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: (path) => revealed.push(path), openExternal: async () => undefined } }
+      { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: (path) => { revealed.push(path) }, quickLook: () => undefined, openInTerminal: async () => undefined, openExternal: async () => undefined } }
     )
     try {
       await controller.startScan()
@@ -900,7 +900,7 @@ describe("OrbisController", () => {
     const workers: FakeScanSession[] = []
     const controller = createController(
       { create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } },
-      { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: () => undefined, openExternal: async () => undefined } }
+      { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: () => undefined, quickLook: () => undefined, openInTerminal: async () => undefined, openExternal: async () => undefined } }
     )
     try {
       await controller.startScan()
@@ -917,12 +917,76 @@ describe("OrbisController", () => {
     }
   })
 
+  it("runs Quick Look, Finder, and Terminal actions on validated canonical paths", async () => {
+    const target = await makeTarget("native-actions")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-native-actions-index-"))
+    const workers: FakeScanSession[] = []
+    const previewed: string[] = []
+    const revealed: string[] = []
+    const terminals: string[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, {
+      indexDirectory,
+      initialTarget: target.target,
+      shell: {
+        quickLook: (path) => { previewed.push(path) },
+        showItemInFolder: (path) => { revealed.push(path) },
+        openInTerminal: async (directory) => { terminals.push(directory) },
+        openExternal: async () => undefined
+      }
+    })
+    try {
+      await controller.startScan()
+      await publish(workers[0]!, controller)
+      const snapshot = controller.snapshot()
+      const file = snapshot.largestItems.find((item) => item.name === "file.txt")!
+      const root = snapshot.focus!
+      const canonicalFile = await realpath(join(target.target, "file.txt"))
+      const canonicalRoot = await realpath(target.target)
+
+      await controller.performNodeAction(file.id, "quick-look")
+      await controller.performNodeAction(file.id, "show-in-finder")
+      await controller.performNodeAction(root.id, "open-in-terminal")
+      await controller.performNodeAction(file.id, "open-in-terminal")
+
+      expect(previewed).toEqual([canonicalFile])
+      expect(revealed).toEqual([canonicalFile])
+      expect(terminals).toEqual([canonicalRoot, canonicalRoot])
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
+  it("runs no native action when an indexed file disappears or changes kind", async () => {
+    const target = await makeTarget("native-action-races")
+    const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-native-action-races-index-"))
+    const workers: FakeScanSession[] = []
+    const actions: string[] = []
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, {
+      indexDirectory,
+      initialTarget: target.target,
+      shell: {
+        quickLook: () => { actions.push("quick-look") },
+        showItemInFolder: () => { actions.push("finder") },
+        openInTerminal: async () => { actions.push("terminal") },
+        openExternal: async () => undefined
+      }
+    })
+    try {
+      await controller.startScan()
+      await publish(workers[0]!, controller)
+      const file = controller.snapshot().largestItems.find((item) => item.name === "file.txt")!
+      await rm(join(target.target, "file.txt"))
+      await expect(controller.performNodeAction(file.id, "quick-look")).rejects.toThrow("no longer available")
+      await mkdir(join(target.target, "file.txt"))
+      await expect(controller.performNodeAction(file.id, "show-in-finder")).rejects.toThrow("kind changed")
+      expect(actions).toEqual([])
+    } finally { await controller.close(); await rm(indexDirectory, { recursive: true, force: true }); await rm(target.directory, { recursive: true, force: true }) }
+  })
+
   it("rejects unknown reveal ids and resolves valid ids through the active index", async () => {
     const target = await makeTarget("reveal")
     const indexDirectory = await mkdtemp(join(tmpdir(), "orbis-controller-reveal-index-"))
     const revealed: string[] = []
     const workers: FakeScanSession[] = []
-    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: (path) => revealed.push(path), openExternal: async () => undefined } })
+    const controller = createController({ create: () => { const worker = new FakeScanSession(); workers.push(worker); return worker } }, { indexDirectory, initialTarget: target.target, shell: { showItemInFolder: (path) => { revealed.push(path) }, quickLook: () => undefined, openInTerminal: async () => undefined, openExternal: async () => undefined } })
     try {
       await controller.startScan()
       await publish(workers[0]!, controller)

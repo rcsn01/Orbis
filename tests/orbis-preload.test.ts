@@ -42,6 +42,12 @@ describe('Orbis preload bridge', () => {
     expect(value.removeListener).toHaveBeenCalledOnce()
   })
 
+  it('forwards only an opaque node id when opening a context menu', async () => {
+    const { value } = renderer()
+    await createOrbisBridge(value).showNodeContextMenu('n-42')
+    expect(value.invoke).toHaveBeenCalledWith('orbis:show-node-context-menu', 'n-42')
+  })
+
   it('uses shared location IPC channels and forwards location ids', async () => {
     const { value } = renderer()
     const bridge = createOrbisBridge(value)

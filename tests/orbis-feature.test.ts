@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => {
   const handlers = new Map<string, (...args: unknown[]) => unknown>()
   class FakeWindow {
     static instances: FakeWindow[] = []
+    static fromWebContents(contents: unknown): FakeWindow | null { return FakeWindow.instances.find((window) => window.webContents === contents) ?? null }
     destroyed = false
     shown = false
     focused = false
@@ -19,6 +20,7 @@ const mocks = vi.hoisted(() => {
     loadFile = vi.fn(async () => undefined)
     show = vi.fn(() => { this.shown = true })
     focus = vi.fn(() => { this.focused = true })
+    previewFile = vi.fn()
     destroy = vi.fn(() => { this.destroyed = true })
     isDestroyed = () => this.destroyed
   }
@@ -42,11 +44,12 @@ const mocks = vi.hoisted(() => {
     app: { isPackaged: false, getAppPath: () => '/tmp/moirasia', getPath: (name: string) => name === 'userData' ? '/tmp/moirasia-user-data' : '/tmp' },
     dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
     shell: { showItemInFolder: vi.fn(), openExternal: vi.fn(async () => undefined) },
+    Menu: { buildFromTemplate: vi.fn(() => ({ popup: vi.fn() })) },
     appearanceDispose: vi.fn()
   }
 })
 
-vi.mock('electron', () => ({ BrowserWindow: mocks.FakeWindow, ipcMain: mocks.ipcMain, app: mocks.app, dialog: mocks.dialog, shell: mocks.shell }))
+vi.mock('electron', () => ({ BrowserWindow: mocks.FakeWindow, Menu: mocks.Menu, ipcMain: mocks.ipcMain, app: mocks.app, dialog: mocks.dialog, shell: mocks.shell }))
 vi.mock('node:worker_threads', () => ({ Worker: mocks.FakeWorker }))
 vi.mock('@moirasia/desktop-shell/main', () => ({
   desktopWindowChromeOptions: () => ({}),

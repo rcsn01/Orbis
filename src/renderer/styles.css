@@ -34,8 +34,8 @@
 .orbis-feature-panel__sunburst-wrap { position: relative; display: grid; min-height: 430px; place-items: center; overflow: visible; }
 .orbis-feature-panel__sunburst { display: block; width: min(100%, 520px); height: auto; overflow: visible; }
 .orbis-feature-panel__sunburst-segment { stroke: var(--card); stroke-width: 1.5; cursor: pointer; outline: none; transition: opacity 120ms ease, filter 120ms ease; }
-.orbis-feature-panel__sunburst-segment:hover, .orbis-feature-panel__sunburst-segment:focus-visible { filter: brightness(1.18); opacity: .92; stroke: var(--foreground); stroke-width: 2.5; }
-.orbis-feature-panel__sunburst-segment:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.orbis-feature-panel__sunburst-segment:hover, .orbis-feature-panel__sunburst-segment:focus-visible { filter: brightness(1.18); opacity: .92; }
+.orbis-feature-panel__sunburst-segment:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; stroke: var(--foreground); stroke-width: 2.5; }
 .orbis-feature-panel__sunburst-hatch, .orbis-feature-panel__sunburst-estimate { pointer-events: none; }
 .orbis-feature-panel__sunburst-hatch-line { fill: none; stroke: rgb(255 255 255 / 58%); stroke-width: 1.35; }
 .orbis-feature-panel__sunburst-estimate-dot { fill: rgb(255 255 255 / 72%); }
