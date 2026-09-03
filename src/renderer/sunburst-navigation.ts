@@ -1,7 +1,9 @@
 import type { ChartSegment } from "../shared/contracts"
 
-export const SUNBURST_NAVIGATION_DURATION_MS = 1_920
-export const SUNBURST_NAVIGATION_STAGE_SPLIT = 0.5
+export const SUNBURST_CONTEXT_DURATION_MS = 160
+export const SUNBURST_MORPH_DURATION_MS = 480
+export const SUNBURST_NAVIGATION_DURATION_MS = SUNBURST_CONTEXT_DURATION_MS + SUNBURST_MORPH_DURATION_MS
+export const SUNBURST_NAVIGATION_STAGE_SPLIT = SUNBURST_CONTEXT_DURATION_MS / SUNBURST_NAVIGATION_DURATION_MS
 
 const NORMAL_RING_COUNT = 5
 const NORMAL_RING_WIDTH = 42
@@ -189,10 +191,11 @@ export function sampleSunburstNavigation(plan: SunburstNavigationPlan, direction
     }
     return frame("morph", plan, stageProgress(progress, SUNBURST_NAVIGATION_STAGE_SPLIT, 1), 0)
   }
-  if (progress < SUNBURST_NAVIGATION_STAGE_SPLIT) {
-    return frame("morph", plan, 1 - stageProgress(progress, 0, SUNBURST_NAVIGATION_STAGE_SPLIT), 0)
+  const morphEnd = SUNBURST_MORPH_DURATION_MS / SUNBURST_NAVIGATION_DURATION_MS
+  if (progress < morphEnd) {
+    return frame("morph", plan, 1 - stageProgress(progress, 0, morphEnd), 0)
   }
-  return frame("context", plan, 0, stageProgress(progress, SUNBURST_NAVIGATION_STAGE_SPLIT, 1))
+  return frame("context", plan, 0, stageProgress(progress, morphEnd, 1))
 }
 
 function frame(phase: SunburstNavigationPhase, plan: SunburstNavigationPlan, canonicalProgress: number, contextOpacity: number): SunburstNavigationFrame {
@@ -341,7 +344,8 @@ function transitionColor(start: string, end: string, progress: number): string {
 }
 
 function stageProgress(progress: number, start: number, end: number): number {
-  return clamp((progress - start) / (end - start))
+  const normalized = clamp((progress - start) / (end - start))
+  return Math.round(normalized * 1_000_000_000_000) / 1_000_000_000_000
 }
 
 function clamp(value: number): number {

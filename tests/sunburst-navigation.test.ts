@@ -5,6 +5,8 @@ import {
   layoutSunburstSegments,
   sampleSunburstNavigation,
   segmentColor,
+  SUNBURST_CONTEXT_DURATION_MS,
+  SUNBURST_MORPH_DURATION_MS,
   SUNBURST_NAVIGATION_DURATION_MS,
   SUNBURST_NAVIGATION_STAGE_SPLIT
 } from '../src/renderer/sunburst-navigation'
@@ -24,8 +26,10 @@ function plan(parentSegments: readonly ChartSegment[], childSegments: readonly C
 
 describe('sunburst navigation planner', () => {
   it('keeps duration and stage split explicit', () => {
-    expect(SUNBURST_NAVIGATION_DURATION_MS).toBe(1_920)
-    expect(SUNBURST_NAVIGATION_STAGE_SPLIT).toBe(0.5)
+    expect(SUNBURST_CONTEXT_DURATION_MS).toBe(160)
+    expect(SUNBURST_MORPH_DURATION_MS).toBe(480)
+    expect(SUNBURST_NAVIGATION_DURATION_MS).toBe(640)
+    expect(SUNBURST_NAVIGATION_STAGE_SPLIT).toBe(0.25)
   })
 
   it('lays out five normal rings followed by thin rings', () => {
@@ -45,7 +49,7 @@ describe('sunburst navigation planner', () => {
     const child = segment('shared', 1, 0, 180, 'root:shared')
     const navigation = plan([branch, sibling, parentChild], [child])
     const start = sampleSunburstNavigation(navigation, 'enter', 0)
-    const middle = sampleSunburstNavigation(navigation, 'enter', 0.25)
+    const middle = sampleSunburstNavigation(navigation, 'enter', 0.125)
 
     expect(start.phase).toBe('context')
     expect(middle.phase).toBe('context')
@@ -59,8 +63,8 @@ describe('sunburst navigation planner', () => {
     const navigation = plan([branch, parentChild], [child])
 
     for (const canonicalProgress of [0, 0.2, 0.5, 0.8, 1]) {
-      const entering = sampleSunburstNavigation(navigation, 'enter', 0.5 + canonicalProgress * 0.5)
-      const exiting = sampleSunburstNavigation(navigation, 'exit', (1 - canonicalProgress) * 0.5)
+      const entering = sampleSunburstNavigation(navigation, 'enter', 0.25 + canonicalProgress * 0.75)
+      const exiting = sampleSunburstNavigation(navigation, 'exit', (1 - canonicalProgress) * 0.75)
       expect(exiting.bars).toEqual(entering.bars)
     }
   })
@@ -69,9 +73,9 @@ describe('sunburst navigation planner', () => {
     const sibling = segment('sibling', 1, 240, 360, 'root:sibling')
     const child = segment('child', 1, 0, 360, 'root:child')
     const navigation = plan([branch, sibling], [child])
-    const duringMorph = sampleSunburstNavigation(navigation, 'exit', 0.25)
-    const morphEnd = sampleSunburstNavigation(navigation, 'exit', 0.5)
-    const duringReveal = sampleSunburstNavigation(navigation, 'exit', 0.75)
+    const duringMorph = sampleSunburstNavigation(navigation, 'exit', 0.375)
+    const morphEnd = sampleSunburstNavigation(navigation, 'exit', 0.75)
+    const duringReveal = sampleSunburstNavigation(navigation, 'exit', 0.875)
 
     expect(duringMorph.bars.some((bar) => bar.origin === 'context')).toBe(false)
     expect(morphEnd.bars.some((bar) => bar.origin === 'context')).toBe(false)
@@ -83,7 +87,7 @@ describe('sunburst navigation planner', () => {
     const parentDescendant = segment('shared', 3, 70, 110, 'root:folder:middle:shared')
     const child = segment('shared', 1, 0, 80, 'root:shared')
     const navigation = plan([branch, parentDescendant], [child], branch, 2)
-    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.5)
+    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.25)
 
     expect(parentFrame.bars.find((bar) => bar.origin === 'exact')?.geometry).toEqual({ inner: 132, outer: 174, startAngle: 70, endAngle: 110 })
   })
@@ -94,7 +98,7 @@ describe('sunburst navigation planner', () => {
     const second = segment('second', 1, 120, 360, 'root:second')
     const nested = segment('nested', 2, 0, 60, 'root:first:nested')
     const navigation = plan([branch, other], [first, second, nested])
-    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.5)
+    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.25)
     const aggregateBars = parentFrame.bars.filter((bar) => bar.origin === 'aggregate')
 
     expect(aggregateBars.map((bar) => bar.fill)).toEqual(['#89909a', '#89909a', '#89909a'])
@@ -111,7 +115,7 @@ describe('sunburst navigation planner', () => {
     const deepChild = segment('deep', 2, 0, 180, 'root:parent:deep')
     const shallowChild = segment('shallow', 1, 180, 360, 'root:shallow')
     const navigation = plan([branch, parent, shallowOther, deepOther], [deepChild, shallowChild])
-    const frame = sampleSunburstNavigation(navigation, 'enter', 0.5)
+    const frame = sampleSunburstNavigation(navigation, 'enter', 0.25)
 
     expect(frame.bars.find((bar) => bar.segment.id === 'deep')?.geometry.startAngle).toBe(40)
     expect(frame.bars.find((bar) => bar.segment.id === 'shallow')?.geometry.startAngle).toBe(120)
@@ -121,7 +125,7 @@ describe('sunburst navigation planner', () => {
     const parentOther = segment(null, 2, 120, 180, 'root:folder:other', 'other')
     const childOther = segment(null, 1, 200, 360, 'root:other', 'other')
     const navigation = plan([branch, parentOther], [childOther])
-    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.5)
+    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.25)
 
     expect(parentFrame.bars).toHaveLength(1)
     expect(parentFrame.bars[0]).toMatchObject({ origin: 'aggregate', fill: '#89909a', strokeOpacity: 0 })
@@ -134,7 +138,7 @@ describe('sunburst navigation planner', () => {
     const exactChild = segment('existing', 1, 0, 120, 'root:existing')
     const aggregateChild = segment('aggregate-child', 1, 120, 240, 'root:aggregate-child')
     const navigation = plan([branch, parentChild, other], [exactChild, aggregateChild])
-    const frame = sampleSunburstNavigation(navigation, 'enter', 0.75)
+    const frame = sampleSunburstNavigation(navigation, 'enter', 0.625)
 
     expect(frame.bars.map((bar) => bar.origin)).toEqual(['aggregate', 'exact'])
   })
@@ -144,8 +148,8 @@ describe('sunburst navigation planner', () => {
     const exactParent = segment('shared', 2, 0, 120, 'root:folder:shared')
     const child = segment('shared', 1, 0, 360, 'root:shared')
     const navigation = plan([branch, exactParent, other], [child])
-    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.5)
-    const middleFrame = sampleSunburstNavigation(navigation, 'enter', 0.75)
+    const parentFrame = sampleSunburstNavigation(navigation, 'enter', 0.25)
+    const middleFrame = sampleSunburstNavigation(navigation, 'enter', 0.625)
     const childFrame = sampleSunburstNavigation(navigation, 'enter', 1)
     const residual = parentFrame.bars.find((bar) => bar.origin === 'residual')
     const middleResidual = middleFrame.bars.find((bar) => bar.origin === 'residual')
@@ -162,7 +166,7 @@ describe('sunburst navigation planner', () => {
     const aggregated = createSunburstNavigationPlan({ parentSegments: [otherAnchor], childSegments: [child], anchor: otherAnchor, targetFolderId: 'hidden-folder', depthOffset: 1, centerRadius: 48 })
 
     expect(sampleSunburstNavigation(empty, 'enter', 1).bars).toEqual([])
-    expect(sampleSunburstNavigation(aggregated, 'enter', 0.5).bars[0]).toMatchObject({ origin: 'aggregate', fill: '#89909a' })
+    expect(sampleSunburstNavigation(aggregated, 'enter', 0.25).bars[0]).toMatchObject({ origin: 'aggregate', fill: '#89909a' })
   })
 
   it('retains the established color palette', () => {
