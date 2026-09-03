@@ -109,6 +109,45 @@ test("keeps product chrome fixed while disk usage content scrolls", async () => 
   }
 })
 
+test("animates a folder wedge into its contents with reduced motion enabled", async () => {
+  const root = resolve(import.meta.dirname, "../..")
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "orbis-folder-animation-"))
+  const scanRoot = join(fixtureDirectory, "fixture")
+  const userData = join(fixtureDirectory, "user-data")
+  await mkdir(join(scanRoot, "Photos", "Nested"), { recursive: true })
+  await writeFile(join(scanRoot, "Photos", "Nested", "large.raw"), Buffer.alloc(32 * 1024))
+  await writeFile(join(scanRoot, "notes.txt"), "notes")
+  const application = await electron.launch({ args: [root], cwd: root, env: { ...process.env, ORBIS_SCAN_ROOT: scanRoot, ORBIS_USER_DATA: userData } })
+  try {
+    const page = await application.firstWindow()
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.getByRole("button", { name: "Scan", exact: true }).click()
+    await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
+    await page.evaluate(() => {
+      const chart = document.querySelector(".orbis-feature-panel__sunburst")
+      const states: string[] = []
+      const paths: string[] = []
+      new MutationObserver(() => {
+        states.push(chart?.getAttribute("data-transitioning") ?? "missing")
+        const path = chart?.querySelector(".orbis-feature-panel__sunburst-segment")?.getAttribute("d")
+        if (path) paths.push(path)
+      }).observe(chart!, { attributes: true, subtree: true, attributeFilter: ["data-transitioning", "d"] })
+      Object.assign(window, { __orbisAnimationProbe: { states, paths } })
+    })
+
+    const folderWedge = page.getByRole("button", { name: /Photos, directory, .* percent/ })
+    await folderWedge.dispatchEvent("click")
+    await expect(page.getByRole("complementary", { name: "Photos contents" })).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const probe = (window as unknown as { __orbisAnimationProbe: { states: string[]; paths: string[] } }).__orbisAnimationProbe
+      return probe.states.includes("true") && new Set(probe.paths).size > 1
+    })).toBe(true)
+  } finally {
+    await application.close()
+    await rm(fixtureDirectory, { recursive: true, force: true })
+  }
+})
+
 test("scans the fixture without touching the startup volume", async () => {
   const root = resolve(import.meta.dirname, "../..")
   const fixtureDirectory = await mkdtemp(join(tmpdir(), "orbis-smoke-"))

@@ -204,13 +204,42 @@ describe("Orbis renderer", () => {
       chart: [{ id: nestedFile.id, name: nestedFile.name, kind: "file", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: nestedFile.sizeBytes, percentage: 100, drillable: false, colorKey: "root:n-4", scanState: "complete", sizeAccuracy: "exact" }],
       largestItems: [nestedFile]
     }
-    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1))
+    let animationFrame: FrameRequestCallback | undefined
+    const performanceNow = vi.spyOn(performance, "now").mockReturnValue(0)
+    vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => { animationFrame = callback; return 1 }))
     vi.stubGlobal("cancelAnimationFrame", vi.fn())
     vi.mocked(window.orbis.focusNode).mockResolvedValueOnce(nested)
 
     render(<App />)
     const folderSegment = await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, 80\.0 percent/ })
     await user.click(folderSegment)
+    await screen.findByRole("complementary", { name: "Documents contents" })
+    const nestedSegment = screen.getByRole("button", { name: /inside\.txt, file, 8\.0 KB, 100\.0 percent/ })
+    expect(nestedSegment).toHaveAttribute("data-start-angle", "0")
+    expect(nestedSegment).toHaveAttribute("data-end-angle", "288")
+    const startingPath = nestedSegment.getAttribute("d")
+    act(() => animationFrame?.(240))
+    expect(nestedSegment).not.toHaveAttribute("data-end-angle", "288")
+    expect(nestedSegment.getAttribute("d")).not.toBe(startingPath)
+    performanceNow.mockRestore()
+  })
+
+  it("uses the matching chart wedge when a folder is opened from the contents list", async () => {
+    const user = userEvent.setup()
+    const nestedFile = { ...file, id: "n-4", parentId: folder.id, name: "inside.txt", sizeBytes: folder.sizeBytes }
+    const nested: OrbisSnapshot = {
+      ...completed,
+      focus: folder,
+      breadcrumbs: [{ id: root.id, name: root.name }, { id: folder.id, name: folder.name }],
+      chart: [{ id: nestedFile.id, name: nestedFile.name, kind: "file", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: nestedFile.sizeBytes, percentage: 100, drillable: false, colorKey: "root:n-4", scanState: "complete", sizeAccuracy: "exact" }],
+      largestItems: [nestedFile]
+    }
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1))
+    vi.stubGlobal("cancelAnimationFrame", vi.fn())
+    vi.mocked(window.orbis.focusNode).mockResolvedValueOnce(nested)
+
+    render(<App />)
+    await user.click(await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, Exact$/ }))
     await screen.findByRole("complementary", { name: "Documents contents" })
     const nestedSegment = screen.getByRole("button", { name: /inside\.txt, file, 8\.0 KB, 100\.0 percent/ })
     expect(nestedSegment).toHaveAttribute("data-start-angle", "0")

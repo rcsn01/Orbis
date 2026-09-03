@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from "react"
+import { useLayoutEffect, useRef, useState } from "react"
 import type { ChartSegment, DirectoryScanState } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
 
@@ -15,35 +15,48 @@ interface SunburstProps {
   readonly provisionalState?: DirectoryScanState
   readonly diskUsagePercentage?: number | undefined
   readonly transitionOrigin?: SunburstTransitionOrigin | undefined
+  readonly onTransitionComplete?: () => void
 }
 
-export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", diskUsagePercentage, transitionOrigin }: SunburstProps): React.JSX.Element {
+const TRANSITION_DURATION_MS = 480
+const TRANSITION_INTERACTION_THRESHOLD = 0.7
+
+export function Sunburst({ segments, onActivate, onContextMenu, provisionalState = "complete", diskUsagePercentage, transitionOrigin, onTransitionComplete }: SunburstProps): React.JSX.Element {
   const [tooltip, setTooltip] = useState<{ readonly segment: ChartSegment; readonly x: number; readonly y: number }>()
   const [transitionProgress, setTransitionProgress] = useState(1)
+  const onTransitionCompleteRef = useRef(onTransitionComplete)
+  onTransitionCompleteRef.current = onTransitionComplete
   const maxDepth = Math.max(1, ...segments.map((segment) => segment.depth))
   const innerRadius = 48
   const outerRadius = ringOuterRadius(maxDepth, innerRadius)
   const center = 320
+  const transitioning = Boolean(transitionOrigin) && transitionProgress < 1
+  const interactive = !transitioning || transitionProgress >= TRANSITION_INTERACTION_THRESHOLD
 
   useLayoutEffect(() => {
-    if (!transitionOrigin || typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    if (!transitionOrigin) {
       setTransitionProgress(1)
       return
     }
+    setTooltip(undefined)
     setTransitionProgress(0)
     const startedAt = performance.now()
     let frame = 0
     const advance = (now: number): void => {
-      const progress = Math.min(1, (now - startedAt) / 420)
+      const progress = Math.min(1, Math.max(0, (now - startedAt) / TRANSITION_DURATION_MS))
       setTransitionProgress(progress)
-      if (progress < 1) frame = window.requestAnimationFrame(advance)
+      if (progress < 1) {
+        frame = window.requestAnimationFrame(advance)
+      } else {
+        onTransitionCompleteRef.current?.()
+      }
     }
     frame = window.requestAnimationFrame(advance)
     return () => window.cancelAnimationFrame(frame)
   }, [transitionOrigin])
 
   return <div className="orbis-feature-panel__sunburst-wrap">
-    <svg className="orbis-feature-panel__sunburst" viewBox="0 0 640 640" role="group" aria-label="Disk usage sunburst">
+    <svg className="orbis-feature-panel__sunburst" viewBox="0 0 640 640" role="group" aria-label="Disk usage sunburst" aria-busy={transitioning} data-transitioning={transitioning} data-interactive={interactive}>
       <title>Disk usage. Open a folder or reveal a file from its segment.</title>
       <defs><pattern id="orbis-provisional-hatch" width="8" height="8" patternUnits="userSpaceOnUse"><path d="M -2 2 L 2 -2 M 0 8 L 8 0 M 6 10 L 10 6 M -2 6 L 2 10 M 0 0 L 8 8 M 6 -2 L 10 2" className="orbis-feature-panel__sunburst-hatch-line" /></pattern><pattern id="orbis-estimated-dots" width="8" height="8" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /><circle cx="6" cy="6" r="1.2" className="orbis-feature-panel__sunburst-estimate-dot" /></pattern></defs>
       {segments.map((segment) => {
@@ -59,22 +72,22 @@ export function Sunburst({ segments, onActivate, onContextMenu, provisionalState
         return <g key={`${segment.depth}-${segment.colorKey}-${segment.startAngle}`}>
           <path d={path} fill={segmentColor(segment, segments)} className="orbis-feature-panel__sunburst-segment"
           role="button"
-          tabIndex={0}
-          aria-disabled={!selectable ? true : undefined}
+          tabIndex={interactive ? 0 : -1}
+          aria-disabled={!selectable || !interactive ? true : undefined}
           aria-label={`${segment.name}, ${segment.kind === "directory" ? "directory" : segment.kind === "file" ? "file" : "aggregate"}, ${displayedSize.value}, ${segment.percentage.toFixed(1)} percent${count}${state}`}
           data-depth={segment.depth}
           data-inner-radius={inner}
           data-outer-radius={outer}
           data-start-angle={geometry.startAngle}
           data-end-angle={geometry.endAngle}
-          onClick={() => onActivate(segment)}
+          onClick={() => { if (interactive) onActivate(segment) }}
           onContextMenu={(event) => {
-            if (!segment.id || segment.kind !== "directory" && segment.kind !== "file" || !onContextMenu) return
+            if (!interactive || !segment.id || segment.kind !== "directory" && segment.kind !== "file" || !onContextMenu) return
             event.preventDefault()
             onContextMenu(segment)
           }}
           onKeyDown={(event) => {
-            if (event.key !== "Enter" && event.key !== " ") return
+            if (!interactive || event.key !== "Enter" && event.key !== " ") return
             event.preventDefault()
             onActivate(segment)
           }}
@@ -147,14 +160,18 @@ export function animatedSegmentGeometry(segment: ChartSegment, origin: SunburstT
     endAngle: segment.endAngle
   }
   if (!origin || progress >= 1) return target
+
   const originInset = origin.depth <= NORMAL_RING_COUNT ? 0 : 1
-  const start = {
-    inner: ringInnerRadius(origin.depth, centerRadius) + originInset,
-    outer: ringOuterRadius(origin.depth, centerRadius) - originInset,
-    startAngle: origin.startAngle,
-    endAngle: origin.endAngle
-  }
-  const eased = 1 - Math.pow(1 - Math.max(0, progress), 3)
+  const originInner = ringInnerRadius(origin.depth, centerRadius) + originInset
+  const originOuter = ringOuterRadius(origin.depth, centerRadius) - originInset
+  const originSpan = Math.max(0, origin.endAngle - origin.startAngle)
+  const mapIntoOrigin = (angle: number): number => origin.startAngle + angle / 360 * originSpan
+  const start = segment.depth === 1
+    ? { inner: originInner, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
+    : { inner: originOuter, outer: originOuter, startAngle: mapIntoOrigin(segment.startAngle), endAngle: mapIntoOrigin(segment.endAngle) }
+  const depthDelay = Math.min(0.35, Math.max(0, segment.depth - 1) * 0.07)
+  const localProgress = Math.max(0, Math.min(1, (progress - depthDelay) / (1 - depthDelay)))
+  const eased = 1 - Math.pow(1 - localProgress, 3)
   return {
     inner: interpolate(start.inner, target.inner, eased),
     outer: interpolate(start.outer, target.outer, eased),

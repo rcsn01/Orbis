@@ -1,10 +1,10 @@
 /** @vitest-environment jsdom */
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { animatedSegmentGeometry, segmentColor, Sunburst } from '../src/renderer/Sunburst'
 import type { ChartSegment } from '../src/shared/contracts'
 
-afterEach(cleanup)
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 const base: ChartSegment = {
   id: 'n-folder', name: 'Folder', kind: 'directory', depth: 1, startAngle: 0, endAngle: 90,
@@ -43,13 +43,72 @@ describe('progressive Orbis renderer', () => {
     expect(container.querySelector('.orbis-feature-panel__sunburst-geometry')).toHaveAttribute('data-outer-radius', '308')
   })
 
-  it('expands a focused folder segment into the new chart geometry', () => {
+  it('expands proportional slices of a focused folder into the new chart geometry', () => {
     const nextSegment = { ...base, depth: 1, startAngle: 0, endAngle: 120 }
     const origin = { depth: 3, startAngle: 90, endAngle: 150 }
 
-    expect(animatedSegmentGeometry(nextSegment, origin, 0)).toEqual({ inner: 132, outer: 174, startAngle: 90, endAngle: 150 })
+    expect(animatedSegmentGeometry(nextSegment, origin, 0)).toEqual({ inner: 132, outer: 174, startAngle: 90, endAngle: 110 })
     expect(animatedSegmentGeometry(nextSegment, origin, 1)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 120 })
-    expect(animatedSegmentGeometry(nextSegment, origin, 0.5)).toEqual({ inner: 58.5, outer: 100.5, startAngle: 11.25, endAngle: 123.75 })
+    expect(animatedSegmentGeometry(nextSegment, origin, 0.5)).toEqual({ inner: 58.5, outer: 100.5, startAngle: 11.25, endAngle: 118.75 })
+  })
+
+  it('keeps deeper contents collapsed at the folder edge until their stagger begins', () => {
+    const nestedSegment = { ...base, depth: 3, startAngle: 120, endAngle: 240 }
+    const immediateSegment = { ...nestedSegment, depth: 1 }
+    const origin = { depth: 2, startAngle: 90, endAngle: 180 }
+
+    expect(animatedSegmentGeometry(nestedSegment, origin, 0.1)).toEqual({ inner: 132, outer: 132, startAngle: 120, endAngle: 150 })
+    expect(animatedSegmentGeometry(immediateSegment, origin, 0.1)).not.toEqual(animatedSegmentGeometry(immediateSegment, origin, 0))
+    expect(animatedSegmentGeometry(nestedSegment, origin, 1)).toEqual({ inner: 132, outer: 174, startAngle: 120, endAngle: 240 })
+  })
+
+  it('cancels an interrupted expansion and restores interaction near its end', () => {
+    const callbacks = new Map<number, FrameRequestCallback>()
+    let nextFrame = 0
+    const cancelAnimationFrame = vi.fn()
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      const frame = ++nextFrame
+      callbacks.set(frame, callback)
+      return frame
+    }))
+    vi.stubGlobal('cancelAnimationFrame', cancelAnimationFrame)
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })))
+    const onTransitionComplete = vi.fn()
+    const firstOrigin = { depth: 2, startAngle: 0, endAngle: 90 }
+    const secondOrigin = { depth: 2, startAngle: 90, endAngle: 180 }
+    const { container, rerender } = render(<Sunburst segments={[base]} transitionOrigin={firstOrigin} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+
+    expect(container.querySelector('svg')).toHaveAttribute('data-interactive', 'false')
+    expect(screen.getByRole('button')).toHaveAttribute('tabindex', '-1')
+    rerender(<Sunburst segments={[base]} transitionOrigin={secondOrigin} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+    expect(cancelAnimationFrame).toHaveBeenCalledWith(1)
+
+    act(() => callbacks.get(2)?.(336))
+    expect(container.querySelector('svg')).toHaveAttribute('data-interactive', 'true')
+    expect(screen.getByRole('button')).toHaveAttribute('tabindex', '0')
+    act(() => callbacks.get(3)?.(480))
+    expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'false')
+    expect(onTransitionComplete).toHaveBeenCalledOnce()
+  })
+
+  it('runs folder expansion even when reduced motion is requested', () => {
+    let animationFrame: FrameRequestCallback | undefined
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => { animationFrame = callback; return 1 }))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true })))
+    const onTransitionComplete = vi.fn()
+    const { container } = render(<Sunburst segments={[base]} transitionOrigin={{ depth: 2, startAngle: 90, endAngle: 180 }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+
+    expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('button')).toHaveAttribute('data-start-angle', '90')
+    expect(screen.getByRole('button')).toHaveAttribute('data-end-angle', '112.5')
+    act(() => animationFrame?.(480))
+    expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'false')
+    expect(screen.getByRole('button')).toHaveAttribute('data-start-angle', '0')
+    expect(screen.getByRole('button')).toHaveAttribute('data-end-angle', '90')
+    expect(onTransitionComplete).toHaveBeenCalledOnce()
   })
 
   it('hatches provisional segments and identifies their state accessibly', () => {
