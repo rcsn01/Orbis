@@ -215,21 +215,19 @@ describe("Orbis renderer", () => {
     await user.click(folderSegment)
     await screen.findByRole("complementary", { name: "Documents contents" })
     const nestedSegment = screen.getByRole("button", { name: /inside\.txt, file, 8\.0 KB, 100\.0 percent/ })
-    expect(nestedSegment).toHaveAttribute("data-start-angle", "0")
-    expect(nestedSegment).toHaveAttribute("data-end-angle", "288")
-    const startingPath = nestedSegment.getAttribute("d")
-    const fadingContext = document.querySelector(".orbis-feature-panel__sunburst-fading-parent-context")
-    const siblingPath = fadingContext?.querySelector("path")
-    const siblingGeometry = siblingPath?.getAttribute("d")
+    expect(nestedSegment).toHaveAttribute("data-end-angle", "360")
+    expect(nestedSegment).toHaveAttribute("tabindex", "-1")
+    const animatedSegment = document.querySelector('.orbis-feature-panel__sunburst-transition [data-track-origin="projected"] path')
+    expect(animatedSegment).toHaveAttribute("data-start-angle", "0")
+    expect(animatedSegment).toHaveAttribute("data-end-angle", "288")
+    const startingPath = animatedSegment?.getAttribute("d")
     act(() => animationFrame?.(480))
-    expect(fadingContext).toHaveClass("orbis-feature-panel__sunburst-fading-parent-context")
-    expect(siblingPath?.getAttribute("d")).toBe(siblingGeometry)
-    expect(nestedSegment.getAttribute("d")).toBe(startingPath)
+    expect(animatedSegment?.getAttribute("d")).toBe(startingPath)
     act(() => animationFrame?.(960))
-    expect(nestedSegment.getAttribute("d")).toBe(startingPath)
+    expect(animatedSegment?.getAttribute("d")).toBe(startingPath)
     act(() => animationFrame?.(1_440))
-    expect(nestedSegment).not.toHaveAttribute("data-end-angle", "288")
-    expect(nestedSegment.getAttribute("d")).not.toBe(startingPath)
+    expect(animatedSegment).not.toHaveAttribute("data-end-angle", "288")
+    expect(animatedSegment?.getAttribute("d")).not.toBe(startingPath)
     performanceNow.mockRestore()
   })
 
@@ -253,7 +251,7 @@ describe("Orbis renderer", () => {
     const { container } = render(<App />)
     await user.click(await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, 80\.0 percent/ }))
     await screen.findByRole("complementary", { name: "Documents contents" })
-    const enteringPath = container.querySelector('.orbis-feature-panel__sunburst-current [aria-label^="inside.txt, file"]')
+    const enteringPath = container.querySelector('.orbis-feature-panel__sunburst-transition [data-track-origin] path')
     if (!enteringPath) throw new Error("Expected the entering sunburst path")
     act(() => animationFrame?.(1_440))
     const halfwayEntryGeometry = enteringPath.getAttribute("d")
@@ -261,8 +259,8 @@ describe("Orbis renderer", () => {
 
     await user.click(screen.getByRole("button", { name: "Up" }))
     await screen.findByRole("complementary", { name: "fixture contents" })
-    const outgoing = container.querySelector(".orbis-feature-panel__sunburst-outgoing")
-    const outgoingPath = outgoing?.querySelector("path")
+    const outgoing = container.querySelector(".orbis-feature-panel__sunburst-transition")
+    const outgoingPath = outgoing?.querySelector("[data-track-origin] path")
     expect(outgoing).toHaveAttribute("aria-hidden", "true")
     expect(outgoingPath).toHaveAttribute("data-start-angle", "0")
     expect(outgoingPath).toHaveAttribute("data-end-angle", "360")
@@ -274,7 +272,7 @@ describe("Orbis renderer", () => {
     expect(outgoingPath?.getAttribute("d")).not.toBe(expandedPath)
     expect(Number(outgoingPath?.getAttribute("data-end-angle"))).toBeLessThan(360)
     act(() => animationFrame?.(1_920))
-    expect(container.querySelector(".orbis-feature-panel__sunburst-outgoing")).toBeNull()
+    expect(container.querySelector(".orbis-feature-panel__sunburst-transition")).toBeNull()
   })
 
   it("contracts an ancestor jump into the branch below that ancestor", async () => {
@@ -298,7 +296,7 @@ describe("Orbis renderer", () => {
     const { container } = render(<App />)
     await user.click(await screen.findByRole("button", { name: "fixture" }))
     await screen.findByRole("complementary", { name: "fixture contents" })
-    const outgoingPath = container.querySelector(".orbis-feature-panel__sunburst-outgoing path")
+    const outgoingPath = container.querySelector(".orbis-feature-panel__sunburst-transition [data-track-origin]:not([data-track-origin=\"context\"]) path")
     expect(outgoingPath).toHaveAttribute("data-end-angle", "360")
     act(() => animationFrame?.(1_919))
     expect(Number(outgoingPath?.getAttribute("data-start-angle"))).toBeGreaterThanOrEqual(0)
@@ -329,7 +327,7 @@ describe("Orbis renderer", () => {
     const { container } = render(<App />)
     await user.click(await screen.findByRole("button", { name: "Up" }))
     await screen.findByRole("complementary", { name: "fixture contents" })
-    const outgoingPath = container.querySelector(".orbis-feature-panel__sunburst-outgoing path")
+    const outgoingPath = container.querySelector(".orbis-feature-panel__sunburst-transition [data-track-origin]:not([data-track-origin=\"context\"]) path")
     act(() => animationFrame?.(1_919))
     expect(Number(outgoingPath?.getAttribute("data-start-angle"))).toBeGreaterThan(295)
     expect(Number(outgoingPath?.getAttribute("data-end-angle"))).toBeLessThanOrEqual(360)
@@ -353,8 +351,35 @@ describe("Orbis renderer", () => {
     await user.click(await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, Exact$/ }))
     await screen.findByRole("complementary", { name: "Documents contents" })
     const nestedSegment = screen.getByRole("button", { name: /inside\.txt, file, 8\.0 KB, 100\.0 percent/ })
-    expect(nestedSegment).toHaveAttribute("data-start-angle", "0")
-    expect(nestedSegment).toHaveAttribute("data-end-angle", "288")
+    expect(nestedSegment).toHaveAttribute("data-end-angle", "360")
+    const animatedSegment = document.querySelector('.orbis-feature-panel__sunburst-transition [data-track-origin] path')
+    expect(animatedSegment).toHaveAttribute("data-start-angle", "0")
+    expect(animatedSegment).toHaveAttribute("data-end-angle", "288")
+  })
+
+  it("opens a contents-list folder through its representing Other wedge", async () => {
+    const user = userEvent.setup()
+    const nestedFile = { ...file, id: "n-4", parentId: folder.id, name: "inside.txt", sizeBytes: folder.sizeBytes }
+    const aggregatedSource: OrbisSnapshot = {
+      ...completed,
+      chart: [{ id: null, name: "Other", kind: "other", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: root.sizeBytes, percentage: 100, drillable: false, colorKey: "root:other", scanState: "complete", sizeAccuracy: "exact" }]
+    }
+    const nested: OrbisSnapshot = {
+      ...completed,
+      focus: folder,
+      breadcrumbs: [{ id: root.id, name: root.name }, { id: folder.id, name: folder.name }],
+      chart: [{ id: nestedFile.id, name: nestedFile.name, kind: "file", depth: 1, startAngle: 0, endAngle: 360, sizeBytes: nestedFile.sizeBytes, percentage: 100, drillable: false, colorKey: "root:n-4", scanState: "complete", sizeAccuracy: "exact" }],
+      largestItems: [nestedFile]
+    }
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1))
+    vi.stubGlobal("cancelAnimationFrame", vi.fn())
+    vi.mocked(window.orbis.getSnapshot).mockResolvedValueOnce(aggregatedSource)
+    vi.mocked(window.orbis.focusNode).mockResolvedValueOnce(nested)
+
+    const { container } = render(<App />)
+    await user.click(await screen.findByRole("button", { name: /Documents, directory, 8\.0 KB, Exact$/ }))
+    await screen.findByRole("complementary", { name: "Documents contents" })
+    expect(container.querySelector('.orbis-feature-panel__sunburst-transition [data-track-origin="aggregate"]')).not.toBeNull()
   })
 
   it("opens native node menus without activating the node", async () => {

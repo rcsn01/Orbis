@@ -126,62 +126,48 @@ test("animates a folder wedge into its contents with reduced motion enabled", as
     await page.getByRole("button", { name: "Scan", exact: true }).click()
     await expect(page.getByText("Scan complete", { exact: true })).toBeVisible({ timeout: 20_000 })
     await page.evaluate(() => {
-      const wrap = document.querySelector(".orbis-feature-panel__sunburst-wrap")
-      const chart = wrap?.querySelector(".orbis-feature-panel__sunburst")
-      const states: string[] = []
       const paths: string[] = []
-      const outgoingPaths: string[] = []
+      const wrap = document.querySelector(".orbis-feature-panel__sunburst-wrap")
       new MutationObserver(() => {
-        states.push(chart?.getAttribute("data-transitioning") ?? "missing")
-        const path = chart?.querySelector(".orbis-feature-panel__sunburst-segment")?.getAttribute("d")
-        if (path) paths.push(path)
-      }).observe(chart!, { attributes: true, subtree: true, attributeFilter: ["data-transitioning", "d"] })
-      new MutationObserver(() => {
-        const outgoingPath = wrap?.querySelector(".orbis-feature-panel__sunburst-outgoing .orbis-feature-panel__sunburst-segment")?.getAttribute("d")
-        if (outgoingPath) outgoingPaths.push(outgoingPath)
+        for (const path of document.querySelectorAll('.orbis-feature-panel__sunburst-transition [data-track-origin]:not([data-track-origin="context"]) path')) {
+          const geometry = path.getAttribute("d")
+          if (geometry) paths.push(geometry)
+        }
       }).observe(wrap!, { attributes: true, childList: true, subtree: true, attributeFilter: ["d"] })
-      Object.assign(window, { __orbisAnimationProbe: { states, paths, outgoingPaths } })
+      Object.assign(window, { __orbisNavigationPaths: paths })
     })
-
     const folderWedge = page.getByRole("button", { name: /Photos, directory, .* percent/ })
-    const folderGeometry = await folderWedge.getAttribute("d")
-    const siblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
     await folderWedge.dispatchEvent("click")
     await expect(page.getByRole("complementary", { name: "Photos contents" })).toBeVisible()
-    await expect.poll(() => page.evaluate(({ selected, sibling }) => {
-      const context = document.querySelector(".orbis-feature-panel__sunburst-fading-parent-context")
-      const opacity = context ? Number(getComputedStyle(context).opacity) : -1
-      const geometries = Array.from(context?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
-      return opacity > 0 && opacity < 1 && geometries.includes(selected) && geometries.includes(sibling)
-    }, { selected: folderGeometry, sibling: siblingGeometry })).toBe(true)
-    await expect.poll(() => page.evaluate(() => {
-      const probe = (window as unknown as { __orbisAnimationProbe: { states: string[]; paths: string[] } }).__orbisAnimationProbe
-      return probe.states.includes("true") && new Set(probe.paths).size > 1
-    })).toBe(true)
+    const transitionLayer = page.locator(".orbis-feature-panel__sunburst-transition")
+    await expect(transitionLayer).toHaveCount(1)
+    await expect(transitionLayer).toHaveAttribute("data-navigation-direction", "enter")
+    await expect(page.locator(".orbis-feature-panel__sunburst-semantic-bars--hidden")).toHaveCSS("opacity", "0")
+    await expect(transitionLayer).toHaveAttribute("data-navigation-phase", "morph", { timeout: 2_000 })
+    await expect.poll(() => page.evaluate(() => new Set((window as unknown as { __orbisNavigationPaths: string[] }).__orbisNavigationPaths).size)).toBeGreaterThan(1)
+    await expect(transitionLayer).toHaveCount(0, { timeout: 3_000 })
 
-    await page.evaluate(() => {
-      const probe = (window as unknown as { __orbisAnimationProbe: { outgoingPaths: string[] } }).__orbisAnimationProbe
-      probe.outgoingPaths.length = 0
-    })
+    await page.evaluate(() => { (window as unknown as { __orbisNavigationPaths: string[] }).__orbisNavigationPaths.length = 0 })
     await page.getByRole("button", { name: "Up" }).click()
     await expect(page.getByRole("complementary", { name: "fixture contents" })).toBeVisible()
-    await expect.poll(() => page.evaluate(() => {
-      const probe = (window as unknown as { __orbisAnimationProbe: { outgoingPaths: string[] } }).__orbisAnimationProbe
-      return new Set(probe.outgoingPaths).size > 1
-    })).toBe(true)
-    await expect(page.locator(".orbis-feature-panel__sunburst-outgoing")).toHaveCount(0)
+    await expect(transitionLayer).toHaveCount(1)
+    await expect(transitionLayer).toHaveAttribute("data-navigation-direction", "exit")
+    await expect(transitionLayer).toHaveAttribute("data-navigation-phase", "morph")
+    await expect(transitionLayer.locator('[data-track-origin="context"]')).toHaveCount(0)
+    await page.waitForTimeout(400)
+    await expect(transitionLayer.locator('[data-track-origin="context"]')).toHaveCount(0)
+    await expect(transitionLayer).toHaveAttribute("data-navigation-phase", "context", { timeout: 2_000 })
+    await page.evaluate(() => { (window as unknown as { __orbisNavigationPaths: string[] }).__orbisNavigationPaths.length = 0 })
+    await page.waitForTimeout(200)
+    await expect.poll(() => page.evaluate(() => new Set((window as unknown as { __orbisNavigationPaths: string[] }).__orbisNavigationPaths).size)).toBeLessThanOrEqual(1)
+    await expect(transitionLayer).toHaveCount(0, { timeout: 3_000 })
 
     const nestedWedge = page.getByRole("button", { name: /Nested, directory, .* percent/ })
-    const nestedGeometry = await nestedWedge.getAttribute("d")
-    const rootSiblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
     await nestedWedge.dispatchEvent("click")
     await expect(page.getByRole("complementary", { name: "Nested contents" })).toBeVisible()
-    await expect.poll(() => page.evaluate(({ selected, sibling }) => {
-      const context = document.querySelector(".orbis-feature-panel__sunburst-fading-parent-context")
-      const opacity = context ? Number(getComputedStyle(context).opacity) : -1
-      const geometries = Array.from(context?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
-      return opacity > 0 && opacity < 1 && geometries.includes(selected) && geometries.includes(sibling)
-    }, { selected: nestedGeometry, sibling: rootSiblingGeometry })).toBe(true)
+    await expect(transitionLayer).toHaveCount(1)
+    await expect(transitionLayer).toHaveAttribute("data-navigation-direction", "enter")
+    await expect(transitionLayer).toHaveCount(0, { timeout: 3_000 })
   } finally {
     await application.close()
     await rm(fixtureDirectory, { recursive: true, force: true })

@@ -8,22 +8,26 @@ import { AlertCircle, ChevronLeft, RefreshCw, Square } from "@moirasia/ui-react/
 import type { ChartSegment, LocationId, NodeSummary, OrbisApi, OrbisSnapshot } from "../shared/contracts"
 import { formatBytes } from "./format-bytes"
 import { scanStatusPresentation } from "./scan-presentation"
-import { segmentColor, Sunburst } from "./Sunburst"
-import type { SunburstTransition, SunburstTransitionOrigin } from "./Sunburst"
+import { Sunburst } from "./Sunburst"
+import type { SunburstTransition } from "./Sunburst"
+import { segmentColor } from "./sunburst-navigation"
 
-type PendingFolderTransition =
+type PendingSunburstNavigation =
   | {
-      readonly kind: "enter"
-      readonly targetId: string
-      readonly origin: SunburstTransitionOrigin
-      readonly sourceSegments: readonly ChartSegment[]
-      readonly branchId: string
+      readonly direction: "enter"
+      readonly token: number
+      readonly targetFocusId: string
+      readonly targetFolderId: string
+      readonly parentSegments: readonly ChartSegment[]
+      readonly anchor: ChartSegment
+      readonly depthOffset: number
     }
   | {
-      readonly kind: "exit"
-      readonly targetId: string
-      readonly branchId: string
-      readonly outgoingSegments: readonly ChartSegment[]
+      readonly direction: "exit"
+      readonly token: number
+      readonly targetFocusId: string
+      readonly targetFolderId: string
+      readonly childSegments: readonly ChartSegment[]
       readonly depthOffset: number
     }
 
@@ -42,11 +46,12 @@ export interface OrbisPanelProps {
 /** Orbis content shared by the standalone window and the Moirasia shell. */
 export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<OrbisSnapshot>()
-  const [pendingFolderTransition, setPendingFolderTransition] = useState<PendingFolderTransition>()
+  const [pendingNavigation, setPendingNavigation] = useState<PendingSunburstNavigation>()
   const [error, setError] = useState<string>()
   const [loading, setLoading] = useState(true)
   const notificationVersion = useRef(0)
   const commandVersion = useRef(0)
+  const navigationVersion = useRef(0)
 
   useEffect(() => {
     let alive = true
@@ -72,7 +77,7 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
       }
     } catch (reason) {
       if (commandVersion.current === command) {
-        setPendingFolderTransition(undefined)
+        setPendingNavigation(undefined)
         setError(message(reason))
       }
     }
@@ -83,35 +88,62 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
   const selectedLocation = snapshot?.locations.find((location) => location.id === snapshot.selectedLocationId)
   const isScanning = scan?.status === "scanning"
   const diskRoot = Boolean(focus && snapshot?.target.isStartup && focus.id === snapshot.breadcrumbs[0]?.id)
+  const folderIsEmpty = Boolean(focus && snapshot && focus.directChildren === 0 && focus.scanState === "complete" && !(diskRoot && snapshot.volume.unscannedBytes > 0))
   const displayTotal = useMemo(() => focus && snapshot ? (diskRoot ? snapshot.volume.capacityBytes : focus.sizeBytes) : 0, [diskRoot, focus, snapshot])
   const diskUsagePercentage = diskRoot && focus && displayTotal > 0
     ? (isPending(focus) ? focus.estimatedSizeBytes ?? focus.sizeBytes : focus.sizeBytes) / displayTotal * 100
     : undefined
   const startOrRescan = !scan || scan.status === "idle" ? bridge.startScan : bridge.rescan
   const startOrRescanLabel = scan?.resume?.available ? "Resume" : !scan || scan.status === "idle" ? "Scan" : "Rescan"
-  const exitDestination = pendingFolderTransition?.kind === "exit" && pendingFolderTransition.targetId === focus?.id
-    ? snapshot?.chart.find((segment) => segment.depth === 1 && segment.id === pendingFolderTransition.branchId)
+  const exitAnchor = pendingNavigation?.direction === "exit" && pendingNavigation.targetFocusId === focus?.id
+    ? snapshot?.chart.find((segment) => segment.depth === 1 && segment.id === pendingNavigation.targetFolderId)
       ?? snapshot?.chart.find((segment) => segment.depth === 1 && segment.kind === "other")
     : undefined
   const chartTransition = useMemo<SunburstTransition | undefined>(() => {
-    if (!pendingFolderTransition || pendingFolderTransition.targetId !== focus?.id) return undefined
-    if (pendingFolderTransition.kind === "enter") return { kind: "enter", origin: pendingFolderTransition.origin, sourceSegments: pendingFolderTransition.sourceSegments, branchId: pendingFolderTransition.branchId }
-    if (!exitDestination) return undefined
-    return {
-      kind: "exit",
-      outgoingSegments: pendingFolderTransition.outgoingSegments,
-      branchId: pendingFolderTransition.branchId,
-      depthOffset: pendingFolderTransition.depthOffset
+    if (!pendingNavigation || pendingNavigation.targetFocusId !== focus?.id || !snapshot) return undefined
+    if (pendingNavigation.direction === "enter") {
+      return {
+        direction: "enter",
+        navigationToken: pendingNavigation.token,
+        parentSegments: pendingNavigation.parentSegments,
+        childSegments: snapshot.chart,
+        anchor: pendingNavigation.anchor,
+        targetFolderId: pendingNavigation.targetFolderId,
+        depthOffset: pendingNavigation.depthOffset,
+        centerRadius: 48
+      }
     }
-  }, [exitDestination?.depth, exitDestination?.endAngle, exitDestination?.startAngle, focus?.id, pendingFolderTransition])
+    if (!exitAnchor) return undefined
+    return {
+      direction: "exit",
+      navigationToken: pendingNavigation.token,
+      parentSegments: snapshot.chart,
+      childSegments: pendingNavigation.childSegments,
+      anchor: exitAnchor,
+      targetFolderId: pendingNavigation.targetFolderId,
+      depthOffset: pendingNavigation.depthOffset,
+      centerRadius: 48
+    }
+  }, [exitAnchor, focus?.id, pendingNavigation, snapshot])
 
   useEffect(() => {
-    if (pendingFolderTransition?.kind !== "exit" || pendingFolderTransition.targetId !== focus?.id || chartTransition) return
-    setPendingFolderTransition((current) => current?.kind === "exit" && current.targetId === focus.id ? undefined : current)
-  }, [chartTransition, focus?.id, pendingFolderTransition])
+    if (!pendingNavigation || pendingNavigation.targetFocusId !== focus?.id) return
+    if (folderIsEmpty || pendingNavigation.direction === "exit" && !chartTransition) {
+      setPendingNavigation((current) => current?.token === pendingNavigation.token ? undefined : current)
+    }
+  }, [chartTransition, focus?.id, folderIsEmpty, pendingNavigation])
 
-  const focusNode = (id: string, origin?: SunburstTransitionOrigin): void => {
-    setPendingFolderTransition(origin ? { kind: "enter", targetId: id, origin, sourceSegments: snapshot?.chart ?? [], branchId: id } : undefined)
+  const focusNode = (id: string, anchor?: ChartSegment): void => {
+    const token = ++navigationVersion.current
+    setPendingNavigation(anchor && snapshot ? {
+      direction: "enter",
+      token,
+      targetFocusId: id,
+      targetFolderId: id,
+      parentSegments: snapshot.chart,
+      anchor,
+      depthOffset: anchor.depth
+    } : undefined)
     void run(() => bridge.focusNode(id))
   }
   const exitToNode = (id: string): void => {
@@ -122,7 +154,14 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
       focusNode(id)
       return
     }
-    setPendingFolderTransition({ kind: "exit", targetId: id, branchId: branch.id, outgoingSegments: snapshot.chart, depthOffset: snapshot.breadcrumbs.length - 1 - destinationIndex })
+    setPendingNavigation({
+      direction: "exit",
+      token: ++navigationVersion.current,
+      targetFocusId: id,
+      targetFolderId: branch.id,
+      childSegments: snapshot.chart,
+      depthOffset: snapshot.breadcrumbs.length - 1 - destinationIndex
+    })
     void run(() => bridge.focusNode(id))
   }
   const activateSegment = (segment: ChartSegment): void => {
@@ -136,8 +175,9 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
   }
   const activateNode = (item: NodeSummary): void => {
     if (item.kind === "directory" && (item.directChildren > 0 || item.scanState !== "complete")) {
-      const segment = snapshot?.chart.find((candidate) => candidate.id === item.id && candidate.depth === 1)
-      focusNode(item.id, segment)
+      const anchor = snapshot?.chart.find((candidate) => candidate.id === item.id && candidate.depth === 1)
+        ?? snapshot?.chart.find((candidate) => candidate.depth === 1 && candidate.kind === "other")
+      focusNode(item.id, anchor)
       return
     }
     void revealNode(item.id)
@@ -177,7 +217,7 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
         {focus ? <div className="orbis-feature-panel__workspace">
           <section className="orbis-feature-panel__chart-panel" aria-label={`Disk usage for ${focus.name}`}>
             <div className="orbis-feature-panel__panel-heading"><div className="orbis-feature-panel__location"><Breadcrumbs snapshot={snapshot} onFocus={exitToNode} onContextMenu={(id) => void showNodeContextMenu(id)} /><FolderSize node={focus} /></div>{focus.parentId && <Button size="sm" variant="ghost" onClick={() => exitToNode(focus.parentId!)}><ChevronLeft />Up</Button>}</div>
-            {focus.directChildren === 0 && focus.scanState === "complete" && !(diskRoot && snapshot.volume.unscannedBytes > 0) ? <div className="orbis-feature-panel__empty" role="status"><strong>This folder is empty</strong><span>No readable child files or folders were found.</span></div> : <Sunburst segments={snapshot.chart} onActivate={activateSegment} onContextMenu={(segment) => { if (segment.id) void showNodeContextMenu(segment.id) }} provisionalState={focus.scanState} diskUsagePercentage={diskUsagePercentage} transition={chartTransition} onTransitionComplete={() => setPendingFolderTransition((current) => current?.targetId === focus.id ? undefined : current)} />}
+            {folderIsEmpty ? <div className="orbis-feature-panel__empty" role="status"><strong>This folder is empty</strong><span>No readable child files or folders were found.</span></div> : <Sunburst segments={snapshot.chart} onActivate={activateSegment} onContextMenu={(segment) => { if (segment.id) void showNodeContextMenu(segment.id) }} provisionalState={focus.scanState} diskUsagePercentage={diskUsagePercentage} transition={chartTransition} onTransitionComplete={() => setPendingNavigation((current) => current?.token === chartTransition?.navigationToken ? undefined : current)} />}
           </section>
           <DirectoryContents snapshot={snapshot} onActivate={activateNode} onContextMenu={(id) => void showNodeContextMenu(id)} />
         </div> : <EmptyScanState snapshot={snapshot} onStart={() => void run(() => bridge.startScan())} />}
