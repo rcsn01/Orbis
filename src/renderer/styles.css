@@ -36,8 +36,8 @@
 .orbis-feature-panel__sunburst-current { z-index: 1; }
 .orbis-feature-panel__sunburst-outgoing { z-index: 2; pointer-events: none; }
 .orbis-feature-panel__sunburst-outgoing .orbis-feature-panel__sunburst-segment { pointer-events: none; }
-.orbis-feature-panel__sunburst-fading-siblings { animation: orbis-sunburst-fade-siblings 960ms linear forwards; will-change: opacity; }
-@keyframes orbis-sunburst-fade-siblings { from { opacity: 1; } to { opacity: 0; } }
+.orbis-feature-panel__sunburst-fading-parent-context { animation: orbis-sunburst-fade-parent-context 960ms linear forwards; will-change: opacity; }
+@keyframes orbis-sunburst-fade-parent-context { from { opacity: 1; } to { opacity: 0; } }
 .orbis-feature-panel__sunburst-segment { stroke: var(--card); stroke-width: 1.5; cursor: pointer; outline: none; transition: opacity 120ms ease, filter 120ms ease; }
 .orbis-feature-panel__sunburst[data-interactive="false"] .orbis-feature-panel__sunburst-segment { pointer-events: none; }
 .orbis-feature-panel__sunburst-segment:hover, .orbis-feature-panel__sunburst-segment:focus-visible { filter: brightness(1.18); opacity: .92; }

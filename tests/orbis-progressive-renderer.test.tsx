@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { animatedSegmentGeometry, segmentColor, Sunburst } from '../src/renderer/Sunburst'
+import { animatedSegmentGeometry, buildNavigationTracks, navigationTrackGeometry, segmentColor, Sunburst } from '../src/renderer/Sunburst'
 import type { ChartSegment } from '../src/shared/contracts'
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
@@ -71,6 +71,59 @@ describe('progressive Orbis renderer', () => {
     expect(animatedSegmentGeometry(destination, origin, 1, 48, source)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 180 })
   })
 
+  it('uses one geometry track for forward and reverse navigation without collapsing matched bars toward the center', () => {
+    const branch = { ...base, startAngle: 45, endAngle: 135 }
+    const parentChild = { ...base, id: 'shared', depth: 2, startAngle: 60, endAngle: 100, colorKey: 'root:n-folder:shared' }
+    const child = { ...base, id: 'shared', depth: 1, startAngle: 0, endAngle: 160, colorKey: 'root:shared' }
+    const [track] = buildNavigationTracks([branch, parentChild], [child], branch, 1)
+
+    expect(track).toBeDefined()
+    expect(navigationTrackGeometry(track!, 0)).toEqual({ inner: 90, outer: 132, startAngle: 60, endAngle: 100 })
+    expect(navigationTrackGeometry(track!, 1)).toEqual({ inner: 48, outer: 90, startAngle: 0, endAngle: 160 })
+    expect(navigationTrackGeometry(track!, 0.35)).toEqual(navigationTrackGeometry(track!, 1 - 0.65))
+    expect(navigationTrackGeometry(track!, 0.35).inner).toBeGreaterThan(48)
+  })
+
+  it('paints newly introduced layers behind bars that already existed in the parent chart', () => {
+    const branch = { ...base, startAngle: 20, endAngle: 200 }
+    const parentChild = { ...base, id: 'existing', depth: 2, startAngle: 40, endAngle: 100, colorKey: 'root:n-folder:existing' }
+    const existingChild = { ...base, id: 'existing', depth: 1, startAngle: 0, endAngle: 180, colorKey: 'root:existing' }
+    const newOuterLayer = { ...base, id: 'new-outer', depth: 2, startAngle: 180, endAngle: 360, colorKey: 'root:new-outer' }
+
+    const tracks = buildNavigationTracks([branch, parentChild], [existingChild, newOuterLayer], branch, 1)
+
+    expect(tracks.map((track) => track.childSegment.id)).toEqual(['new-outer', 'existing'])
+    expect(tracks.map((track) => Boolean(track.parentSegment))).toEqual([false, true])
+  })
+
+  it('matches outgoing bars at the breadcrumb depth used by an ancestor jump', () => {
+    const branch = { ...base, id: 'ancestor-branch', startAngle: 20, endAngle: 200, colorKey: 'root:ancestor-branch' }
+    const parentDescendant = { ...base, id: 'shared-deep-node', depth: 3, startAngle: 70, endAngle: 110, colorKey: 'root:ancestor-branch:middle:shared' }
+    const child = { ...base, id: 'shared-deep-node', depth: 1, startAngle: 0, endAngle: 80, colorKey: 'root:shared' }
+    const [track] = buildNavigationTracks([branch, parentDescendant], [child], branch, 2)
+
+    expect(track?.parentSegment).toBe(parentDescendant)
+    expect(track?.parentGeometry).toEqual({ inner: 132, outer: 174, startAngle: 70, endAngle: 110 })
+  })
+
+  it('keeps the clicked parent shell fixed while it fades with parent context in stage one', () => {
+    let animationFrame: FrameRequestCallback | undefined
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => { animationFrame = callback; return 1 }))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const branch = { ...base, startAngle: 45, endAngle: 135 }
+    const child = { ...base, id: 'child', startAngle: 0, endAngle: 360, colorKey: 'root:child' }
+    const { container } = render(<Sunburst segments={[child]} transition={{ kind: 'enter', origin: branch, sourceSegments: [branch], branchId: branch.id! }} onActivate={vi.fn()} />)
+    const context = container.querySelector('.orbis-feature-panel__sunburst-fading-parent-context')
+    const shell = context?.querySelector('path')
+    const initialPath = shell?.getAttribute('d')
+
+    act(() => animationFrame?.(480))
+    expect(shell?.getAttribute('d')).toBe(initialPath)
+    expect(shell).toHaveAttribute('data-inner-radius', '48')
+    expect(shell).toHaveAttribute('data-outer-radius', '90')
+  })
+
   it('contracts outgoing segments into the destination wedge in reverse', () => {
     const destination = { depth: 1, startAngle: 90, endAngle: 180 }
     const firstLevel = { ...base, startAngle: 0, endAngle: 120 }
@@ -91,17 +144,34 @@ describe('progressive Orbis renderer', () => {
     const destination = { ...base, id: 'nested-child', startAngle: 0, endAngle: 360, colorKey: 'root:nested-child' }
     const { container } = render(<Sunburst segments={[destination]} transition={{ kind: 'enter', origin: nestedBranch, sourceSegments: [nestedBranch, sibling], branchId: nestedBranch.id! }} onActivate={vi.fn()} />)
 
-    const fadingSiblings = container.querySelector('.orbis-feature-panel__sunburst-fading-siblings')
-    expect(fadingSiblings).not.toBeNull()
-    expect(fadingSiblings?.querySelector('[data-depth="1"]')).toHaveAttribute('data-start-angle', '180')
+    const fadingContext = container.querySelector('.orbis-feature-panel__sunburst-fading-parent-context')
+    expect(fadingContext).not.toBeNull()
+    expect(fadingContext?.querySelector('[data-depth="1"]')).toHaveAttribute('data-start-angle', '180')
+    expect(fadingContext?.querySelector('[data-depth="2"]')).toHaveAttribute('data-start-angle', '30')
+  })
+
+  it('reveals the clicked parent shell with the surrounding parent context in exit stage two', () => {
+    let animationFrame: FrameRequestCallback | undefined
+    vi.spyOn(performance, 'now').mockReturnValue(0)
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => { animationFrame = callback; return 1 }))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const branch = { ...base, id: 'parent-child', name: 'Parent child' }
+    const sibling = { ...base, id: 'sibling', name: 'Sibling', startAngle: 90, endAngle: 180, colorKey: 'root:sibling' }
+    const child = { ...base, id: 'inside', name: 'Inside', colorKey: 'root:inside' }
+    render(<Sunburst segments={[branch, sibling]} transition={{ kind: 'exit', outgoingSegments: [child], branchId: branch.id!, depthOffset: 1 }} onActivate={vi.fn()} />)
+    const branchGroup = screen.getByRole('button', { name: /Parent child/ }).parentElement
+
+    act(() => animationFrame?.(480))
+    expect(branchGroup).toHaveStyle({ opacity: '0' })
+    act(() => animationFrame?.(1_440))
+    expect(branchGroup).toHaveStyle({ opacity: '0.5' })
   })
 
   it('renders the outgoing chart as a decorative non-interactive overlay', () => {
     vi.spyOn(performance, 'now').mockReturnValue(0)
     vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
     vi.stubGlobal('cancelAnimationFrame', vi.fn())
-    const destination = { depth: 1, startAngle: 90, endAngle: 180 }
-    const { container } = render(<Sunburst segments={[{ ...base, id: 'parent-child', name: 'Parent child' }]} transition={{ kind: 'exit', destination, outgoingSegments: [base], branchId: 'parent-child' }} onActivate={vi.fn()} />)
+    const { container } = render(<Sunburst segments={[{ ...base, id: 'parent-child', name: 'Parent child' }]} transition={{ kind: 'exit', outgoingSegments: [base], branchId: 'parent-child', depthOffset: 1 }} onActivate={vi.fn()} />)
 
     const outgoing = container.querySelector('.orbis-feature-panel__sunburst-outgoing')
     expect(outgoing).toHaveAttribute('aria-hidden', 'true')
@@ -148,7 +218,8 @@ describe('progressive Orbis renderer', () => {
     vi.stubGlobal('cancelAnimationFrame', vi.fn())
     vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true })))
     const onTransitionComplete = vi.fn()
-    const { container } = render(<Sunburst segments={[base]} transition={{ kind: 'enter', origin: { depth: 2, startAngle: 90, endAngle: 180 }, sourceSegments: [base], branchId: base.id! }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
+    const sourceBranch = { ...base, depth: 2, startAngle: 90, endAngle: 180 }
+    const { container } = render(<Sunburst segments={[base]} transition={{ kind: 'enter', origin: sourceBranch, sourceSegments: [sourceBranch], branchId: sourceBranch.id! }} onTransitionComplete={onTransitionComplete} onActivate={vi.fn()} />)
 
     expect(container.querySelector('svg')).toHaveAttribute('aria-busy', 'true')
     expect(screen.getByRole('button')).toHaveAttribute('data-start-angle', '90')

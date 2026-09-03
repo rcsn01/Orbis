@@ -24,6 +24,7 @@ type PendingFolderTransition =
       readonly targetId: string
       readonly branchId: string
       readonly outgoingSegments: readonly ChartSegment[]
+      readonly depthOffset: number
     }
 
 export function App(): React.JSX.Element {
@@ -98,9 +99,9 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
     if (!exitDestination) return undefined
     return {
       kind: "exit",
-      destination: { depth: exitDestination.depth, startAngle: exitDestination.startAngle, endAngle: exitDestination.endAngle },
       outgoingSegments: pendingFolderTransition.outgoingSegments,
-      branchId: pendingFolderTransition.branchId
+      branchId: pendingFolderTransition.branchId,
+      depthOffset: pendingFolderTransition.depthOffset
     }
   }, [exitDestination?.depth, exitDestination?.endAngle, exitDestination?.startAngle, focus?.id, pendingFolderTransition])
 
@@ -121,7 +122,7 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
       focusNode(id)
       return
     }
-    setPendingFolderTransition({ kind: "exit", targetId: id, branchId: branch.id, outgoingSegments: snapshot.chart })
+    setPendingFolderTransition({ kind: "exit", targetId: id, branchId: branch.id, outgoingSegments: snapshot.chart, depthOffset: snapshot.breadcrumbs.length - 1 - destinationIndex })
     void run(() => bridge.focusNode(id))
   }
   const activateSegment = (segment: ChartSegment): void => {

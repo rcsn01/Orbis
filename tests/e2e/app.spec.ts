@@ -144,15 +144,16 @@ test("animates a folder wedge into its contents with reduced motion enabled", as
     })
 
     const folderWedge = page.getByRole("button", { name: /Photos, directory, .* percent/ })
+    const folderGeometry = await folderWedge.getAttribute("d")
     const siblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
     await folderWedge.dispatchEvent("click")
     await expect(page.getByRole("complementary", { name: "Photos contents" })).toBeVisible()
-    await expect.poll(() => page.evaluate((expectedGeometry) => {
-      const siblings = document.querySelector(".orbis-feature-panel__sunburst-fading-siblings")
-      const opacity = siblings ? Number(getComputedStyle(siblings).opacity) : -1
-      const geometries = Array.from(siblings?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
-      return opacity > 0 && opacity < 1 && geometries.includes(expectedGeometry)
-    }, siblingGeometry)).toBe(true)
+    await expect.poll(() => page.evaluate(({ selected, sibling }) => {
+      const context = document.querySelector(".orbis-feature-panel__sunburst-fading-parent-context")
+      const opacity = context ? Number(getComputedStyle(context).opacity) : -1
+      const geometries = Array.from(context?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
+      return opacity > 0 && opacity < 1 && geometries.includes(selected) && geometries.includes(sibling)
+    }, { selected: folderGeometry, sibling: siblingGeometry })).toBe(true)
     await expect.poll(() => page.evaluate(() => {
       const probe = (window as unknown as { __orbisAnimationProbe: { states: string[]; paths: string[] } }).__orbisAnimationProbe
       return probe.states.includes("true") && new Set(probe.paths).size > 1
@@ -171,15 +172,16 @@ test("animates a folder wedge into its contents with reduced motion enabled", as
     await expect(page.locator(".orbis-feature-panel__sunburst-outgoing")).toHaveCount(0)
 
     const nestedWedge = page.getByRole("button", { name: /Nested, directory, .* percent/ })
+    const nestedGeometry = await nestedWedge.getAttribute("d")
     const rootSiblingGeometry = await page.getByRole("button", { name: /Videos, directory, .* percent/ }).getAttribute("d")
     await nestedWedge.dispatchEvent("click")
     await expect(page.getByRole("complementary", { name: "Nested contents" })).toBeVisible()
-    await expect.poll(() => page.evaluate((expectedGeometry) => {
-      const siblings = document.querySelector(".orbis-feature-panel__sunburst-fading-siblings")
-      const opacity = siblings ? Number(getComputedStyle(siblings).opacity) : -1
-      const geometries = Array.from(siblings?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
-      return opacity > 0 && opacity < 1 && geometries.includes(expectedGeometry)
-    }, rootSiblingGeometry)).toBe(true)
+    await expect.poll(() => page.evaluate(({ selected, sibling }) => {
+      const context = document.querySelector(".orbis-feature-panel__sunburst-fading-parent-context")
+      const opacity = context ? Number(getComputedStyle(context).opacity) : -1
+      const geometries = Array.from(context?.querySelectorAll("path") ?? [], (path) => path.getAttribute("d"))
+      return opacity > 0 && opacity < 1 && geometries.includes(selected) && geometries.includes(sibling)
+    }, { selected: nestedGeometry, sibling: rootSiblingGeometry })).toBe(true)
   } finally {
     await application.close()
     await rm(fixtureDirectory, { recursive: true, force: true })
