@@ -3,7 +3,7 @@
 @source "./**/*.{ts,tsx}";
 
 .orbis-feature-panel { width: 100%; height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--background); color: var(--foreground); }
-.orbis-feature-panel__page { max-width: none; padding: 24px 30px; overflow: auto; }
+.orbis-feature-panel__page { max-width: none; overflow: auto; }
 .orbis-feature-panel__page, .orbis-feature-panel__page * { box-sizing: border-box; }
 .orbis-feature-panel__actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .orbis-feature-panel__actions button svg, .orbis-feature-panel__panel-heading button svg { width: 14px; height: 14px; }
@@ -65,7 +65,6 @@
 .orbis-feature-panel__empty--large h2 { margin: 0; color: var(--foreground); font-size: 20px; }
 .orbis-feature-panel__empty--large p { margin: 0 0 8px; }
 @media (max-width: 980px) {
-  .orbis-feature-panel__page { padding: 20px; }
   .orbis-feature-panel__workspace { grid-template-columns: minmax(0, 1fr); }
   .orbis-feature-panel__chart-panel { min-height: 0; }
   .orbis-feature-panel__sunburst-wrap { width: 100%; height: min(500px, calc(100vw - 80px)); min-height: 0; }
@@ -74,7 +73,6 @@
   .orbis-feature-panel__contents-list { max-height: 320px; }
 }
 @media (max-width: 650px) {
-  .orbis-feature-panel__page { padding: 16px; }
   .orbis-feature-panel__scan-status { grid-template-columns: 1fr auto; }
   .orbis-feature-panel__scan-progress { grid-column: 1 / -1; grid-row: 2; }
   .orbis-feature-panel__scan-warning { grid-column: 1 / -1; justify-self: stretch; }
