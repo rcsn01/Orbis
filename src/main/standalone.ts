@@ -1,16 +1,16 @@
 import { app } from 'electron'
 import { join } from 'node:path'
-import type { FeatureContext } from '@moirasia/desktop-shell/feature'
+import { artifactPath, featureCatalog, type FeatureContext } from '@moirasia/desktop-shell/feature'
 
 /** Build the standalone host resources without making suite mode know app paths. */
 export function standaloneContext(): FeatureContext {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL
-  const worker = app.isPackaged
-    ? join(process.resourcesPath, 'features', 'orbis', 'worker', 'scan-worker.mjs')
-    : join(app.getAppPath(), 'worker-dist', 'scan-worker.mjs')
-  const metadata = app.isPackaged
-    ? join(process.resourcesPath, 'features', 'orbis', 'native', nativeAddonName())
-    : join(app.getAppPath(), 'native', nativeAddonName())
+  const entry = featureCatalog.get('orbis')
+  const metadata = entry.artifacts.find((artifact) => artifact.name === 'metadata')!
+  const scan = entry.artifacts.find((artifact) => artifact.name === 'scan')!
+  const appDevRoot = app.getAppPath()
+  const devPath = (artifact: typeof metadata): string => artifactPath(join(appDevRoot, artifact.buildOutput.replace('{configuration}', 'debug')), artifact)
+  const packagedPath = (artifact: typeof metadata): string => artifactPath(join(process.resourcesPath, artifact.standaloneResource), artifact)
   return {
     id: 'orbis',
     mode: 'standalone',
@@ -18,16 +18,9 @@ export function standaloneContext(): FeatureContext {
     paths: {
       preloads: { main: join(import.meta.dirname, '../preload/index.cjs') },
       renderers: { main: rendererUrl ? `${rendererUrl}/index.html` : join(import.meta.dirname, '../renderer/index.html') },
-      workers: { scan: worker },
-      native: { metadata },
+      workers: { scan: app.isPackaged ? packagedPath(scan) : devPath(scan) },
+      native: { metadata: app.isPackaged ? packagedPath(metadata) : devPath(metadata) },
       dataDirectory: app.getPath('userData')
     }
   }
-}
-
-function nativeAddonName(): string {
-  const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
-  if (process.platform === 'darwin') return `orbis-metadata.darwin-${arch}.node`
-  if (process.platform === 'win32') return 'orbis-metadata.win32-x64-msvc.node'
-  return 'orbis-metadata.linux-x64-gnu.node'
 }
