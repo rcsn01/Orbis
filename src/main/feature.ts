@@ -20,9 +20,7 @@ export class OrbisFeature implements MoirasiaFeature {
   async register(ctx: FeatureContext): Promise<void> {
     if (this.#controller) return
     if (ctx.id !== this.id || ctx.productId !== 'orbis') throw new Error('Invalid Orbis feature context')
-    validateFeatureResources(ctx, ctx.mode === 'standalone'
-      ? { preloads: ['main'], renderers: ['main'], workers: ['scan'], dataDirectory: true }
-      : { workers: ['scan'], dataDirectory: true })
+    validateFeatureResources(ctx)
     const workerPath = ctx.paths.workers?.scan
     const nativeAddonPath = ctx.paths.native?.metadata
     const dataDirectory = ctx.paths.dataDirectory
