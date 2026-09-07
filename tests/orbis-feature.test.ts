@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => {
     static instances: FakeWindow[] = []
     static fromWebContents(contents: unknown): FakeWindow | null { return FakeWindow.instances.find((window) => window.webContents === contents) ?? null }
     destroyed = false
+    minimized = false
     shown = false
     focused = false
     webContents = {
@@ -16,10 +17,13 @@ const mocks = vi.hoisted(() => {
       setWindowOpenHandler: vi.fn()
     }
     constructor(_options: unknown) { FakeWindow.instances.push(this) }
+    on = vi.fn()
     loadURL = vi.fn(async () => undefined)
     loadFile = vi.fn(async () => undefined)
     show = vi.fn(() => { this.shown = true })
     focus = vi.fn(() => { this.focused = true })
+    isMinimized = vi.fn(() => this.minimized)
+    restore = vi.fn(() => { this.minimized = false })
     previewFile = vi.fn()
     destroy = vi.fn(() => { this.destroyed = true })
     isDestroyed = () => this.destroyed
@@ -54,6 +58,7 @@ vi.mock('node:worker_threads', () => ({ Worker: mocks.FakeWorker }))
 vi.mock('@moirasia/desktop-shell/main', () => ({
   desktopWindowChromeOptions: () => ({}),
   neutralWindowBackground: () => '#fff',
+  defaultProductAppearance: () => 'system',
   registerProductAppearance: vi.fn(async () => mocks.appearanceDispose),
   sendToRenderer: () => false
 }))
@@ -91,6 +96,7 @@ describe('Orbis feature host', () => {
     await feature.register(standaloneContext)
     expect(mocks.FakeWindow.instances).toHaveLength(1)
     expect(mocks.FakeWindow.instances[0]!.loadFile).toHaveBeenCalledWith('/tmp/orbis-renderer.html')
+    expect(mocks.FakeWindow.instances[0]!.webContents.setWindowOpenHandler).toHaveBeenCalled()
     expect(mocks.FakeWorker.instances).toHaveLength(0)
     expect(mocks.appearanceDispose).not.toHaveBeenCalled()
 
@@ -101,5 +107,20 @@ describe('Orbis feature host', () => {
     await feature.dispose()
     expect(mocks.FakeWorker.instances[0]!.terminated).toBe(true)
     expect(mocks.handlers.size).toBe(0)
+    expect(mocks.appearanceDispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-activates the standalone window through the handle, restoring a minimized one', async () => {
+    await feature.register(standaloneContext)
+    const window = mocks.FakeWindow.instances[0]!
+    window.minimized = true
+    feature.activate()
+    expect(window.restore).toHaveBeenCalledTimes(1)
+    expect(window.show).toHaveBeenCalledTimes(2) // one from ready(), one from activate()
+    expect(window.focus).toHaveBeenCalledTimes(1)
+
+    feature.activate()
+    expect(window.restore).toHaveBeenCalledTimes(1)
+    expect(window.show).toHaveBeenCalledTimes(3)
   })
 })

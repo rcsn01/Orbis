@@ -1,8 +1,8 @@
-import { BrowserWindow, dialog, type WebContents } from 'electron'
+import { dialog } from 'electron'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
-import { validateFeatureResources, type EmbeddedFeatureSurface, type FeatureContext, type MoirasiaFeature } from '@moirasia/desktop-shell/feature'
-import { desktopWindowChromeOptions, neutralWindowBackground, registerProductAppearance } from '@moirasia/desktop-shell/main'
+import type { FeatureContext, MoirasiaFeature } from '@moirasia/desktop-shell/feature'
+import { acquireFeatureSurface, type FeatureSurfaceHandle } from '@moirasia/desktop-shell/feature-surface-host'
 import { OrbisController } from './controller'
 import { WorkerScanExecution, type WorkerTransportFactory } from './scan-execution'
 import { ScanFailureDiagnosticsStore } from './scan-failure-diagnostics'
@@ -12,100 +12,58 @@ import { createOrbisSystemShell } from './system-shell'
 export class OrbisFeature implements MoirasiaFeature {
   readonly id = 'orbis'
   #controller: OrbisController | undefined
-  #window: BrowserWindow | undefined
+  #surface: FeatureSurfaceHandle | undefined
   #disposeIpc: (() => void) | undefined
-  #disposeAppearance: (() => void) | undefined
-  #surface: EmbeddedFeatureSurface | undefined
 
   async register(ctx: FeatureContext): Promise<void> {
     if (this.#controller) return
     if (ctx.id !== this.id || ctx.productId !== 'orbis') throw new Error('Invalid Orbis feature context')
-    validateFeatureResources(ctx)
-    const workerPath = ctx.paths.workers?.scan
-    const nativeAddonPath = ctx.paths.native?.metadata
-    const dataDirectory = ctx.paths.dataDirectory
-    if (!workerPath || !dataDirectory) throw new Error('Orbis feature resources are incomplete')
-
-    const diagnostics = new ScanFailureDiagnosticsStore(join(dataDirectory, 'indexes'))
-    let target: WebContents | undefined
-    const controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, nativeAddonPath), { diagnostics }), {
-      dataDirectory,
-      ...(process.env.ORBIS_SCAN_ROOT ? { initialTarget: process.env.ORBIS_SCAN_ROOT } : {}),
-      ...(ctx.mode === 'standalone' ? { dialog: { showOpenDialog: (options) => dialog.showOpenDialog(this.#window!, options) } } : {}),
-      shell: createOrbisSystemShell(() => target)
-    })
-    let window: BrowserWindow | undefined
+    // Validation, the standalone window, its guards, appearance, load, show,
+    // and teardown all live in the feature surface host.
+    const surface = await acquireFeatureSurface(ctx)
+    const dataDirectory = ctx.paths.dataDirectory!
+    const workerPath = ctx.paths.workers!.scan!
+    let controller: OrbisController | undefined
     let disposeIpc: (() => void) | undefined
-    let disposeAppearance: (() => void) | undefined
     try {
+      const diagnostics = new ScanFailureDiagnosticsStore(join(dataDirectory, 'indexes'))
+      controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(workerPath, ctx.paths.native?.metadata), { diagnostics }), {
+        dataDirectory,
+        ...(process.env.ORBIS_SCAN_ROOT ? { initialTarget: process.env.ORBIS_SCAN_ROOT } : {}),
+        ...(surface.window ? { dialog: { showOpenDialog: (options) => dialog.showOpenDialog(surface.window!, options) } } : {}),
+        shell: createOrbisSystemShell(() => surface.webContents)
+      })
       // Publish the controller before initialization so dispose() can close an
       // index that is loading while the host is shutting down.
       this.#controller = controller
       await controller.initialize()
-      const surface = ctx.mode === 'suite' ? ctx.surface : undefined
-      if (surface) target = surface.webContents
-      else {
-        window = createWindow(ctx)
-        target = window.webContents
-      }
-      if (ctx.mode === 'standalone') {
-        const standaloneWindow = window
-        if (!standaloneWindow) throw new Error('Orbis standalone window is missing')
-        this.#window = standaloneWindow
-        disposeAppearance = await registerProductAppearance('orbis', standaloneWindow, undefined, { applyNativeTheme: true })
-        installWindowGuards(standaloneWindow)
-      }
-      if (!target) throw new Error('Orbis renderer webContents is missing')
-      disposeIpc = registerIpc({ webContents: target, controller })
-      this.#window = window
+      disposeIpc = registerIpc({ webContents: surface.webContents, controller })
       this.#surface = surface
       this.#disposeIpc = disposeIpc
-      this.#disposeAppearance = disposeAppearance
-      if (ctx.mode === 'standalone') {
-        const standaloneWindow = window
-        if (!standaloneWindow) throw new Error('Orbis standalone window is missing')
-        const renderer = ctx.paths.renderers?.main ?? ctx.paths.rendererUrl ?? ctx.paths.rendererFile
-        if (!renderer) throw new Error('Orbis standalone renderer is missing')
-        await loadRenderer(standaloneWindow, renderer)
-        standaloneWindow.show()
-      }
+      await surface.ready()
     } catch (error) {
       disposeIpc?.()
-      disposeAppearance?.()
-      await controller.close().catch(() => undefined)
-      if (window && !window.isDestroyed()) window.destroy()
-      if (this.#controller === controller) this.#controller = undefined
-      this.#window = undefined
+      await controller?.close().catch(() => undefined)
+      surface.dispose()
+      if (!controller || this.#controller === controller) this.#controller = undefined
       this.#surface = undefined
       this.#disposeIpc = undefined
-      this.#disposeAppearance = undefined
       throw error
     }
   }
 
   async dispose(): Promise<void> {
     const controller = this.#controller
-    const window = this.#window
+    const surface = this.#surface
+    const disposeIpc = this.#disposeIpc
     this.#controller = undefined
-    this.#window = undefined
     this.#surface = undefined
-    this.#disposeIpc?.()
     this.#disposeIpc = undefined
-    this.#disposeAppearance?.()
-    this.#disposeAppearance = undefined
-    await controller?.close()
-    if (window && !window.isDestroyed()) window.destroy()
+    disposeIpc?.()
+    try { await controller?.close() } finally { surface?.dispose() }
   }
 
-  activate(): void {
-    if (this.#window && !this.#window.isDestroyed()) {
-      this.#window.show()
-      this.#window.focus()
-    } else {
-      // The suite owns showing and focusing its single BrowserWindow.
-      this.#surface?.activate()
-    }
-  }
+  activate(): void { this.#surface?.activate() }
 
   setActive(_active: boolean): void { /* The shell surface owns tab state. */ }
 
@@ -126,30 +84,4 @@ function createWorkerFactory(workerPath: string, nativeAddonPath: string | undef
   }
   const hasWorkerData = nativeAddonPath !== undefined || resumeValidationDelayMs !== undefined
   return { create: () => hasWorkerData ? new Worker(workerPath, { workerData }) : new Worker(workerPath) }
-}
-
-function createWindow(ctx: FeatureContext): BrowserWindow {
-  const preload = ctx.paths.preloads?.main ?? ctx.paths.preload
-  if (!preload) throw new Error('Orbis standalone preload is missing')
-  return new BrowserWindow({
-    title: 'Orbis',
-    width: 1_280,
-    height: 820,
-    minWidth: 860,
-    minHeight: 600,
-    show: false,
-    ...desktopWindowChromeOptions(),
-    backgroundColor: neutralWindowBackground('system'),
-    webPreferences: { preload, contextIsolation: true, nodeIntegration: false, sandbox: true }
-  })
-}
-
-async function loadRenderer(window: BrowserWindow, renderer: string): Promise<void> {
-  if (renderer.startsWith('http://') || renderer.startsWith('https://')) await window.loadURL(renderer)
-  else await window.loadFile(renderer)
-}
-
-function installWindowGuards(window: BrowserWindow): void {
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
-  window.webContents.on('will-navigate', (event) => event.preventDefault())
 }
