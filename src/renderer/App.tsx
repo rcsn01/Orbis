@@ -43,7 +43,7 @@ export interface OrbisPanelProps {
   readonly appearance: Appearance
 }
 
-/** Orbis content shared by the standalone window and the Moirasia shell. */
+/** Orbis application content rendered inside the shared desktop shell. */
 export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.Element {
   const [snapshot, setSnapshot] = useState<OrbisSnapshot>()
   const [pendingNavigation, setPendingNavigation] = useState<PendingSunburstNavigation>()

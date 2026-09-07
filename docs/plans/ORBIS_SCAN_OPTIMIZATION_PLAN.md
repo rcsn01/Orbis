@@ -70,14 +70,14 @@ Determine whether traversal, SQLite writes, finalization, or main-process snapsh
 - `src/main/scanner.ts`
 - `src/main/database.ts`
 - `src/main/controller.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
-- A new benchmark script under `apps/integrated/Orbis/scripts/` or `scripts/`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
+- A new benchmark script under `apps/standalone/Orbis/scripts/` or `scripts/`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test -- scanner.test.ts
-pnpm -C apps/integrated/Orbis typecheck
+pnpm -C apps/standalone/Orbis test -- scanner.test.ts
+pnpm -C apps/standalone/Orbis typecheck
 ```
 
 ### Exit criteria
@@ -113,14 +113,14 @@ Fix the most obvious avoidable database cost before changing traversal behavior.
 
 - `src/main/database.ts`
 - `src/main/scanner.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
-- `apps/integrated/Orbis/tests/controller.test.ts`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/controller.test.ts`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test -- scanner.test.ts controller.test.ts
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis test -- scanner.test.ts controller.test.ts
+pnpm -C apps/standalone/Orbis verify
 pnpm test -- orbis-feature.test.ts
 ```
 
@@ -160,13 +160,13 @@ Remove the full-table JavaScript reconstruction and second recursive aggregation
 
 - `src/main/scanner.ts`
 - `src/main/database.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test -- scanner.test.ts
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis test -- scanner.test.ts
+pnpm -C apps/standalone/Orbis verify
 ```
 
 ### Exit criteria
@@ -206,15 +206,15 @@ Reduce bytes written per item and shrink the parent-size index before adding con
 - `src/main/index-store.ts`
 - `src/main/controller.ts`
 - `src/shared/contracts.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
-- `apps/integrated/Orbis/tests/controller.test.ts`
-- `apps/integrated/Orbis/tests/ipc.test.ts`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/controller.test.ts`
+- `apps/standalone/Orbis/tests/ipc.test.ts`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis test
+pnpm -C apps/standalone/Orbis verify
 pnpm test -- orbis-feature.test.ts
 ```
 
@@ -245,13 +245,13 @@ Avoid the numeric, case-insensitive locale sort performed in every directory.
 
 - `src/main/scanner.ts`
 - `src/main/index-store.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test -- scanner.test.ts renderer.test.tsx
-pnpm -C apps/integrated/Orbis typecheck
+pnpm -C apps/standalone/Orbis test -- scanner.test.ts renderer.test.tsx
+pnpm -C apps/standalone/Orbis typecheck
 ```
 
 ### Exit criteria
@@ -298,16 +298,16 @@ Apply PDU's strongest technique without copying its full in-memory result model.
 - `src/main/scanner.ts`
 - A new queue helper under `src/main/`
 - `src/main/scan-worker.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
-- `apps/integrated/Orbis/tests/controller.test.ts`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/controller.test.ts`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis test
+pnpm -C apps/standalone/Orbis verify
 pnpm test -- orbis-feature.test.ts
-pnpm -C apps/integrated/Orbis test:smoke
+pnpm -C apps/standalone/Orbis test:smoke
 ```
 
 ### Exit criteria
@@ -341,15 +341,15 @@ Reduce journal and sync work for an unpublished, regenerable index without weake
 
 - `src/main/database.ts`
 - `src/main/controller.ts`
-- `apps/integrated/Orbis/tests/scanner.test.ts`
-- `apps/integrated/Orbis/tests/controller.test.ts`
-- `apps/integrated/Orbis/README.md`
+- `apps/standalone/Orbis/tests/scanner.test.ts`
+- `apps/standalone/Orbis/tests/controller.test.ts`
+- `apps/standalone/Orbis/README.md`
 
 ### Verification
 
 ```sh
-pnpm -C apps/integrated/Orbis test -- scanner.test.ts controller.test.ts
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis test -- scanner.test.ts controller.test.ts
+pnpm -C apps/standalone/Orbis verify
 ```
 
 ### Exit criteria
@@ -467,7 +467,7 @@ This stage changes Orbis's current privacy and retention behavior. Treat it as a
 Use the narrow commands during development, then run the complete checks before considering a stage finished:
 
 ```sh
-pnpm -C apps/integrated/Orbis verify
+pnpm -C apps/standalone/Orbis verify
 pnpm typecheck
 pnpm test
 ```
@@ -475,7 +475,7 @@ pnpm test
 Run the standalone smoke test for worker, IPC, renderer, or publication changes:
 
 ```sh
-pnpm -C apps/integrated/Orbis test:smoke
+pnpm -C apps/standalone/Orbis test:smoke
 ```
 
 ## Measurement log

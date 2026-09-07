@@ -1,18 +1,18 @@
 import type { MenuItemConstructorOptions } from 'electron'
 import { runStandaloneLaunch } from '@moirasia/desktop-shell/main'
-import { feature } from './feature'
-import { standaloneContext } from './standalone'
+import { application } from './application'
 
 void runStandaloneLaunch({
   appId: 'orbis',
+  controlProtocol: 'none',
   productName: 'Orbis',
   appUserModelId: 'com.opense.Orbis',
   userDataEnv: 'ORBIS_USER_DATA',
   contentSecurityPolicy: orbisContentSecurityPolicy,
   menu: orbisMenu,
-  register: () => feature.register(standaloneContext()),
-  activate: () => feature.activate(),
-  dispose: () => feature.dispose()
+  register: () => application.start(),
+  activate: () => application.activate(),
+  dispose: () => application.stop()
 })
 
 function orbisContentSecurityPolicy(rendererUrl: string | undefined): string {
@@ -23,8 +23,8 @@ function orbisMenu(): MenuItemConstructorOptions[] {
   return [
     { label: 'Orbis', submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { type: 'separator' }, { role: 'quit' }] },
     { label: 'File', submenu: [
-      { label: 'Choose Folder…', accelerator: 'CommandOrControl+O', click: () => void feature.addLocation().catch(reportMenuError) },
-      { label: 'Rescan', accelerator: 'CommandOrControl+R', click: () => void feature.rescan().catch(reportMenuError) },
+      { label: 'Choose Folder…', accelerator: 'CommandOrControl+O', click: () => void application.addLocation().catch(reportMenuError) },
+      { label: 'Rescan', accelerator: 'CommandOrControl+R', click: () => void application.rescan().catch(reportMenuError) },
       { type: 'separator' },
       { role: 'close' }
     ] },

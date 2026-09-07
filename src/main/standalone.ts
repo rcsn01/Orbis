@@ -1,26 +1,32 @@
 import { app } from 'electron'
 import { join } from 'node:path'
-import { artifactPath, featureCatalog, type FeatureContext } from '@moirasia/desktop-shell/feature'
 
-/** Build the standalone host resources without making suite mode know app paths. */
-export function standaloneContext(): FeatureContext {
+export interface OrbisResources {
+  readonly preload: string
+  readonly renderer: string
+  readonly worker: string
+  readonly nativeMetadata: string
+  readonly dataDirectory: string
+  readonly appearanceFile: string
+}
+
+/** Resolve resources owned by the standalone Orbis bundle. */
+export function standaloneResources(): OrbisResources {
   const rendererUrl = process.env.ELECTRON_RENDERER_URL
-  const entry = featureCatalog.get('orbis')
-  const metadata = entry.artifacts.find((artifact) => artifact.name === 'metadata')!
-  const scan = entry.artifacts.find((artifact) => artifact.name === 'scan')!
-  const appDevRoot = app.getAppPath()
-  const devPath = (artifact: typeof metadata): string => artifactPath(join(appDevRoot, artifact.buildOutput.replace('{configuration}', 'debug')), artifact)
-  const packagedPath = (artifact: typeof metadata): string => artifactPath(join(process.resourcesPath, artifact.standaloneResource), artifact)
+  const root = app.isPackaged ? process.resourcesPath : app.getAppPath()
   return {
-    id: 'orbis',
-    mode: 'standalone',
-    productId: 'orbis',
-    paths: {
-      preloads: { main: join(import.meta.dirname, '../preload/index.cjs') },
-      renderers: { main: rendererUrl ? `${rendererUrl}/index.html` : join(import.meta.dirname, '../renderer/index.html') },
-      workers: { scan: app.isPackaged ? packagedPath(scan) : devPath(scan) },
-      native: { metadata: app.isPackaged ? packagedPath(metadata) : devPath(metadata) },
-      dataDirectory: app.getPath('userData')
-    }
+    preload: join(import.meta.dirname, '../preload/index.cjs'),
+    renderer: rendererUrl ? `${rendererUrl}/index.html` : join(import.meta.dirname, '../renderer/index.html'),
+    worker: app.isPackaged ? join(root, 'worker', 'scan-worker.mjs') : join(root, 'worker-dist', 'scan-worker.mjs'),
+    nativeMetadata: join(root, 'native', nativeAddonFileName('orbis-metadata')),
+    dataDirectory: app.getPath('userData'),
+    appearanceFile: join(app.getPath('userData'), 'appearance.json')
   }
+}
+
+function nativeAddonFileName(base: string): string {
+  const architecture = process.arch === 'arm64' ? 'arm64' : 'x64'
+  if (process.platform === 'darwin') return `${base}.darwin-${architecture}.node`
+  if (process.platform === 'win32') return `${base}.win32-x64-msvc.node`
+  return `${base}.linux-x64-gnu.node`
 }

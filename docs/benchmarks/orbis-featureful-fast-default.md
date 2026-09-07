@@ -19,7 +19,7 @@ The independent Stage 5 scanner remains reachable only through an explicit bench
 Command:
 
 ```sh
-ORBIS_DISABLE_INCREMENTAL_SCAN=1 pnpm -C apps/integrated/Orbis benchmark:scan -- \
+ORBIS_DISABLE_INCREMENTAL_SCAN=1 pnpm -C apps/standalone/Orbis benchmark:scan -- \
   --profile baseline --warmup 1 --samples 5 --fixture all \
   --scanner progressive --concurrency 4 --batch-size 256 \
   --native-addon native/orbis-metadata.darwin-arm64.node \

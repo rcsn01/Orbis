@@ -11,9 +11,9 @@ files:
   - assets/**/*
 extraResources:
   - from: worker-dist
-    to: features/orbis/worker
+    to: worker
   - from: native
-    to: features/orbis/native
+    to: native
     filter:
       - '*.node'
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}

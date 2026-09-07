@@ -81,11 +81,11 @@ The cancellation and nested-limit stress selection passed ten consecutive runs. 
 ## Reproduction
 
 ```sh
-pnpm -C apps/integrated/Orbis benchmark:scan -- \
+pnpm -C apps/standalone/Orbis benchmark:scan -- \
   --profile baseline --warmup 1 --samples 10 --fixture all \
   --concurrency 1 --output benchmark-results/stage-5-serial.json
 
-pnpm -C apps/integrated/Orbis benchmark:scan -- \
+pnpm -C apps/standalone/Orbis benchmark:scan -- \
   --profile baseline --warmup 1 --samples 10 --fixture all \
   --concurrency 4 --output benchmark-results/stage-5-bounded.json
 ```
