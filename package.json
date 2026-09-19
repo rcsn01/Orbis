@@ -28,7 +28,8 @@
     "benchmark:scan:prepared": "node benchmark-dist/benchmark-scan.mjs --worker worker-dist/scan-worker.mjs",
     "verify": "pnpm typecheck && pnpm native:test && pnpm test && pnpm build:app",
     "package:dir": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir --arm64",
-    "package:mac:unsigned": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --publish never -c.mac.notarize=false"
+    "package:mac:unsigned": "pnpm build:app && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --publish never -c.mac.notarize=false",
+    "release:mac": "node scripts/release-mac.mjs"
   },
   "dependencies": {
     "@moirasia/desktop-shell": "link:../../../packages/desktop-shell",
