@@ -44,7 +44,7 @@ const mocks = vi.hoisted(() => {
       handle: (channel: string, handler: (...args: unknown[]) => unknown) => { handlers.set(channel, handler) },
       removeHandler: (channel: string) => { handlers.delete(channel) }
     },
-    app: { isPackaged: false, getAppPath: () => '/tmp/orbis-app', getPath: (name: string) => name === 'userData' ? '/tmp/orbis-user-data' : '/tmp' },
+    app: { isPackaged: false, getAppPath: () => '/tmp/orbis-app', getPath: (name: string) => name === 'userData' ? '/tmp/orbis-user-data' : '/tmp', getVersion: () => '1.0.0' },
     dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
     shell: { showItemInFolder: vi.fn(), openExternal: vi.fn(async () => undefined) },
     Menu: { buildFromTemplate: vi.fn(() => ({ popup: vi.fn() })) },

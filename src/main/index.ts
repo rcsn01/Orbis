@@ -21,7 +21,7 @@ function orbisContentSecurityPolicy(rendererUrl: string | undefined): string {
 
 function orbisMenu(): MenuItemConstructorOptions[] {
   return [
-    { label: 'Orbis', submenu: [{ role: 'about' }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { type: 'separator' }, { role: 'quit' }] },
+    { label: 'Orbis', submenu: [{ role: 'about' }, { label: 'Check for Updates…', click: () => application.checkForUpdates() }, { type: 'separator' }, { role: 'hide' }, { role: 'hideOthers' }, { type: 'separator' }, { role: 'quit' }] },
     { label: 'File', submenu: [
       { label: 'Choose Folder…', accelerator: 'CommandOrControl+O', click: () => void application.addLocation().catch(reportMenuError) },
       { label: 'Rescan', accelerator: 'CommandOrControl+R', click: () => void application.rescan().catch(reportMenuError) },

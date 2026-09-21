@@ -1,11 +1,13 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { Appearance, AppearanceApi } from '@moirasia/desktop-shell'
+import { createGitHubUpdatesBridge } from '@moirasia/desktop-shell/app-updater'
 import { createOrbisBridge } from './bridge'
 
 export { createOrbisBridge } from './bridge'
 export type { IpcRendererLike } from './bridge'
 
 contextBridge.exposeInMainWorld('orbis', Object.freeze(createOrbisBridge(ipcRenderer)))
+contextBridge.exposeInMainWorld('githubUpdates', Object.freeze(createGitHubUpdatesBridge(ipcRenderer, 'orbis')))
 
 const appearanceApi: AppearanceApi = {
   getAppearance: () => ipcRenderer.invoke('desktop-shell:orbis:appearance:get'),

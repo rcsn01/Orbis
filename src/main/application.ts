@@ -2,6 +2,10 @@ import { dialog } from 'electron'
 import { join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { acquireStandaloneSurface, type StandaloneSurface } from '@moirasia/desktop-shell/standalone-surface'
+import { sendToRenderer } from '@moirasia/desktop-shell/main'
+import type { AppUpdater } from '@moirasia/desktop-shell/app-updater'
+import { githubUpdaterChannels } from '@moirasia/desktop-shell/app-updater'
+import { createGitHubAppUpdater, registerGitHubUpdaterIpc } from '@moirasia/desktop-shell/app-updater-electron'
 import { OrbisController } from './controller'
 import { WorkerScanExecution, type WorkerTransportFactory } from './scan-execution'
 import { ScanFailureDiagnosticsStore } from './scan-failure-diagnostics'
@@ -9,9 +13,12 @@ import { registerIpc } from './ipc'
 import { standaloneResources } from './standalone'
 import { createOrbisSystemShell } from './system-shell'
 
+const GITHUB_FEED = { owner: 'rcsn01', repo: 'Orbis', userAgent: 'Orbis' } as const
+
 export class OrbisApplication {
   #controller: OrbisController | undefined
   #surface: StandaloneSurface | undefined
+  #updater: AppUpdater | undefined
   #disposeIpc: (() => void) | undefined
 
   async start(): Promise<void> {
@@ -31,6 +38,7 @@ export class OrbisApplication {
     })
     let controller: OrbisController | undefined
     let disposeIpc: (() => void) | undefined
+    const updater = createGitHubAppUpdater(GITHUB_FEED)
     try {
       const diagnostics = new ScanFailureDiagnosticsStore(join(resources.dataDirectory, 'indexes'))
       controller = new OrbisController(new WorkerScanExecution(createWorkerFactory(resources.worker, resources.nativeMetadata), { diagnostics }), {
@@ -42,6 +50,18 @@ export class OrbisApplication {
       this.#controller = controller
       await controller.initialize()
       disposeIpc = registerIpc({ webContents: surface.webContents, controller })
+      const channels = githubUpdaterChannels('orbis')
+      const disposeProductIpc = disposeIpc
+      const disposeUpdater = registerGitHubUpdaterIpc({
+        prefix: 'orbis',
+        updater,
+        authorize: (event) => {
+          if (event.sender !== surface.webContents || event.sender.isDestroyed()) throw new Error('Unauthorized IPC sender')
+        },
+        sendState: (state) => { sendToRenderer(surface.webContents, channels.state, state) }
+      })
+      disposeIpc = () => { disposeUpdater(); disposeProductIpc() }
+      this.#updater = updater
       this.#surface = surface
       this.#disposeIpc = disposeIpc
       await surface.ready()
@@ -51,6 +71,7 @@ export class OrbisApplication {
       surface.dispose()
       if (!controller || this.#controller === controller) this.#controller = undefined
       this.#surface = undefined
+      this.#updater = undefined
       this.#disposeIpc = undefined
       throw error
     }
@@ -62,12 +83,17 @@ export class OrbisApplication {
     const disposeIpc = this.#disposeIpc
     this.#controller = undefined
     this.#surface = undefined
+    this.#updater = undefined
     this.#disposeIpc = undefined
     disposeIpc?.()
     try { await controller?.close() } finally { surface?.dispose() }
   }
 
   activate(): void { this.#surface?.activate() }
+  checkForUpdates(): void {
+    this.activate()
+    void this.#updater?.check()
+  }
   async addLocation(): Promise<void> { await this.#controller?.addLocation() }
   async rescan(): Promise<void> { await this.#controller?.rescan() }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import type { Appearance } from "@moirasia/desktop-shell"
-import { AppearanceScope, DesktopAppShell, DesktopContentHeader, DesktopPage, useProductAppearance } from "@moirasia/desktop-shell/react"
+import { AppearanceScope, DesktopAppShell, DesktopContentHeader, DesktopPage, StandaloneGitHubUpdates, useProductAppearance } from "@moirasia/desktop-shell/react"
 import { Alert, AlertDescription, AlertTitle } from "@moirasia/ui-react/components/alert"
 import { Button } from "@moirasia/ui-react/components/button"
 import { Progress } from "@moirasia/ui-react/components/progress"
@@ -218,6 +218,7 @@ export function OrbisPanel({ bridge, appearance }: OrbisPanelProps): React.JSX.E
           <DirectoryContents snapshot={snapshot} onActivate={activateNode} onContextMenu={(id) => void showNodeContextMenu(id)} />
         </div> : <EmptyScanState snapshot={snapshot} onStart={() => void run(() => bridge.startScan())} />}
       </>}
+      <StandaloneGitHubUpdates product="Orbis" api={window.githubUpdates} />
     </DesktopPage>
   </AppearanceScope>
 }
