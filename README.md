@@ -56,6 +56,25 @@ The release command requires a clean `main` branch and a semantic `package.json`
 
 The macOS package is an unsigned ARM64 DMG with bundle identifier `com.opense.Orbis`. Full Disk Access is optional. If protected paths are skipped, Orbis keeps the readable index, reports the skipped count, and provides a button to open the relevant System Settings pane.
 
+### Opening the unsigned DMG
+
+After dragging `Orbis.app` from the DMG into `/Applications`, macOS may report that the app is damaged because the package is unsigned. For a DMG you built or otherwise trust, remove its quarantine flag and try opening it:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Orbis.app"
+open "/Applications/Orbis.app"
+```
+
+If macOS still reports that the app is damaged, repair the local ad-hoc signature:
+
+```sh
+sudo xattr -cr "/Applications/Orbis.app"
+sudo codesign --force --deep --sign - "/Applications/Orbis.app"
+open "/Applications/Orbis.app"
+```
+
+These commands bypass Gatekeeper checks for this local copy. Use them only for an Orbis build you trust. They do not replace Developer ID signing and notarization for normal distribution.
+
 ## Architecture
 
 The renderer receives snapshots, progress, and opaque node IDs through a context-isolated preload. It never receives a filesystem path or chooses a privileged menu action. The main process owns the active read-only SQLite index and resolves native item actions only after validating the node ID, canonical path, filesystem kind, and scan target confinement against the active scan or index.

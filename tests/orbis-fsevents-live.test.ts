@@ -27,7 +27,11 @@ describe.skipIf(!available)('live Orbis FSEvents addon', () => {
       await rename(created, renamed)
       await rm(renamed)
 
-      const batch = addon.readChanges(directory, initial.journalUuid!, cursor, 10_000, 5_000, 10)
+      let batch = addon.readChanges(directory, initial.journalUuid!, cursor, 10_000, 5_000, 10)
+      await expect.poll(() => {
+        batch = addon.readChanges(directory, initial.journalUuid!, cursor, 10_000, 5_000, 10)
+        return BigInt(batch.throughEventId) > BigInt(cursor)
+      }).toBe(true)
       expect(batch.requiresFullScan).toBe(false)
       expect(BigInt(batch.throughEventId)).toBeGreaterThan(BigInt(cursor))
       expect(batch.events.some((event) => event.relativePath === 'folder' || event.relativePath.startsWith('folder/'))).toBe(true)

@@ -10,7 +10,7 @@ export default defineConfig({
     build: { rollupOptions: { input: resolve('src/main/index.ts') } }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin({ exclude: ['@moirasia/desktop-shell'] })],
     resolve: { alias: [{ find: '@shared', replacement: resolve('src/shared') }] },
     build: {
       rollupOptions: {
